@@ -12,7 +12,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:trixie-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends nftables iproute2 netcat-openbsd iputils-ping procps \
+ && apt-get install -y --no-install-recommends nftables iproute2 netcat-openbsd iputils-ping procps socat \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/drawbridge /usr/local/bin/
 COPY e2e/entrypoint.sh /usr/local/bin/

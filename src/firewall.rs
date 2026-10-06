@@ -1,6 +1,7 @@
-//! Translates a [`Ruleset`] into nf_tables netlink batches via `rustables`.
+//! Translates a [`Ruleset`] into nf_tables netlink batches via `rustables`, sent with
+//! [`netlink::send_batch`].
 
-use rustables::error::{BuilderError, QueryError};
+use rustables::error::BuilderError;
 use rustables::expr::{
     Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Counter, HighLevelPayload,
     Immediate, Meta, MetaType, TCPHeaderField, TransportHeaderField, UDPHeaderField, VerdictKind,
@@ -10,15 +11,16 @@ use rustables::{
     Table,
 };
 
+use crate::netlink::{self, NetlinkError};
 use crate::policy::{PortSpec, Proto};
-use crate::ruleset::{FILTER_CHAIN, RuleSpec, Ruleset, TABLE};
+use crate::ruleset::{BASE_CHAIN_PRIORITY, BASE_CHAINS, FILTER_CHAIN, RuleSpec, Ruleset, TABLE};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FirewallError {
-    #[error("failed to build nftables rule: {0}")]
+    #[error("failed to build nftables rule")]
     Build(#[from] BuilderError),
-    #[error("nftables netlink request failed: {0}")]
-    Netlink(#[from] QueryError),
+    #[error("nftables netlink request failed")]
+    Netlink(#[from] NetlinkError),
 }
 
 fn table() -> Table {
@@ -27,7 +29,7 @@ fn table() -> Table {
 
 /// Atomically replaces the gateway table with one implementing `ruleset`.
 pub fn apply(ruleset: &Ruleset) -> Result<(), FirewallError> {
-    build_apply_batch(ruleset)?.send()?;
+    netlink::send_batch(&build_apply_batch(ruleset)?.finalize())?;
     Ok(())
 }
 
@@ -35,17 +37,16 @@ pub fn apply(ruleset: &Ruleset) -> Result<(), FirewallError> {
 pub fn teardown() -> Result<bool, FirewallError> {
     let mut batch = Batch::new();
     batch.add(&table(), MsgType::Del);
-    match batch.send() {
+    match netlink::send_batch(&batch.finalize()) {
         Ok(()) => Ok(true),
-        // rustables reports errno as a positive value, unlike the kernel's negative nlmsgerr.
-        Err(QueryError::NetlinkError(e)) if e.error.abs() == libc::ENOENT => Ok(false),
+        Err(NetlinkError::Kernel { errno, .. }) if errno == libc::ENOENT => Ok(false),
         Err(e) => Err(e.into()),
     }
 }
 
 /// Builds the batch for [`apply`]. Adding then deleting the table first clears any copy left
 /// behind by a previous run, all within the same transaction.
-pub fn build_apply_batch(ruleset: &Ruleset) -> Result<Batch, BuilderError> {
+fn build_apply_batch(ruleset: &Ruleset) -> Result<Batch, BuilderError> {
     let mut batch = Batch::new();
     let table = table();
     batch.add(&table, MsgType::Add);
@@ -56,10 +57,10 @@ pub fn build_apply_batch(ruleset: &Ruleset) -> Result<Batch, BuilderError> {
         .with_name(FILTER_CHAIN)
         .add_to_batch(&mut batch);
 
-    for (name, class) in [("input", HookClass::In), ("forward", HookClass::Forward)] {
+    for name in BASE_CHAINS {
         let chain = Chain::new(&table)
             .with_name(name)
-            .with_hook(Hook::new(class, 0))
+            .with_hook(Hook::new(hook_class(name), BASE_CHAIN_PRIORITY))
             .with_policy(ChainPolicy::Accept)
             .with_type(ChainType::Filter)
             .add_to_batch(&mut batch);
@@ -83,6 +84,15 @@ pub fn build_apply_batch(ruleset: &Ruleset) -> Result<Batch, BuilderError> {
         .add_to_batch(&mut batch);
 
     Ok(batch)
+}
+
+/// Maps a [`BASE_CHAINS`] entry to the netfilter hook it is named after.
+fn hook_class(chain: &str) -> HookClass {
+    match chain {
+        "input" => HookClass::In,
+        "forward" => HookClass::Forward,
+        other => unreachable!("BASE_CHAINS entry {other:?} has no hook mapping"),
+    }
 }
 
 /// `ct state established,related` — rustables' `Rule::established` omits `related`.
@@ -147,6 +157,13 @@ mod tests {
             port_range_bounds(PortSpec { lo: 8000, hi: 8100 }),
             ([0x1f, 0x40], [0x1f, 0xa4])
         );
+    }
+
+    #[test]
+    fn every_base_chain_has_a_hook() {
+        for name in BASE_CHAINS {
+            hook_class(name);
+        }
     }
 
     #[test]

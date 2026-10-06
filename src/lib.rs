@@ -3,5 +3,6 @@
 pub mod cli;
 pub mod firewall;
 pub mod gateway;
+pub mod netlink;
 pub mod policy;
 pub mod ruleset;

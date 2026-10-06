@@ -1,4 +1,4 @@
-//! Command-line interface. Every option can also be set via an `DRAWBRIDGE_*` environment variable.
+//! Command-line interface. Every option can also be set via a `DRAWBRIDGE_*` environment variable.
 
 use std::path::PathBuf;
 
@@ -14,11 +14,19 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Provision the policy, wait for SIGINT/SIGTERM, then deprovision it.
-    Run(PolicyArgs),
+    Run(RunArgs),
     /// Validate the policy and print the ruleset that `run` would install.
     Check(PolicyArgs),
     /// Remove the gateway's nftables table, e.g. after a crash.
-    Teardown,
+    Teardown(LockArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    #[command(flatten)]
+    pub policy: PolicyArgs,
+    #[command(flatten)]
+    pub lock: LockArgs,
 }
 
 #[derive(Debug, Args)]
@@ -29,4 +37,15 @@ pub struct PolicyArgs {
     /// Interface that clients connect through (e.g. wg0).
     #[arg(long, env = "DRAWBRIDGE_EXTERNAL_IFACE")]
     pub external_iface: String,
+}
+
+#[derive(Debug, Args)]
+pub struct LockArgs {
+    /// Lock file ensuring only one instance manages the nftables table at a time.
+    #[arg(
+        long,
+        env = "DRAWBRIDGE_LOCK_FILE",
+        default_value = "/run/drawbridge.lock"
+    )]
+    pub lock_file: PathBuf,
 }

@@ -4,20 +4,29 @@ use std::fmt;
 
 use ipnetwork::IpNetwork;
 
-use crate::policy::{Policy, PortSpec, Proto};
+use crate::policy::{Policy, PolicyError, PortSpec, Proto};
 
 /// Name of the `inet` table owned by the gateway.
 pub const TABLE: &str = "drawbridge";
 /// Regular chain holding the per-client allow rules, jumped to from the base chains.
 pub const FILTER_CHAIN: &str = "client_filter";
+/// Filter base chains that send external-interface traffic to [`FILTER_CHAIN`], named after the
+/// netfilter hook each one attaches to.
+pub const BASE_CHAINS: [&str; 2] = ["input", "forward"];
+/// Priority of the base chains (`filter`).
+pub const BASE_CHAIN_PRIORITY: i32 = 0;
 
-/// Linux `IFNAMSIZ` including the trailing NUL.
+/// Mirrors `libc::IFNAMSIZ` (including the trailing NUL) to keep this module kernel-free.
 const IFNAMSIZ: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RulesetError {
-    #[error("invalid external interface name {0:?}")]
+    #[error(
+        "invalid external interface name {0:?}: use 1-15 characters from A-Z, a-z, 0-9, '_', '.', '-'"
+    )]
     InterfaceName(String),
+    #[error("invalid policy")]
+    Policy(#[from] PolicyError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,11 +45,13 @@ pub struct RuleSpec {
 }
 
 impl Ruleset {
-    /// Expands the policy into one rule per client × allow entry × dest × port spec, in policy order.
+    /// Validates the policy, then expands it into one rule per client × allow entry × dest × port
+    /// spec, in policy order.
     pub fn from_policy(policy: &Policy, external_iface: &str) -> Result<Self, RulesetError> {
-        if external_iface.is_empty() || external_iface.len() >= IFNAMSIZ {
+        if !is_valid_iface_name(external_iface) {
             return Err(RulesetError::InterfaceName(external_iface.to_string()));
         }
+        policy.validate()?;
         let mut rules = Vec::new();
         for client in &policy.clients {
             let src = normalize(client.cidr);
@@ -71,6 +82,18 @@ impl Ruleset {
     }
 }
 
+/// A conservative subset of what the kernel accepts (`dev_valid_name`): it rules out whitespace,
+/// `/`, `:` and quotes, so the name is also safe to render unescaped.
+fn is_valid_iface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() < IFNAMSIZ
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
 /// Clears host bits so `192.168.1.5/24` becomes `192.168.1.0/24`.
 fn normalize(net: IpNetwork) -> IpNetwork {
     IpNetwork::new(net.network(), net.prefix()).expect("prefix taken from a valid network")
@@ -95,9 +118,12 @@ impl fmt::Display for RuleSpec {
 impl fmt::Display for Ruleset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "table inet {TABLE} {{")?;
-        for hook in ["input", "forward"] {
+        for hook in BASE_CHAINS {
             writeln!(f, "\tchain {hook} {{")?;
-            writeln!(f, "\t\ttype filter hook {hook} priority 0; policy accept;")?;
+            writeln!(
+                f,
+                "\t\ttype filter hook {hook} priority {BASE_CHAIN_PRIORITY}; policy accept;"
+            )?;
             writeln!(
                 f,
                 "\t\tiifname \"{}\" jump {FILTER_CHAIN}",
@@ -153,10 +179,87 @@ mod tests {
     }
 
     #[test]
+    fn accepts_interface_names_up_to_15_bytes() {
+        let policy = Policy { clients: vec![] };
+        for name in ["wg0", "eth0.100", "br-lan_1", "a23456789012345"] {
+            assert!(Ruleset::from_policy(&policy, name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
     fn rejects_bad_interface_names() {
         let policy = Policy { clients: vec![] };
-        assert!(Ruleset::from_policy(&policy, "").is_err());
-        assert!(Ruleset::from_policy(&policy, "a-very-long-ifname").is_err());
+        for name in [
+            "",
+            "a234567890123456", // 16 bytes: no room for the NUL
+            ".",
+            "..",
+            "wg 0",
+            "wg0 ",
+            "wg/0",
+            "wg:0",
+            "wg\"0",
+        ] {
+            assert!(
+                matches!(
+                    Ruleset::from_policy(&policy, name),
+                    Err(RulesetError::InterfaceName(_))
+                ),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_policy() {
+        let policy = Policy {
+            clients: vec![crate::policy::Client {
+                cidr: "10.0.0.1/32".parse().unwrap(),
+                allow: vec![crate::policy::Allow {
+                    dest: vec![],
+                    proto: Proto::Tcp,
+                    ports: vec![],
+                }],
+            }],
+        };
+        assert!(matches!(
+            Ruleset::from_policy(&policy, "wg0"),
+            Err(RulesetError::Policy(_))
+        ));
+    }
+
+    #[test]
+    fn renders_remaining_protocol_branches() {
+        let policy = Policy::parse(
+            "clients:
+  - cidr: 10.0.0.1/32
+    allow:
+      - dest: [10.1.0.0/16]
+        proto: udp
+      - dest: [10.1.0.0/16]
+        proto: icmp
+  - cidr: fd00::1/128
+    allow:
+      - dest: [\"fd01::/64\"]
+        proto: tcp
+        ports: [22]
+",
+        )
+        .unwrap();
+        let rules: Vec<String> = Ruleset::from_policy(&policy, "wg0")
+            .unwrap()
+            .rules
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            rules,
+            [
+                "ip saddr 10.0.0.1/32 ip daddr 10.1.0.0/16 meta l4proto udp counter accept",
+                "ip saddr 10.0.0.1/32 ip daddr 10.1.0.0/16 meta l4proto icmp counter accept",
+                "ip6 saddr fd00::1/128 ip6 daddr fd01::/64 tcp dport 22 counter accept",
+            ]
+        );
     }
 
     #[test]

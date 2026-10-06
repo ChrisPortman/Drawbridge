@@ -22,11 +22,13 @@ not explicitly allowed is dropped. See `docs/` for the specifications:
 | `src/cli.rs` | Clap definitions (`run`, `check`, `teardown`); every flag has a `DRAWBRIDGE_*` env var. |
 | `src/policy.rs` | Serde YAML schema, `Policy::load`/`parse`/`validate`. |
 | `src/ruleset.rs` | Pure `Policy` → `Ruleset` IR; `Display` renders nft-style text (used by `check`). |
-| `src/firewall.rs` | `Ruleset` → `rustables` netlink batch; `apply` / `teardown`. The only kernel-touching code. |
-| `src/gateway.rs` | Subcommand implementations and the signal-driven `run` lifecycle. |
+| `src/firewall.rs` | `Ruleset` → `rustables` batch; `apply` / `teardown`. Builds what touches the kernel. |
+| `src/netlink.rs` | Sends finalized batches with buffers sized to the batch, and parses the kernel's acks. |
+| `src/gateway.rs` | Subcommand implementations: instance lock, interface check, signal-driven `run` lifecycle. |
 | `examples/policy.yaml` | Example policy, used by unit tests. |
 | `tests/data/example.nft` | Golden `check` output for the example policy. |
-| `tests/kernel.rs` | `#[ignore]`d test that applies rules to a real kernel (needs CAP_NET_ADMIN). |
+| `tests/data/example.kernel.nft` | Golden `nft list` output (counters stripped) after applying the example policy. |
+| `tests/kernel.rs` | `#[ignore]`d tests against a real kernel (needs CAP_NET_ADMIN): example golden, 5,000-rule policy. |
 | `e2e/` | Docker Compose end-to-end stack (`run.sh`, `compose.yaml`, `Dockerfile`, `policy.yaml`). |
 
 ## Commands
@@ -66,22 +68,32 @@ Keep these unless the user changes them:
 - **Access to the gateway host comes only through policy.** A client reaches the host by listing
   the gateway's IP as a `dest`. Nothing is hard-coded.
 - **Apply is atomic.** One batch does add table, delete table, then rebuilds everything. A restart
-  therefore replaces leftover state.
+  therefore replaces leftover state. A batch the kernel rejects changes nothing. After a timeout or
+  lost acks (`NetlinkError::Timeout` / `AcksLost`), the batch may already be live. Either way `run`
+  must not tear down after a failed apply: at worst that leaves the new rules enforcing.
+- **One instance at a time.** `run` and `teardown` hold an exclusive lock on `--lock-file`
+  (`DRAWBRIDGE_LOCK_FILE`, default `/run/drawbridge.lock`); `check` takes none.
+- **The external interface must exist at startup.** `run` refuses to start otherwise, because rules
+  for a misnamed interface match nothing. Names are limited to 1–15 characters from
+  `[A-Za-z0-9_.-]`.
 - **Shutdown is fail-open.** It deletes the table. `teardown` reports a missing table as success.
 - **Policy is allow-only and inline per client** (`clients[].cidr`, `allow[].dest/proto/ports`).
   - Validate before touching the kernel.
   - Validation errors name `clients[i].allow[j]`.
   - Schema structs use `deny_unknown_fields`.
 - `ruleset.rs` stays pure and kernel-free. Test rule generation there, not in `firewall.rs`.
-- If you change rule generation or rendering, update `tests/data/example.nft` and the e2e checks
-  to match.
+- If you change rule generation or rendering, update `tests/data/example.nft`,
+  `tests/data/example.kernel.nft` and the e2e checks to match.
 
 ## rustables notes (v0.9)
 
 The docs are sparse, so read the source in `~/.cargo/registry/src/*/rustables-0.9.0/src/`. Known quirks:
 
-- Netlink errno values come back **positive** in `QueryError::NetlinkError(e).error`, because the
-  parser applies `abs()`. Compare with `e.error.abs()`.
+- **Don't use `Batch::send`.** It uses default socket buffers. Batches over roughly 220 rules then
+  fail: either with `EMSGSIZE` before the send, or with `ENOBUFS` *after* the kernel has committed
+  them. Build with rustables, then send `batch.finalize()` through `netlink::send_batch`.
+- Its own netlink errors (`QueryError::NetlinkError`) report errno as a positive value. Our
+  `NetlinkError::Kernel` stores the positive errno too.
 - `Rule::established()` matches only ESTABLISHED. Use `firewall::established_or_related` instead.
 - There is no port-range helper. Ranges are a transport `Payload` followed by `Cmp Gte` and
   `Cmp Lte`, with big-endian bytes.
@@ -96,6 +108,10 @@ The docs are sparse, so read the source in `~/.cargo/registry/src/*/rustables-0.
 - Log with `tracing`; the level is set by `RUST_LOG` and defaults to `info`.
 - Put unit tests in `#[cfg(test)] mod tests` next to the code they test. Fixtures go in `examples/`
   or `tests/data/`.
-- Keep e2e assertions in `e2e/run.sh` and use the `tcp` / `ping_` helpers. The e2e network
-  addresses are fixed in `compose.yaml`, `entrypoint.sh` and `policy.yaml`, so keep the three in
-  sync.
+- Keep e2e assertions in `e2e/run.sh` and use the `tcp` / `udp` / `ping_` / `refused` helpers.
+  - Every "closed" check needs a real listener behind it, and a matching "open" check after
+    shutdown, so a denial is shown to come from the rules.
+  - The e2e addresses and MACs are fixed in `compose.yaml`, `entrypoint.sh` and `policy.yaml`, so
+    keep the three in sync.
+  - The external Docker network stands in for WireGuard. It has pinned IPv6 neighbour entries,
+    because Drawbridge (correctly) drops neighbour discovery on the external interface.

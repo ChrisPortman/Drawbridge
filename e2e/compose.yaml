@@ -1,9 +1,13 @@
 # Topology:
-#   client-allowed (.10) ─┐                       ┌─ server (10.10.0.20)
-#   client-denied  (.11) ─┴─ external ── gateway ─┴─ internal
-#                     172.30.0.0/24   (wg0 / .2)    10.10.0.0/24
+#   client-allowed (.10/::10) ─┐                       ┌─ server (10.10.0.20, fd00:10::20)
+#   client-denied  (.11/::11) ─┴─ external ── gateway ─┴─ internal
+#                          172.30.0.0/24   (wg0 / .2)    10.10.0.0/24
+#                          fd00:30::/64    (::2)         fd00:10::/64
 #
 # The external network stands in for a WireGuard interface; it is named wg0 inside the gateway.
+# WireGuard is layer 3 and Drawbridge filters everything arriving on it, including IPv6 neighbour
+# discovery. To emulate that, external endpoints get fixed MACs and entrypoint.sh pins permanent
+# neighbour entries, so no ND traffic is needed across the gateway's filter.
 
 x-node: &node
   image: drawbridge-e2e
@@ -19,6 +23,7 @@ services:
     command: [gateway]
     sysctls:
       net.ipv4.ip_forward: 1
+      net.ipv6.conf.all.forwarding: 1
     environment:
       DRAWBRIDGE_POLICY: /etc/drawbridge/policy.yaml
       DRAWBRIDGE_EXTERNAL_IFACE: wg0
@@ -27,9 +32,12 @@ services:
     networks:
       external:
         ipv4_address: 172.30.0.2
+        ipv6_address: fd00:30::2
+        mac_address: "02:00:00:30:00:02"
         interface_name: wg0
       internal:
         ipv4_address: 10.10.0.2
+        ipv6_address: fd00:10::2
     healthcheck:
       test: [CMD, nft, list, table, inet, drawbridge]
       interval: 1s
@@ -42,6 +50,7 @@ services:
     networks:
       internal:
         ipv4_address: 10.10.0.20
+        ipv6_address: fd00:10::20
     healthcheck: &route-check
       test: [CMD, test, -f, /tmp/ready]
       interval: 1s
@@ -54,6 +63,8 @@ services:
     networks:
       external:
         ipv4_address: 172.30.0.10
+        ipv6_address: fd00:30::10
+        mac_address: "02:00:00:30:00:10"
     healthcheck: *route-check
 
   client-denied:
@@ -63,12 +74,16 @@ services:
     networks:
       external:
         ipv4_address: 172.30.0.11
+        ipv6_address: fd00:30::11
+        mac_address: "02:00:00:30:00:11"
     healthcheck: *route-check
 
 networks:
   external:
+    enable_ipv6: true
     ipam:
-      config: [{subnet: 172.30.0.0/24}]
+      config: [{subnet: 172.30.0.0/24}, {subnet: "fd00:30::/64"}]
   internal:
+    enable_ipv6: true
     ipam:
-      config: [{subnet: 10.10.0.0/24}]
+      config: [{subnet: 10.10.0.0/24}, {subnet: "fd00:10::/64"}]

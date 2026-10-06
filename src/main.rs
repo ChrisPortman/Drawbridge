@@ -1,8 +1,8 @@
 use std::process::ExitCode;
 
+use clap::Parser;
 use drawbridge::cli::{Cli, Command};
 use drawbridge::gateway;
-use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -15,7 +15,7 @@ async fn main() -> ExitCode {
     let result = match &cli.command {
         Command::Run(args) => gateway::run(args).await,
         Command::Check(args) => gateway::check(args),
-        Command::Teardown => gateway::teardown(),
+        Command::Teardown(args) => gateway::teardown(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

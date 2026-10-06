@@ -1,20 +1,20 @@
 //! Allow-list policy file: YAML schema, loading and validation.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ipnetwork::IpNetwork;
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
-    #[error("failed to read policy file {path}: {source}")]
+    #[error("failed to read policy file {}", path.display())]
     Io {
-        path: String,
+        path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to parse policy: {0}")]
+    #[error("failed to parse policy")]
     Parse(#[from] serde_norway::Error),
     #[error("clients[{client}].allow[{rule}]: {msg}")]
     Invalid {
@@ -89,8 +89,14 @@ impl fmt::Display for PortSpec {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum RawPort {
-    Num(u16),
+    // Wider than u16 so out-of-range numbers get a specific message rather than serde's
+    // generic "did not match any variant".
+    Num(i64),
     Str(String),
+}
+
+fn port_from_i64(p: i64) -> Result<u16, String> {
+    u16::try_from(p).map_err(|_| format!("port {p} is out of range (1-65535)"))
 }
 
 impl TryFrom<RawPort> for PortSpec {
@@ -98,12 +104,16 @@ impl TryFrom<RawPort> for PortSpec {
 
     fn try_from(raw: RawPort) -> Result<Self, Self::Error> {
         let (lo, hi) = match raw {
-            RawPort::Num(p) => (p, p),
+            RawPort::Num(p) => {
+                let p = port_from_i64(p)?;
+                (p, p)
+            }
             RawPort::Str(s) => {
                 let parse = |v: &str| {
                     v.trim()
-                        .parse::<u16>()
+                        .parse::<i64>()
                         .map_err(|_| format!("invalid port {s:?}"))
+                        .and_then(port_from_i64)
                 };
                 match s.split_once('-') {
                     Some((lo, hi)) => (parse(lo)?, parse(hi)?),
@@ -127,7 +137,7 @@ impl TryFrom<RawPort> for PortSpec {
 impl Policy {
     pub fn load(path: &Path) -> Result<Self, PolicyError> {
         let text = std::fs::read_to_string(path).map_err(|source| PolicyError::Io {
-            path: path.display().to_string(),
+            path: path.to_path_buf(),
             source,
         })?;
         Self::parse(&text)
@@ -175,8 +185,28 @@ impl Policy {
 mod tests {
     use super::*;
 
+    /// A one-client, one-rule policy with the given client CIDR and allow-entry fields.
+    fn policy(cidr: &str, allow_fields: &str) -> String {
+        format!("clients:\n  - cidr: {cidr}\n    allow:\n      - {allow_fields}\n")
+    }
+
+    fn tcp_ports(ports: &str) -> String {
+        policy(
+            "10.0.0.1/32",
+            &format!("dest: [10.1.0.0/16]\n        proto: tcp\n        ports: [{ports}]"),
+        )
+    }
+
+    /// The full error chain, as `main` prints it with `{:#}`.
     fn err(text: &str) -> String {
-        Policy::parse(text).unwrap_err().to_string()
+        let e = Policy::parse(text).unwrap_err();
+        let mut msg = e.to_string();
+        let mut source = std::error::Error::source(&e);
+        while let Some(s) = source {
+            msg = format!("{msg}: {s}");
+            source = s.source();
+        }
+        msg
     }
 
     #[test]
@@ -196,11 +226,54 @@ mod tests {
 
     #[test]
     fn ports_optional() {
-        let p = Policy::parse(
-            "clients:\n  - cidr: 10.0.0.1/32\n    allow:\n      - dest: [10.1.0.0/16]\n        proto: any\n",
-        )
+        let p = Policy::parse(&policy(
+            "10.0.0.1/32",
+            "dest: [10.1.0.0/16]\n        proto: any",
+        ))
         .unwrap();
         assert!(p.clients[0].allow[0].ports.is_empty());
+    }
+
+    #[test]
+    fn accepts_port_boundaries() {
+        for (ports, expected) in [
+            ("1", PortSpec { lo: 1, hi: 1 }),
+            (
+                "65535",
+                PortSpec {
+                    lo: 65535,
+                    hi: 65535,
+                },
+            ),
+            ("\"80-80\"", PortSpec { lo: 80, hi: 80 }),
+            ("\" 80 - 90 \"", PortSpec { lo: 80, hi: 90 }),
+            ("1-65535", PortSpec { lo: 1, hi: 65535 }),
+        ] {
+            let p = Policy::parse(&tcp_ports(ports)).unwrap();
+            assert_eq!(p.clients[0].allow[0].ports, [expected], "{ports}");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_ports() {
+        for (ports, expected) in [
+            ("0", "port 0 is not allowed"),
+            ("\"0-10\"", "port 0 is not allowed"),
+            ("9000-8000", "port range 9000-8000 is reversed"),
+            ("70000", "port 70000 is out of range"),
+            ("\"70000\"", "port 70000 is out of range"),
+            ("-1", "port -1 is out of range"),
+            ("\"abc\"", "invalid port \"abc\""),
+        ] {
+            let e = err(&tcp_ports(ports));
+            assert!(e.contains(expected), "{ports}: {e}");
+        }
+    }
+
+    #[test]
+    fn error_detail_is_not_repeated() {
+        let e = err(&tcp_ports("0"));
+        assert_eq!(e.matches("port 0 is not allowed").count(), 1, "{e}");
     }
 
     #[test]
@@ -209,39 +282,48 @@ mod tests {
     }
 
     #[test]
-    fn rejects_ports_on_icmp() {
-        let e = err(
-            "clients:\n  - cidr: 10.0.0.1/32\n    allow:\n      - dest: [10.1.0.0/16]\n        proto: icmp\n        ports: [1]\n",
-        );
-        assert!(
-            e.contains("clients[0].allow[0]") && e.contains("only valid with tcp or udp"),
-            "{e}"
-        );
+    fn rejects_ports_without_tcp_or_udp() {
+        for proto in ["icmp", "any"] {
+            let e = err(&policy(
+                "10.0.0.1/32",
+                &format!("dest: [10.1.0.0/16]\n        proto: {proto}\n        ports: [1]"),
+            ));
+            assert!(
+                e.contains("clients[0].allow[0]") && e.contains("only valid with tcp or udp"),
+                "{proto}: {e}"
+            );
+        }
     }
 
     #[test]
     fn rejects_empty_dest() {
-        let e = err(
-            "clients:\n  - cidr: 10.0.0.1/32\n    allow:\n      - dest: []\n        proto: tcp\n",
-        );
+        let e = err(&policy("10.0.0.1/32", "dest: []\n        proto: tcp"));
         assert!(e.contains("dest must not be empty"), "{e}");
     }
 
     #[test]
     fn rejects_mixed_family() {
-        let e = err(
-            "clients:\n  - cidr: 10.0.0.1/32\n    allow:\n      - dest: [\"fd00::/64\"]\n        proto: tcp\n",
-        );
-        assert!(e.contains("different address family"), "{e}");
+        for (cidr, dest) in [
+            ("10.0.0.1/32", "\"fd00::/64\""),
+            ("\"fd00::1/128\"", "10.1.0.0/16"),
+        ] {
+            let e = err(&policy(
+                cidr,
+                &format!("dest: [{dest}]\n        proto: tcp"),
+            ));
+            assert!(
+                e.contains("different address family"),
+                "{cidr} -> {dest}: {e}"
+            );
+        }
     }
 
     #[test]
-    fn rejects_bad_ports() {
-        for bad in ["0", "9000-8000", "70000", "\"abc\""] {
-            let e = err(&format!(
-                "clients:\n  - cidr: 10.0.0.1/32\n    allow:\n      - dest: [10.1.0.0/16]\n        proto: tcp\n        ports: [{bad}]\n"
-            ));
-            assert!(e.contains("parse"), "{bad}: {e}");
-        }
+    fn missing_file_names_the_path() {
+        let e = Policy::load(Path::new("/nonexistent/policy.yaml")).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "failed to read policy file /nonexistent/policy.yaml"
+        );
     }
 }

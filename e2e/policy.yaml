@@ -5,8 +5,20 @@ clients:
         proto: tcp
         ports: [8080, 9000-9001]
       - dest: [10.10.0.20/32]
+        proto: udp
+        ports: [5353]
+      - dest: [10.10.0.20/32]
         proto: icmp
       # A service on the gateway host itself, reached through the input hook.
       - dest: [172.30.0.2/32]
         proto: tcp
         ports: [2222]
+
+  # The same client over IPv6, with a narrower allow list.
+  - cidr: fd00:30::10/128
+    allow:
+      - dest: ["fd00:10::20/128"]
+        proto: tcp
+        ports: [8080]
+      - dest: ["fd00:10::20/128"]
+        proto: icmp

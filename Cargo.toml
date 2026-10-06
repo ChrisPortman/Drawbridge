@@ -2,12 +2,15 @@
 name = "drawbridge"
 version = "0.1.0"
 edition = "2024"
+# File::try_lock (instance lock) is stable from 1.89.
+rust-version = "1.89"
 
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 ipnetwork = { version = "0.21.1", features = ["serde"] }
 libc = "0.2.190"
+nix = { version = "0.31.3", features = ["socket", "net", "uio"] }
 rustables = "0.9"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_norway = "0.9.42"
