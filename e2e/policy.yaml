@@ -1,0 +1,12 @@
+clients:
+  - cidr: 172.30.0.10/32
+    allow:
+      - dest: [10.10.0.20/32]
+        proto: tcp
+        ports: [8080, 9000-9001]
+      - dest: [10.10.0.20/32]
+        proto: icmp
+      # A service on the gateway host itself, reached through the input hook.
+      - dest: [172.30.0.2/32]
+        proto: tcp
+        ports: [2222]

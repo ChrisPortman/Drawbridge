@@ -1,0 +1,22 @@
+# Access gateway allow-list policy.
+#
+# Each client (a source CIDR arriving on the external interface) lists the
+# destinations it may reach. Anything not listed is dropped.
+#
+#   dest:  destination CIDRs (same address family as the client)
+#   proto: tcp | udp | icmp | any
+#   ports: optional, tcp/udp only; single ports or "lo-hi" ranges
+clients:
+  - cidr: 192.168.50.0/24
+    allow:
+      - dest: [10.0.1.0/24]
+        proto: tcp
+        ports: [443, 8000-8100]
+      - dest: [10.0.0.53/32]
+        proto: udp
+        ports: [53]
+
+  - cidr: fd00:50::/64
+    allow:
+      - dest: ["fd00:1::/64"]
+        proto: icmp

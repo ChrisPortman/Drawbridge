@@ -1,0 +1,74 @@
+# Topology:
+#   client-allowed (.10) ─┐                       ┌─ server (10.10.0.20)
+#   client-denied  (.11) ─┴─ external ── gateway ─┴─ internal
+#                     172.30.0.0/24   (wg0 / .2)    10.10.0.0/24
+#
+# The external network stands in for a WireGuard interface; it is named wg0 inside the gateway.
+
+x-node: &node
+  image: access-portal-e2e
+  init: true
+  cap_add: [NET_ADMIN]
+
+services:
+  gateway:
+    <<: *node
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile
+    command: [gateway]
+    sysctls:
+      net.ipv4.ip_forward: 1
+    environment:
+      AG_POLICY: /etc/access_portal/policy.yaml
+      AG_EXTERNAL_IFACE: wg0
+    volumes:
+      - ./policy.yaml:/etc/access_portal/policy.yaml:ro
+    networks:
+      external:
+        ipv4_address: 172.30.0.2
+        interface_name: wg0
+      internal:
+        ipv4_address: 10.10.0.2
+    healthcheck:
+      test: [CMD, nft, list, table, inet, access_gateway]
+      interval: 1s
+      retries: 30
+
+  server:
+    <<: *node
+    command: [server]
+    depends_on: [gateway]
+    networks:
+      internal:
+        ipv4_address: 10.10.0.20
+    healthcheck: &route-check
+      test: [CMD, test, -f, /tmp/ready]
+      interval: 1s
+      retries: 30
+
+  client-allowed:
+    <<: *node
+    command: [client]
+    depends_on: [gateway]
+    networks:
+      external:
+        ipv4_address: 172.30.0.10
+    healthcheck: *route-check
+
+  client-denied:
+    <<: *node
+    command: [client]
+    depends_on: [gateway]
+    networks:
+      external:
+        ipv4_address: 172.30.0.11
+    healthcheck: *route-check
+
+networks:
+  external:
+    ipam:
+      config: [{subnet: 172.30.0.0/24}]
+  internal:
+    ipam:
+      config: [{subnet: 10.10.0.0/24}]

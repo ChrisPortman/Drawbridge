@@ -1,0 +1,18 @@
+table inet access_gateway {
+	chain input {
+		type filter hook input priority 0; policy accept;
+		iifname "wg0" jump client_filter
+	}
+	chain forward {
+		type filter hook forward priority 0; policy accept;
+		iifname "wg0" jump client_filter
+	}
+	chain client_filter {
+		ct state established,related accept
+		ip saddr 192.168.50.0/24 ip daddr 10.0.1.0/24 tcp dport 443 counter accept
+		ip saddr 192.168.50.0/24 ip daddr 10.0.1.0/24 tcp dport 8000-8100 counter accept
+		ip saddr 192.168.50.0/24 ip daddr 10.0.0.53/32 udp dport 53 counter accept
+		ip6 saddr fd00:50::/64 ip6 daddr fd00:1::/64 meta l4proto ipv6-icmp counter accept
+		counter drop
+	}
+}
