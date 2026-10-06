@@ -8,12 +8,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY src src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release && cp target/release/access_portal /usr/local/bin/
+    cargo build --release && cp target/release/drawbridge /usr/local/bin/
 
 FROM debian:trixie-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends nftables iproute2 netcat-openbsd iputils-ping procps \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=build /usr/local/bin/access_portal /usr/local/bin/
+COPY --from=build /usr/local/bin/drawbridge /usr/local/bin/
 COPY e2e/entrypoint.sh /usr/local/bin/
 ENTRYPOINT ["entrypoint.sh"]

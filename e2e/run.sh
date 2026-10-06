@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-dc() { docker compose -p access-portal-e2e "$@"; }
+dc() { docker compose -p drawbridge-e2e "$@"; }
 trap 'dc down --remove-orphans --timeout 1 >/dev/null 2>&1' EXIT
 
 dc up -d --build --wait
@@ -49,15 +49,15 @@ tcp closed client-denied  $GATEWAY 2222
 tcp open   server         172.30.0.10 7000   # internally originated traffic is not filtered
 
 echo "== gateway stopped"
-dc exec -T gateway pkill -TERM -x access_portal
+dc exec -T gateway pkill -TERM -x drawbridge
 for _ in $(seq 20); do
-    dc exec -T gateway pgrep -x access_portal >/dev/null || break
+    dc exec -T gateway pgrep -x drawbridge >/dev/null || break
     sleep 0.25
 done
-if dc exec -T gateway nft list table inet access_gateway >/dev/null 2>&1; then
-    report absent present "access_gateway table removed"
+if dc exec -T gateway nft list table inet drawbridge >/dev/null 2>&1; then
+    report absent present "drawbridge table removed"
 else
-    report absent absent "access_gateway table removed"
+    report absent absent "drawbridge table removed"
 fi
 tcp open   client-denied $SERVER 8081
 tcp open   client-denied $GATEWAY 2223

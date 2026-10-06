@@ -6,7 +6,7 @@
 # The external network stands in for a WireGuard interface; it is named wg0 inside the gateway.
 
 x-node: &node
-  image: access-portal-e2e
+  image: drawbridge-e2e
   init: true
   cap_add: [NET_ADMIN]
 
@@ -20,10 +20,10 @@ services:
     sysctls:
       net.ipv4.ip_forward: 1
     environment:
-      AG_POLICY: /etc/access_portal/policy.yaml
-      AG_EXTERNAL_IFACE: wg0
+      DRAWBRIDGE_POLICY: /etc/drawbridge/policy.yaml
+      DRAWBRIDGE_EXTERNAL_IFACE: wg0
     volumes:
-      - ./policy.yaml:/etc/access_portal/policy.yaml:ro
+      - ./policy.yaml:/etc/drawbridge/policy.yaml:ro
     networks:
       external:
         ipv4_address: 172.30.0.2
@@ -31,7 +31,7 @@ services:
       internal:
         ipv4_address: 10.10.0.2
     healthcheck:
-      test: [CMD, nft, list, table, inet, access_gateway]
+      test: [CMD, nft, list, table, inet, drawbridge]
       interval: 1s
       retries: 30
 

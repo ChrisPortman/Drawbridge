@@ -1,11 +1,11 @@
-//! Command-line interface. Every option can also be set via an `AG_*` environment variable.
+//! Command-line interface. Every option can also be set via an `DRAWBRIDGE_*` environment variable.
 
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Identity-aware L3/L4 access gateway")]
+#[command(version, about = "Drawbridge: identity-aware L3/L4 access gateway")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -24,9 +24,9 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct PolicyArgs {
     /// Path to the YAML allow-list policy.
-    #[arg(long, env = "AG_POLICY")]
+    #[arg(long, env = "DRAWBRIDGE_POLICY")]
     pub policy: PathBuf,
     /// Interface that clients connect through (e.g. wg0).
-    #[arg(long, env = "AG_EXTERNAL_IFACE")]
+    #[arg(long, env = "DRAWBRIDGE_EXTERNAL_IFACE")]
     pub external_iface: String,
 }

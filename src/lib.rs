@@ -1,4 +1,4 @@
-//! Access gateway: provisions nftables allow-list rules from a policy file.
+//! Drawbridge: provisions nftables allow-list rules from a policy file.
 
 pub mod cli;
 pub mod firewall;

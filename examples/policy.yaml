@@ -1,4 +1,4 @@
-# Access gateway allow-list policy.
+# Drawbridge allow-list policy.
 #
 # Each client (a source CIDR arriving on the external interface) lists the
 # destinations it may reach. Anything not listed is dropped.

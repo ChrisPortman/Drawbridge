@@ -11,7 +11,7 @@ case "$1" in
 gateway)
     listen 2222 2223
     # Keep the container alive after the gateway exits so tests can inspect the aftermath.
-    access_portal run || echo "access_portal exited with $?"
+    drawbridge run || echo "drawbridge exited with $?"
     exec sleep infinity
     ;;
 client)

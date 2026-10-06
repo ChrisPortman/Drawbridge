@@ -7,13 +7,13 @@
 //! image (built by `e2e/run.sh`):
 //!
 //!     docker run --rm --cap-add NET_ADMIN -v "$PWD/target/debug/deps/kernel-<hash>:/t:ro" \
-//!         --entrypoint /t access-portal-e2e --ignored
+//!         --entrypoint /t drawbridge-e2e --ignored
 
 use std::process::Command;
 
-use access_portal::firewall;
-use access_portal::policy::Policy;
-use access_portal::ruleset::{FILTER_CHAIN, Ruleset, TABLE};
+use drawbridge::firewall;
+use drawbridge::policy::Policy;
+use drawbridge::ruleset::{FILTER_CHAIN, Ruleset, TABLE};
 
 fn nft_json(args: &[&str]) -> Option<serde_json::Value> {
     let out = Command::new("nft")

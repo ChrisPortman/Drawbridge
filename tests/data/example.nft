@@ -1,4 +1,4 @@
-table inet access_gateway {
+table inet drawbridge {
 	chain input {
 		type filter hook input priority 0; policy accept;
 		iifname "wg0" jump client_filter

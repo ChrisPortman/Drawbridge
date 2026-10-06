@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guidance for coding agents working on the Access Gateway.
+Guidance for coding agents working on Drawbridge, an identity-aware L3/L4 access gateway.
 
 ## What this is
 
@@ -19,7 +19,7 @@ not explicitly allowed is dropped. See `docs/` for the specifications:
 |---|---|
 | `src/main.rs` | Thin binary: tracing setup, `Cli::parse()`, dispatch. **No logic here.** |
 | `src/lib.rs` | Library crate root. All other modules live in the library. |
-| `src/cli.rs` | Clap definitions (`run`, `check`, `teardown`); every flag has an `AG_*` env var. |
+| `src/cli.rs` | Clap definitions (`run`, `check`, `teardown`); every flag has a `DRAWBRIDGE_*` env var. |
 | `src/policy.rs` | Serde YAML schema, `Policy::load`/`parse`/`validate`. |
 | `src/ruleset.rs` | Pure `Policy` → `Ruleset` IR; `Display` renders nft-style text (used by `check`). |
 | `src/firewall.rs` | `Ruleset` → `rustables` netlink batch; `apply` / `teardown`. The only kernel-touching code. |
@@ -46,17 +46,17 @@ Kernel integration test (needs CAP_NET_ADMIN). Use either:
 cargo test --no-run && sudo unshare -n cargo test --test kernel -- --ignored
 # or, without root, after ./e2e/run.sh has built the image:
 docker run --rm --cap-add NET_ADMIN -v "$PWD/target/debug/deps/kernel-<hash>:/t:ro" \
-    --entrypoint /t access-portal-e2e --ignored
+    --entrypoint /t drawbridge-e2e --ignored
 ```
 
-Never run `access_portal run` or `teardown` on the development host itself. They change the host
+Never run `drawbridge run` or `teardown` on the development host itself. They change the host
 firewall. Use a network namespace or the e2e containers.
 
 ## Design invariants
 
 Keep these unless the user changes them:
 
-- **nftables layout:** there is one `inet access_gateway` table.
+- **nftables layout:** there is one `inet drawbridge` table.
   - The `input` and `forward` base chains are filter chains at priority 0 with `policy accept`.
   - Each base chain does `iifname <ext> jump client_filter`.
   - `client_filter` runs `ct state established,related accept`, then the per-client rules, then

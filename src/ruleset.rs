@@ -7,7 +7,7 @@ use ipnetwork::IpNetwork;
 use crate::policy::{Policy, PortSpec, Proto};
 
 /// Name of the `inet` table owned by the gateway.
-pub const TABLE: &str = "access_gateway";
+pub const TABLE: &str = "drawbridge";
 /// Regular chain holding the per-client allow rules, jumped to from the base chains.
 pub const FILTER_CHAIN: &str = "client_filter";
 

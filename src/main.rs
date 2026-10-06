@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
-use access_portal::cli::{Cli, Command};
-use access_portal::gateway;
+use drawbridge::cli::{Cli, Command};
+use drawbridge::gateway;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 

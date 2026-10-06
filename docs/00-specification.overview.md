@@ -1,11 +1,11 @@
-# Access Gateway Specification
+# Drawbridge Specification
 
 ## Objectives
 
-The *Access Gateway* functions as a network access control point at OSI Layer 3/4 by allow listing
+*Drawbridge* functions as a network access control point at OSI Layer 3/4 by allow listing
 network access across the gateway based on user identity.  The administrator, via a configuration
 file, will define access policies and assign then to a user, or group of users.  When a user
-authenticates via an Oauth provider such as Authentik, the *Access Gateway* will install firewall
+authenticates via an Oauth provider such as Authentik, *Drawbridge* will install firewall
 rules that will allow the access according to policy.
 
 Additionally, the administrator may define policy and assign it to a client IP address (CIDR). This
