@@ -1,5 +1,6 @@
 //! Allow-list policy file: YAML schema, loading and validation.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -16,24 +17,56 @@ pub enum PolicyError {
     },
     #[error("failed to parse policy")]
     Parse(#[from] serde_norway::Error),
-    #[error("clients[{client}].allow[{rule}]: {msg}")]
+    #[error("{section}[{index}].allow[{rule}]: {msg}")]
     Invalid {
-        client: usize,
+        section: Section,
+        index: usize,
         rule: usize,
         msg: String,
     },
+    #[error("users[{index}]: {msg}")]
+    InvalidUser { index: usize, msg: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// The top-level policy list an [`PolicyError::Invalid`] entry belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Clients,
+    Users,
+}
+
+impl fmt::Display for Section {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Section::Clients => "clients",
+            Section::Users => "users",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
+    #[serde(default)]
     pub clients: Vec<Client>,
+    /// Allow lists for users who authenticate through the portal, applied to their source IP.
+    #[serde(default)]
+    pub users: Vec<User>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Client {
     pub cidr: IpNetwork,
+    #[serde(default)]
+    pub allow: Vec<Allow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct User {
+    /// Matched exactly against the configured OIDC username claim.
+    pub username: String,
     #[serde(default)]
     pub allow: Vec<Allow>,
 }
@@ -153,20 +186,8 @@ impl Policy {
     pub fn validate(&self) -> Result<(), PolicyError> {
         for (ci, client) in self.clients.iter().enumerate() {
             for (ri, allow) in client.allow.iter().enumerate() {
-                let invalid = |msg: String| PolicyError::Invalid {
-                    client: ci,
-                    rule: ri,
-                    msg,
-                };
-                if allow.dest.is_empty() {
-                    return Err(invalid("dest must not be empty".into()));
-                }
-                if !allow.ports.is_empty() && !matches!(allow.proto, Proto::Tcp | Proto::Udp) {
-                    return Err(invalid(format!(
-                        "ports are only valid with tcp or udp, not {}",
-                        allow.proto
-                    )));
-                }
+                let invalid = |msg| invalid(Section::Clients, ci, ri, msg);
+                validate_allow(allow).map_err(invalid)?;
                 for dest in &allow.dest {
                     if dest.is_ipv4() != client.cidr.is_ipv4() {
                         return Err(invalid(format!(
@@ -177,8 +198,56 @@ impl Policy {
                 }
             }
         }
+        // A user's address family is only known at login, so their dests may mix families.
+        let mut seen = HashSet::new();
+        for (ui, user) in self.users.iter().enumerate() {
+            let invalid_user = |msg: &str| PolicyError::InvalidUser {
+                index: ui,
+                msg: msg.into(),
+            };
+            if user.username.is_empty() {
+                return Err(invalid_user("username must not be empty"));
+            }
+            if !seen.insert(user.username.as_str()) {
+                return Err(invalid_user(&format!(
+                    "duplicate username {:?}",
+                    user.username
+                )));
+            }
+            for (ri, allow) in user.allow.iter().enumerate() {
+                validate_allow(allow).map_err(|msg| invalid(Section::Users, ui, ri, msg))?;
+            }
+        }
         Ok(())
     }
+
+    /// The allow list for `username`, or `None` if the policy doesn't name them.
+    pub fn user(&self, username: &str) -> Option<&User> {
+        self.users.iter().find(|u| u.username == username)
+    }
+}
+
+fn invalid(section: Section, index: usize, rule: usize, msg: String) -> PolicyError {
+    PolicyError::Invalid {
+        section,
+        index,
+        rule,
+        msg,
+    }
+}
+
+/// Checks that apply to an allow entry wherever it appears.
+fn validate_allow(allow: &Allow) -> Result<(), String> {
+    if allow.dest.is_empty() {
+        return Err("dest must not be empty".into());
+    }
+    if !allow.ports.is_empty() && !matches!(allow.proto, Proto::Tcp | Proto::Udp) {
+        return Err(format!(
+            "ports are only valid with tcp or udp, not {}",
+            allow.proto
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -315,6 +384,54 @@ mod tests {
                 e.contains("different address family"),
                 "{cidr} -> {dest}: {e}"
             );
+        }
+    }
+
+    #[test]
+    fn parses_example_users() {
+        let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
+        let alice = policy.user("alice").expect("alice in example");
+        assert_eq!(alice.allow[0].dest.len(), 2);
+        assert!(
+            policy.user("Alice").is_none(),
+            "usernames are case-sensitive"
+        );
+    }
+
+    #[test]
+    fn user_dests_may_mix_families() {
+        Policy::parse(
+            "users:\n  - username: a\n    allow:\n      - dest: [10.0.0.0/8, \"fd00::/8\"]\n        proto: any\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn user_errors_name_the_entry() {
+        for (text, expected) in [
+            (
+                "users:\n  - username: a\n  - username: a\n",
+                "users[1]: duplicate username \"a\"",
+            ),
+            (
+                "users:\n  - username: \"\"\n",
+                "users[0]: username must not be empty",
+            ),
+            (
+                "users:\n  - username: a\n    allow:\n      - dest: []\n        proto: tcp\n",
+                "users[0].allow[0]: dest must not be empty",
+            ),
+            (
+                "users:\n  - username: a\n    allow:\n      - dest: [10.0.0.0/8]\n        proto: icmp\n        ports: [1]\n",
+                "users[0].allow[0]: ports are only valid",
+            ),
+            (
+                "users:\n  - username: a\n    groups: [x]\n",
+                "unknown field",
+            ),
+        ] {
+            let e = err(text);
+            assert!(e.contains(expected), "{text}: {e}");
         }
     }
 

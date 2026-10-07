@@ -22,3 +22,19 @@ clients:
         ports: [8080]
       - dest: ["fd00:10::20/128"]
         proto: icmp
+
+  # Every external client may reach the OIDC provider, so it can log in to the portal.
+  - cidr: 172.30.0.0/24
+    allow:
+      - dest: [10.10.0.30/32]
+        proto: tcp
+        ports: [5556]
+
+# Users logging in through the portal (the username is Dex's verified email claim).
+# bob@example.com exists in Dex but has no entry, so his login is refused.
+users:
+  - username: alice@example.com
+    allow:
+      - dest: [10.10.0.20/32, "fd00:10::20/128"]
+        proto: tcp
+        ports: [8081, 8082]   # 8082 is a TCP echo service for long-lived flows

@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drawbridge: access provisioned</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 0; padding: 3rem 1rem; background: #f4f5f7; color: #1d2330; }
+  main { max-width: 32rem; margin: 0 auto; background: #fff; border-radius: 12px; padding: 2rem; box-shadow: 0 1px 3px #0002; }
+  h1 { margin-top: 0; font-size: 1.4rem; display: flex; align-items: center; gap: .6rem; }
+  .tick { display: inline-grid; place-items: center; width: 2rem; height: 2rem; border-radius: 50%; background: #1f9d55; color: #fff; }
+  ul { padding-left: 1.2rem; font-family: ui-monospace, monospace; font-size: .9rem; }
+  .muted { color: #5b6475; font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1><span class="tick" aria-hidden="true">&#10003;</span> Access provisioned</h1>
+  <p>Signed in as <b id="user"></b>. Your network access is active.</p>
+  <ul id="access"></ul>
+  <p class="muted">Keep this page open to stay connected. Access ends when the page is closed
+    and your login expires (<span id="remaining"></span>).</p>
+</main>
+<script>
+"use strict";
+// Re-authenticate silently once this fraction of the remaining lifetime has passed, but not
+// more often than MIN_DELAY_S, so a provider returning short-lived tokens can't cause a loop.
+const REAUTH_FRACTION = 0.8;
+const MIN_DELAY_S = 5;
+let expiresAtMs = 0; // in this browser's clock, derived from the server's
+
+function showRemaining() {
+  const s = Math.max(0, Math.round((expiresAtMs - Date.now()) / 1000));
+  document.getElementById("remaining").textContent =
+    s >= 60 ? Math.floor(s / 60) + "m " + (s % 60) + "s left" : s + "s left";
+}
+
+async function load() {
+  const r = await fetch("/api/session", { cache: "no-store" });
+  if (r.status === 401) { location.replace("/login"); return; }
+  if (!r.ok) { setTimeout(load, 5000); return; }
+  const s = await r.json();
+  document.getElementById("user").textContent = s.username;
+  const list = document.getElementById("access");
+  list.replaceChildren(...s.access.map(a => {
+    const li = document.createElement("li");
+    li.textContent = a;
+    return li;
+  }));
+  const remaining = s.expires_at - s.server_now;
+  expiresAtMs = Date.now() + remaining * 1000;
+  showRemaining();
+  const delay = Math.max(remaining * REAUTH_FRACTION, MIN_DELAY_S);
+  setTimeout(() => location.replace("/login?silent=1"), delay * 1000);
+}
+
+setInterval(showRemaining, 1000);
+load().catch(() => setTimeout(load, 5000));
+</script>
+</body>
+</html>

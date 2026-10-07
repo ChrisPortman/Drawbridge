@@ -20,3 +20,13 @@ clients:
     allow:
       - dest: ["fd00:1::/64"]
         proto: icmp
+
+# Users authenticate through the portal; their allow list is applied to the
+# source IP they log in from, for as long as their session lasts. A user's
+# dests may mix address families: only those matching the login IP apply.
+users:
+  - username: alice
+    allow:
+      - dest: [10.0.1.0/24, "fd00:1::/64"]
+        proto: tcp
+        ports: [22, 443]

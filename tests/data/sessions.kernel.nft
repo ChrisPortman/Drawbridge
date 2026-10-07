@@ -12,10 +12,14 @@ table inet drawbridge {
 	}
 
 	chain session_flows {
+		ip saddr 192.168.60.7 ct mark 0x00000001 return
+		ip saddr 192.168.60.8 ct mark 0x00000003 return
 		counter drop
 	}
 
 	chain sessions {
+		ip saddr 192.168.60.7 jump session_1
+		ip saddr 192.168.60.8 jump session_3
 	}
 
 	chain input {
@@ -26,5 +30,15 @@ table inet drawbridge {
 	chain forward {
 		type filter hook forward priority filter; policy accept;
 		iifname "wg0" jump client_filter
+	}
+
+	chain session_1 {
+		ip saddr 192.168.60.7 ip daddr 10.0.1.0/24 tcp dport 22 ct mark set 0x00000001 counter accept
+		ip saddr 192.168.60.7 ip daddr 10.0.1.0/24 tcp dport 443 ct mark set 0x00000001 counter accept
+	}
+
+	chain session_3 {
+		ip saddr 192.168.60.8 ip daddr 10.0.1.0/24 tcp dport 22 ct mark set 0x00000003 counter accept
+		ip saddr 192.168.60.8 ip daddr 10.0.1.0/24 tcp dport 443 ct mark set 0x00000003 counter accept
 	}
 }

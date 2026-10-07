@@ -1,10 +1,11 @@
 //! Backend-independent description of the nftables ruleset derived from a [`Policy`].
 
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 
 use ipnetwork::IpNetwork;
 
-use crate::policy::{Policy, PolicyError, PortSpec, Proto};
+use crate::policy::{Allow, Policy, PolicyError, PortSpec, Proto};
 
 /// Name of the `inet` table owned by the gateway.
 pub const TABLE: &str = "drawbridge";
@@ -13,8 +14,21 @@ pub const FILTER_CHAIN: &str = "client_filter";
 /// Filter base chains that send external-interface traffic to [`FILTER_CHAIN`], named after the
 /// netfilter hook each one attaches to.
 pub const BASE_CHAINS: [&str; 2] = ["input", "forward"];
+/// Regular chain dispatching each authenticated session's source IP to its own chain.
+pub const SESSIONS_CHAIN: &str = "sessions";
+/// Regular chain that drops packets of connections whose session has ended. Every connection a
+/// session accepts is tagged with `ct mark <session id>`, and `client_filter` sends marked packets
+/// here before its `ct state established,related accept`; only live sessions' marks return.
+pub const SESSION_FLOWS_CHAIN: &str = "session_flows";
+/// Prefix of the per-session chains; the session id follows.
+pub const SESSION_CHAIN_PREFIX: &str = "session_";
 /// Priority of the base chains (`filter`).
 pub const BASE_CHAIN_PRIORITY: i32 = 0;
+
+/// Name of the chain holding session `id`'s rules.
+pub fn session_chain(id: u32) -> String {
+    format!("{SESSION_CHAIN_PREFIX}{id}")
+}
 
 /// Mirrors `libc::IFNAMSIZ` (including the trailing NUL) to keep this module kernel-free.
 const IFNAMSIZ: usize = 16;
@@ -25,6 +39,8 @@ pub enum RulesetError {
         "invalid external interface name {0:?}: use 1-15 characters from A-Z, a-z, 0-9, '_', '.', '-'"
     )]
     InterfaceName(String),
+    #[error("portal listen address {0} must be a specific address, not unspecified")]
+    PortalAddr(SocketAddr),
     #[error("invalid policy")]
     Policy(#[from] PolicyError),
 }
@@ -32,7 +48,44 @@ pub enum RulesetError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ruleset {
     pub external_iface: String,
+    /// Portal listen addresses. Every client may reach these, so unauthenticated users can log in.
+    pub portal: Vec<SocketAddr>,
+    /// Static per-client rules from the policy's `clients`.
     pub rules: Vec<RuleSpec>,
+    /// Authenticated sessions, each in its own chain. Empty when built from a policy.
+    pub sessions: Vec<SessionRules>,
+}
+
+/// The rules for one authenticated session: traffic from `ip` jumps to [`SessionRules::chain`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRules {
+    /// Nonzero; also the `ct mark` of the session's connections.
+    pub id: u32,
+    pub ip: IpAddr,
+    pub rules: Vec<RuleSpec>,
+}
+
+impl SessionRules {
+    /// Expands `username`'s allow list for a session from `ip`, skipping dests of the other
+    /// address family. Returns `None` if the policy has no entry for `username`.
+    pub fn for_user(policy: &Policy, id: u32, username: &str, ip: IpAddr) -> Option<Self> {
+        assert_ne!(id, 0, "session id 0 is the unmarked ct mark");
+        let user = policy.user(username)?;
+        let src = IpNetwork::from(ip);
+        let mut rules = Vec::new();
+        for allow in &user.allow {
+            let same_family = allow.dest.iter().filter(|d| d.is_ipv4() == ip.is_ipv4());
+            expand(&mut rules, src, allow, same_family.copied());
+        }
+        for rule in &mut rules {
+            rule.mark = Some(id);
+        }
+        Some(SessionRules { id, ip, rules })
+    }
+
+    pub fn chain(&self) -> String {
+        session_chain(self.id)
+    }
 }
 
 /// One accept rule: traffic from `src` to `dst` matching `proto` and optional destination ports.
@@ -42,43 +95,65 @@ pub struct RuleSpec {
     pub dst: IpNetwork,
     pub proto: Proto,
     pub ports: Option<PortSpec>,
+    /// `ct mark` to tag accepted connections with (session rules only).
+    pub mark: Option<u32>,
 }
 
 impl Ruleset {
     /// Validates the policy, then expands it into one rule per client × allow entry × dest × port
-    /// spec, in policy order.
-    pub fn from_policy(policy: &Policy, external_iface: &str) -> Result<Self, RulesetError> {
+    /// spec, in policy order. `portal` addresses get an accept rule ahead of the client rules.
+    pub fn from_policy(
+        policy: &Policy,
+        external_iface: &str,
+        portal: &[SocketAddr],
+    ) -> Result<Self, RulesetError> {
         if !is_valid_iface_name(external_iface) {
             return Err(RulesetError::InterfaceName(external_iface.to_string()));
+        }
+        // An unspecified address would need a rule opening every gateway address to clients.
+        if let Some(&addr) = portal.iter().find(|a| a.ip().is_unspecified()) {
+            return Err(RulesetError::PortalAddr(addr));
         }
         policy.validate()?;
         let mut rules = Vec::new();
         for client in &policy.clients {
             let src = normalize(client.cidr);
             for allow in &client.allow {
-                for &dest in &allow.dest {
-                    let dst = normalize(dest);
-                    let base = RuleSpec {
-                        src,
-                        dst,
-                        proto: allow.proto,
-                        ports: None,
-                    };
-                    if allow.ports.is_empty() {
-                        rules.push(base);
-                    } else {
-                        rules.extend(allow.ports.iter().map(|&p| RuleSpec {
-                            ports: Some(p),
-                            ..base
-                        }));
-                    }
-                }
+                expand(&mut rules, src, allow, allow.dest.iter().copied());
             }
         }
         Ok(Ruleset {
             external_iface: external_iface.to_string(),
+            portal: portal.to_vec(),
             rules,
+            sessions: Vec::new(),
         })
+    }
+}
+
+/// Appends one rule per dest × port spec of `allow`, from `src`.
+fn expand(
+    rules: &mut Vec<RuleSpec>,
+    src: IpNetwork,
+    allow: &Allow,
+    dests: impl Iterator<Item = IpNetwork>,
+) {
+    for dest in dests {
+        let base = RuleSpec {
+            src,
+            dst: normalize(dest),
+            proto: allow.proto,
+            ports: None,
+            mark: None,
+        };
+        if allow.ports.is_empty() {
+            rules.push(base);
+        } else {
+            rules.extend(allow.ports.iter().map(|&p| RuleSpec {
+                ports: Some(p),
+                ..base
+            }));
+        }
     }
 }
 
@@ -101,7 +176,7 @@ fn normalize(net: IpNetwork) -> IpNetwork {
 
 impl fmt::Display for RuleSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let family = if self.src.is_ipv4() { "ip" } else { "ip6" };
+        let family = family(self.src.ip());
         write!(f, "{family} saddr {} {family} daddr {}", self.src, self.dst)?;
         match (self.proto, self.ports) {
             (Proto::Tcp | Proto::Udp, Some(ports)) => write!(f, " {} dport {ports}", self.proto)?,
@@ -110,7 +185,56 @@ impl fmt::Display for RuleSpec {
             (Proto::Icmp, _) => write!(f, " meta l4proto ipv6-icmp")?,
             (Proto::Any, _) => {}
         }
+        if let Some(mark) = self.mark {
+            write!(f, " ct mark set {mark:#010x}")?;
+        }
         write!(f, " counter accept")
+    }
+}
+
+/// `ip`/`ip6`, the nft payload keyword for an address's family.
+fn family(ip: IpAddr) -> &'static str {
+    if ip.is_ipv4() { "ip" } else { "ip6" }
+}
+
+/// The portal accept rule for one listen address.
+pub struct PortalRule(pub SocketAddr);
+
+impl fmt::Display for PortalRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ip = self.0.ip();
+        let port = self.0.port();
+        write!(
+            f,
+            "{} daddr {ip} tcp dport {port} counter accept",
+            family(ip)
+        )
+    }
+}
+
+/// The `sessions` chain rule sending a session's traffic to its chain.
+pub struct DispatchRule<'a>(pub &'a SessionRules);
+
+impl fmt::Display for DispatchRule<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.0;
+        write!(f, "{} saddr {} jump {}", family(s.ip), s.ip, s.chain())
+    }
+}
+
+/// The `session_flows` rule letting a live session's connections through.
+pub struct FlowRule<'a>(pub &'a SessionRules);
+
+impl fmt::Display for FlowRule<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.0;
+        write!(
+            f,
+            "{} saddr {} ct mark {:#010x} return",
+            family(s.ip),
+            s.ip,
+            s.id
+        )
     }
 }
 
@@ -132,12 +256,35 @@ impl fmt::Display for Ruleset {
             writeln!(f, "\t}}")?;
         }
         writeln!(f, "\tchain {FILTER_CHAIN} {{")?;
+        writeln!(f, "\t\tct mark != 0x00000000 jump {SESSION_FLOWS_CHAIN}")?;
         writeln!(f, "\t\tct state established,related accept")?;
+        for &addr in &self.portal {
+            writeln!(f, "\t\t{}", PortalRule(addr))?;
+        }
         for rule in &self.rules {
             writeln!(f, "\t\t{rule}")?;
         }
+        writeln!(f, "\t\tjump {SESSIONS_CHAIN}")?;
         writeln!(f, "\t\tcounter drop")?;
         writeln!(f, "\t}}")?;
+        writeln!(f, "\tchain {SESSION_FLOWS_CHAIN} {{")?;
+        for session in &self.sessions {
+            writeln!(f, "\t\t{}", FlowRule(session))?;
+        }
+        writeln!(f, "\t\tcounter drop")?;
+        writeln!(f, "\t}}")?;
+        writeln!(f, "\tchain {SESSIONS_CHAIN} {{")?;
+        for session in &self.sessions {
+            writeln!(f, "\t\t{}", DispatchRule(session))?;
+        }
+        writeln!(f, "\t}}")?;
+        for session in &self.sessions {
+            writeln!(f, "\tchain {} {{", session.chain())?;
+            for rule in &session.rules {
+                writeln!(f, "\t\t{rule}")?;
+            }
+            writeln!(f, "\t}}")?;
+        }
         writeln!(f, "}}")
     }
 }
@@ -146,9 +293,18 @@ impl fmt::Display for Ruleset {
 mod tests {
     use super::*;
 
+    fn example_policy() -> Policy {
+        Policy::parse(include_str!("../examples/policy.yaml")).unwrap()
+    }
+
+    const PORTAL: &str = "192.168.50.1:8443";
+
     fn example() -> Ruleset {
-        let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
-        Ruleset::from_policy(&policy, "wg0").unwrap()
+        Ruleset::from_policy(&example_policy(), "wg0", &[PORTAL.parse().unwrap()]).unwrap()
+    }
+
+    fn rule_strings(rules: &[RuleSpec]) -> Vec<String> {
+        rules.iter().map(ToString::to_string).collect()
     }
 
     #[test]
@@ -171,7 +327,7 @@ mod tests {
             "clients:\n  - cidr: 10.0.0.7/24\n    allow:\n      - dest: [10.1.2.3/16]\n        proto: any\n",
         )
         .unwrap();
-        let rs = Ruleset::from_policy(&policy, "wg0").unwrap();
+        let rs = Ruleset::from_policy(&policy, "wg0", &[]).unwrap();
         assert_eq!(
             rs.rules[0].to_string(),
             "ip saddr 10.0.0.0/24 ip daddr 10.1.0.0/16 counter accept"
@@ -180,15 +336,15 @@ mod tests {
 
     #[test]
     fn accepts_interface_names_up_to_15_bytes() {
-        let policy = Policy { clients: vec![] };
+        let policy = Policy::default();
         for name in ["wg0", "eth0.100", "br-lan_1", "a23456789012345"] {
-            assert!(Ruleset::from_policy(&policy, name).is_ok(), "{name}");
+            assert!(Ruleset::from_policy(&policy, name, &[]).is_ok(), "{name}");
         }
     }
 
     #[test]
     fn rejects_bad_interface_names() {
-        let policy = Policy { clients: vec![] };
+        let policy = Policy::default();
         for name in [
             "",
             "a234567890123456", // 16 bytes: no room for the NUL
@@ -202,7 +358,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    Ruleset::from_policy(&policy, name),
+                    Ruleset::from_policy(&policy, name, &[]),
                     Err(RulesetError::InterfaceName(_))
                 ),
                 "{name:?}"
@@ -213,6 +369,7 @@ mod tests {
     #[test]
     fn validates_policy() {
         let policy = Policy {
+            users: vec![],
             clients: vec![crate::policy::Client {
                 cidr: "10.0.0.1/32".parse().unwrap(),
                 allow: vec![crate::policy::Allow {
@@ -223,7 +380,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            Ruleset::from_policy(&policy, "wg0"),
+            Ruleset::from_policy(&policy, "wg0", &[]),
             Err(RulesetError::Policy(_))
         ));
     }
@@ -246,7 +403,7 @@ mod tests {
 ",
         )
         .unwrap();
-        let rules: Vec<String> = Ruleset::from_policy(&policy, "wg0")
+        let rules: Vec<String> = Ruleset::from_policy(&policy, "wg0", &[])
             .unwrap()
             .rules
             .iter()
@@ -259,6 +416,91 @@ mod tests {
                 "ip saddr 10.0.0.1/32 ip daddr 10.1.0.0/16 meta l4proto icmp counter accept",
                 "ip6 saddr fd00::1/128 ip6 daddr fd01::/64 tcp dport 22 counter accept",
             ]
+        );
+    }
+
+    #[test]
+    fn rejects_unspecified_portal_addr() {
+        for addr in ["0.0.0.0:443", "[::]:443"] {
+            assert!(
+                matches!(
+                    Ruleset::from_policy(&Policy::default(), "wg0", &[addr.parse().unwrap()]),
+                    Err(RulesetError::PortalAddr(_))
+                ),
+                "{addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn renders_ipv6_portal_rule() {
+        assert_eq!(
+            PortalRule("[fd00::1]:443".parse().unwrap()).to_string(),
+            "ip6 daddr fd00::1 tcp dport 443 counter accept"
+        );
+    }
+
+    #[test]
+    fn session_rules_follow_the_login_family() {
+        let policy = example_policy();
+        let v4 =
+            SessionRules::for_user(&policy, 1, "alice", "192.168.60.7".parse().unwrap()).unwrap();
+        assert_eq!(
+            rule_strings(&v4.rules),
+            [
+                "ip saddr 192.168.60.7/32 ip daddr 10.0.1.0/24 tcp dport 22 ct mark set 0x00000001 counter accept",
+                "ip saddr 192.168.60.7/32 ip daddr 10.0.1.0/24 tcp dport 443 ct mark set 0x00000001 counter accept",
+            ]
+        );
+        let v6 =
+            SessionRules::for_user(&policy, 2, "alice", "fd00:60::7".parse().unwrap()).unwrap();
+        assert_eq!(
+            rule_strings(&v6.rules),
+            [
+                "ip6 saddr fd00:60::7/128 ip6 daddr fd00:1::/64 tcp dport 22 ct mark set 0x00000002 counter accept",
+                "ip6 saddr fd00:60::7/128 ip6 daddr fd00:1::/64 tcp dport 443 ct mark set 0x00000002 counter accept",
+            ]
+        );
+        assert_eq!(v6.chain(), "session_2");
+    }
+
+    #[test]
+    fn unknown_user_has_no_session_rules() {
+        let ip = "192.168.60.7".parse().unwrap();
+        assert!(SessionRules::for_user(&example_policy(), 1, "mallory", ip).is_none());
+    }
+
+    #[test]
+    fn renders_sessions() {
+        let policy = example_policy();
+        let mut rs = Ruleset::from_policy(&Policy::default(), "wg0", &[]).unwrap();
+        rs.sessions = vec![
+            SessionRules::for_user(&policy, 3, "alice", "192.168.60.7".parse().unwrap()).unwrap(),
+            SessionRules::for_user(&policy, 4, "alice", "fd00:60::7".parse().unwrap()).unwrap(),
+        ];
+        let text = rs.to_string();
+        let tail = &text[text.find("\tchain session_flows").unwrap()..];
+        assert_eq!(
+            tail,
+            "\tchain session_flows {
+\t\tip saddr 192.168.60.7 ct mark 0x00000003 return
+\t\tip6 saddr fd00:60::7 ct mark 0x00000004 return
+\t\tcounter drop
+\t}
+\tchain sessions {
+\t\tip saddr 192.168.60.7 jump session_3
+\t\tip6 saddr fd00:60::7 jump session_4
+\t}
+\tchain session_3 {
+\t\tip saddr 192.168.60.7/32 ip daddr 10.0.1.0/24 tcp dport 22 ct mark set 0x00000003 counter accept
+\t\tip saddr 192.168.60.7/32 ip daddr 10.0.1.0/24 tcp dport 443 ct mark set 0x00000003 counter accept
+\t}
+\tchain session_4 {
+\t\tip6 saddr fd00:60::7/128 ip6 daddr fd00:1::/64 tcp dport 22 ct mark set 0x00000004 counter accept
+\t\tip6 saddr fd00:60::7/128 ip6 daddr fd00:1::/64 tcp dport 443 ct mark set 0x00000004 counter accept
+\t}
+}
+"
         );
     }
 

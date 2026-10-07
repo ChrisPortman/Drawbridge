@@ -8,11 +8,19 @@ table inet drawbridge {
 		iifname "wg0" jump client_filter
 	}
 	chain client_filter {
+		ct mark != 0x00000000 jump session_flows
 		ct state established,related accept
+		ip daddr 192.168.50.1 tcp dport 8443 counter accept
 		ip saddr 192.168.50.0/24 ip daddr 10.0.1.0/24 tcp dport 443 counter accept
 		ip saddr 192.168.50.0/24 ip daddr 10.0.1.0/24 tcp dport 8000-8100 counter accept
 		ip saddr 192.168.50.0/24 ip daddr 10.0.0.53/32 udp dport 53 counter accept
 		ip6 saddr fd00:50::/64 ip6 daddr fd00:1::/64 meta l4proto ipv6-icmp counter accept
+		jump sessions
 		counter drop
+	}
+	chain session_flows {
+		counter drop
+	}
+	chain sessions {
 	}
 }

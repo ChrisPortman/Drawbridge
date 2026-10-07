@@ -17,6 +17,13 @@ echo_udp() {
     done
 }
 
+# TCP echo services, for long-lived connections that show whether a flow survives.
+echo_tcp() {
+    for port in "$@"; do
+        socat "TCP6-LISTEN:$port,ipv6only=0,reuseaddr,fork" EXEC:/bin/cat &
+    done
+}
+
 # Emulates WireGuard's lack of neighbour discovery on the external network (see compose.yaml).
 pin_neighbour() { # pin_neighbour <ipv6> <mac> <dev>
     ip -6 neigh replace "$1" lladdr "$2" dev "$3" nud permanent
@@ -26,6 +33,7 @@ case "$1" in
 gateway)
     pin_neighbour fd00:30::10 02:00:00:30:00:10 wg0
     pin_neighbour fd00:30::11 02:00:00:30:00:11 wg0
+    pin_neighbour fd00:30::12 02:00:00:30:00:12 wg0
     listen 2222 2223
     # Keep the container alive after the gateway exits so tests can inspect the aftermath.
     drawbridge run || echo "drawbridge exited with $?"
@@ -45,6 +53,7 @@ server)
     # 8999 and 9002 sit just outside the allowed 9000-9001 range.
     listen 8080 8081 8999 9000 9001 9002
     echo_udp 5353 8080
+    echo_tcp 8082
     touch /tmp/ready
     exec sleep infinity
     ;;

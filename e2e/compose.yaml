@@ -1,8 +1,12 @@
 # Topology:
 #   client-allowed (.10/::10) ─┐                       ┌─ server (10.10.0.20, fd00:10::20)
-#   client-denied  (.11/::11) ─┴─ external ── gateway ─┴─ internal
+#   client-denied  (.11/::11) ─┼─ external ── gateway ─┼─ internal
+#   client-user    (.12/::12) ─┘                       └─ dex    (10.10.0.30, OIDC provider)
 #                          172.30.0.0/24   (wg0 / .2)    10.10.0.0/24
 #                          fd00:30::/64    (::2)         fd00:10::/64
+#
+# client-user has no static policy: it gets access by logging in to the portal (172.30.0.2:8443)
+# as a Dex user listed under the policy's `users`.
 #
 # The external network stands in for a WireGuard interface; it is named wg0 inside the gateway.
 # WireGuard is layer 3 and Drawbridge filters everything arriving on it, including IPv6 neighbour
@@ -21,12 +25,26 @@ services:
       context: ..
       dockerfile: e2e/Dockerfile
     command: [gateway]
+    depends_on:
+      dex: {condition: service_healthy}
     sysctls:
       net.ipv4.ip_forward: 1
       net.ipv6.conf.all.forwarding: 1
     environment:
       DRAWBRIDGE_POLICY: /etc/drawbridge/policy.yaml
       DRAWBRIDGE_EXTERNAL_IFACE: wg0
+      DRAWBRIDGE_PORTAL_LISTEN: 172.30.0.2:8443
+      DRAWBRIDGE_PORTAL_URL: https://172.30.0.2:8443
+      DRAWBRIDGE_TLS_CERT: /etc/drawbridge/portal.crt
+      DRAWBRIDGE_TLS_KEY: /etc/drawbridge/portal.key
+      DRAWBRIDGE_OIDC_ISSUER: http://10.10.0.30:5556/dex
+      # Dex serves plain http inside the test network.
+      DRAWBRIDGE_OIDC_ALLOW_INSECURE_HTTP: "true"
+      DRAWBRIDGE_OIDC_CLIENT_ID: drawbridge
+      DRAWBRIDGE_OIDC_CLIENT_SECRET: e2e-secret
+      # Dex issues no preferred_username; its email is verified.
+      DRAWBRIDGE_OIDC_USERNAME_CLAIM: email
+      DRAWBRIDGE_OIDC_SCOPES: profile,email
     volumes:
       - ./policy.yaml:/etc/drawbridge/policy.yaml:ro
     networks:
@@ -77,6 +95,38 @@ services:
         ipv6_address: fd00:30::11
         mac_address: "02:00:00:30:00:11"
     healthcheck: *route-check
+
+  client-user:
+    <<: *node
+    command: [client]
+    depends_on: [gateway]
+    networks:
+      external:
+        ipv4_address: 172.30.0.12
+        ipv6_address: fd00:30::12
+        mac_address: "02:00:00:30:00:12"
+    healthcheck: *route-check
+
+  # Root and NET_ADMIN only to route replies to clients back through the gateway.
+  dex:
+    image: ghcr.io/dexidp/dex:v2.44.0
+    user: root
+    cap_add: [NET_ADMIN]
+    entrypoint:
+      - sh
+      - -c
+      - ip route add 172.30.0.0/24 via 10.10.0.2 && exec dex serve /etc/dex/config.yaml
+    volumes:
+      - ./dex.yaml:/etc/dex/config.yaml:ro
+    networks:
+      internal:
+        ipv4_address: 10.10.0.30
+        # Pinned so Docker can't hand it an address reserved for another node.
+        ipv6_address: fd00:10::30
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:5556/dex/.well-known/openid-configuration]
+      interval: 1s
+      retries: 30
 
 networks:
   external:

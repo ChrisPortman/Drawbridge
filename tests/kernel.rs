@@ -14,7 +14,11 @@ use std::sync::Mutex;
 
 use drawbridge::firewall;
 use drawbridge::policy::{Allow, Client, Policy, PortSpec, Proto};
-use drawbridge::ruleset::{FILTER_CHAIN, Ruleset, TABLE};
+use drawbridge::ruleset::{
+    FILTER_CHAIN, Ruleset, SESSION_FLOWS_CHAIN, SESSIONS_CHAIN, SessionRules, TABLE,
+};
+
+const PORTAL: &str = "192.168.50.1:8443";
 
 /// The tests share one kernel table, so they must not run concurrently.
 static KERNEL: Mutex<()> = Mutex::new(());
@@ -68,16 +72,17 @@ fn nft_list_normalized() -> String {
 fn apply_and_teardown() {
     let _guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
     let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
-    let ruleset = Ruleset::from_policy(&policy, "wg0").unwrap();
+    let ruleset = Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()]).unwrap();
 
     // Applying twice must replace, not duplicate, the table.
     firewall::apply(&ruleset).unwrap();
     firewall::apply(&ruleset).unwrap();
 
     let listing = nft_json(&["list", "table", "inet", TABLE]).expect("table exists");
-    assert_eq!(count(&listing, "chain"), 3);
-    // One jump per base chain, plus ct + per-client rules + final drop.
-    assert_eq!(count(&listing, "rule"), 2 + 1 + ruleset.rules.len() + 1);
+    assert_eq!(count(&listing, "chain"), 5);
+    // One jump per base chain; in client_filter, the session-flows jump, ct, portal, per-client
+    // rules, sessions jump and final drop; and the session_flows drop.
+    assert_eq!(count(&listing, "rule"), 2 + 3 + ruleset.rules.len() + 2 + 1);
     assert!(nft_json(&["list", "chain", "inet", TABLE, FILTER_CHAIN]).is_some());
     // What the kernel holds must match the reviewed golden listing, so the netlink encoding
     // can't drift from what `check` renders.
@@ -114,19 +119,108 @@ fn large_policy() -> Policy {
             }],
         })
         .collect();
-    Policy { clients }
+    Policy {
+        clients,
+        users: vec![],
+    }
 }
 
 #[test]
 #[ignore = "needs CAP_NET_ADMIN; run inside `sudo unshare -n`"]
 fn apply_large_policy() {
     let _guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
-    let ruleset = Ruleset::from_policy(&large_policy(), "wg0").unwrap();
+    let ruleset = Ruleset::from_policy(&large_policy(), "wg0", &[]).unwrap();
     assert_eq!(ruleset.rules.len(), 5000);
 
     firewall::apply(&ruleset).unwrap();
     let listing = nft_json(&["list", "table", "inet", TABLE]).expect("table exists");
-    assert_eq!(count(&listing, "rule"), 2 + 1 + ruleset.rules.len() + 1);
+    assert_eq!(count(&listing, "rule"), 2 + 2 + ruleset.rules.len() + 2 + 1);
+
+    assert!(firewall::teardown().unwrap());
+}
+
+fn session(policy: &Policy, id: u32, ip: &str) -> SessionRules {
+    SessionRules::for_user(policy, id, "alice", ip.parse().unwrap()).unwrap()
+}
+
+#[test]
+#[ignore = "needs CAP_NET_ADMIN; run inside `sudo unshare -n`"]
+fn add_and_remove_sessions() {
+    let _guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+    let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
+    let mut ruleset = Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()]).unwrap();
+    firewall::apply(&ruleset).unwrap();
+
+    let s1 = session(&policy, 1, "192.168.60.7");
+    let s2 = session(&policy, 2, "fd00:60::7");
+    let s3 = session(&policy, 3, "192.168.60.8");
+    firewall::update_sessions(&[s1.clone(), s2.clone()], &[], &[s1.clone(), s2.clone()]).unwrap();
+    // Replacing a session (2 -> 3) and keeping another happens in one batch.
+    let live = [s1.clone(), s3.clone()];
+    firewall::update_sessions(std::slice::from_ref(&s3), &[2], &live).unwrap();
+    let incremental = nft_list_normalized();
+    assert_eq!(incremental, include_str!("data/sessions.kernel.nft"));
+
+    // A full rebuild with the same sessions holds the same rules.
+    ruleset.sessions = live.to_vec();
+    firewall::apply(&ruleset).unwrap();
+    let rebuilt = nft_json(&["list", "table", "inet", TABLE]).unwrap();
+    assert_eq!(count(&rebuilt, "chain"), 7);
+
+    // Removing every session leaves an empty dispatch chain, a session_flows chain that drops
+    // every marked connection, and no session chains.
+    firewall::update_sessions(&[], &[1, 3], &[]).unwrap();
+    let listing = nft_json(&["list", "chain", "inet", TABLE, SESSIONS_CHAIN]).unwrap();
+    assert_eq!(count(&listing, "rule"), 0);
+    let listing = nft_json(&["list", "chain", "inet", TABLE, SESSION_FLOWS_CHAIN]).unwrap();
+    assert_eq!(count(&listing, "rule"), 1);
+    assert_eq!(
+        count(
+            &nft_json(&["list", "table", "inet", TABLE]).unwrap(),
+            "chain"
+        ),
+        5
+    );
+
+    assert!(firewall::teardown().unwrap());
+}
+
+#[test]
+#[ignore = "needs CAP_NET_ADMIN; run inside `sudo unshare -n`"]
+fn session_churn() {
+    let _guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+    let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
+    firewall::apply(&Ruleset::from_policy(&policy, "wg0", &[]).unwrap()).unwrap();
+
+    let mut live = Vec::new();
+    for id in 1..=200u32 {
+        let s = session(
+            &policy,
+            id,
+            &format!("192.168.{}.{}", 60 + id / 250, id % 250 + 1),
+        );
+        live.push(s.clone());
+        firewall::update_sessions(&[s], &[], &live).unwrap();
+    }
+    let listing = nft_json(&["list", "chain", "inet", TABLE, SESSIONS_CHAIN]).unwrap();
+    assert_eq!(count(&listing, "rule"), 200);
+    let listing = nft_json(&["list", "chain", "inet", TABLE, SESSION_FLOWS_CHAIN]).unwrap();
+    assert_eq!(count(&listing, "rule"), 201);
+
+    while let Some(s) = live.pop() {
+        if live.len() % 2 == 0 {
+            firewall::update_sessions(&[], &[s.id], &live).unwrap();
+        } else {
+            // Removing via a replacement exercises add and delete together.
+            let replacement = session(&policy, s.id + 1000, "192.168.99.1");
+            let mut next = live.clone();
+            next.push(replacement.clone());
+            firewall::update_sessions(std::slice::from_ref(&replacement), &[s.id], &next).unwrap();
+            firewall::update_sessions(&[], &[replacement.id], &live).unwrap();
+        }
+    }
+    let listing = nft_json(&["list", "table", "inet", TABLE]).unwrap();
+    assert_eq!(count(&listing, "chain"), 5);
 
     assert!(firewall::teardown().unwrap());
 }
