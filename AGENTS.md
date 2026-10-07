@@ -11,9 +11,11 @@ not explicitly allowed is dropped. See `docs/` for the specifications:
 - `docs/00-specification.overview.md`: the full vision, with OIDC/OAuth identity, sessions and Axum.
 - `docs/01-specification.prototype.md`: the prototype. It provisions static per-client rules on
   startup and removes them on shutdown.
-- `docs/02-specification.oidc.md`: the **current milestone**. Users log in to an HTTPS portal through
-  OIDC, and their per-user allow list is applied to their source IP until their ID token expires.
-  Group-based access is out of scope. Don't add it unless asked.
+- `docs/02-specification.oidc.md`: users log in to an HTTPS portal through OIDC, and their
+  per-user allow list is applied to their source IP until their ID token expires. Group-based
+  access is out of scope. Don't add it unless asked.
+- `docs/03-specification.permissive_mode.md`: the **current milestone**. `--permissive` accepts
+  instead of dropping, and a deduplicated kernel log records what is (or would be) dropped.
 
 ## Layout
 
@@ -23,19 +25,21 @@ not explicitly allowed is dropped. See `docs/` for the specifications:
 | `src/lib.rs` | Library crate root. All other modules live in the library. |
 | `src/cli.rs` | Clap definitions (`run`, `check`, `teardown`); every flag has a `DRAWBRIDGE_*` env var. |
 | `src/policy.rs` | Serde YAML schema (`clients`, `users`), `Policy::load`/`parse`/`validate`. |
-| `src/ruleset.rs` | Pure `Policy` → `Ruleset` IR, including portal rules and `SessionRules`; `Display` renders nft-style text (used by `check`). |
+| `src/ruleset.rs` | Pure `Policy` → `Ruleset` IR, including portal rules, `SessionRules`, `Mode` and the drop log's `LogSet`s; `Display` renders nft-style text (used by `check`). |
 | `src/firewall.rs` | `Ruleset` → `rustables` batch; `apply` / `update_sessions` / `teardown`. Builds what touches the kernel. |
 | `src/session.rs` | `SessionTable` state machine (login, extend, expire, rebuild on failure) behind an `Enforcer` trait; `spawn` runs it as the single task that changes sessions. |
 | `src/oidc.rs` | OIDC relying party (`openidconnect`): discovery, auth URL with PKCE/nonce, code exchange, ID-token verification, username claim. `Authenticator` trait for tests. |
 | `src/portal.rs` | Axum router: `/`, `/login`, `/callback`, `/api/session`; cookies, pending-login store, security headers. |
 | `src/portal/*.html` | Confirmation page (inline JS schedules silent re-auth) and message template, embedded with `include_str!`. |
 | `src/netlink.rs` | Sends finalized batches with buffers sized to the batch, and parses the kernel's acks. |
+| `src/nfraw.rs` | Hand-encoded nf_tables messages for the drop log's sets and rules (which rustables can't express), spliced into the rustables batch. |
 | `src/gateway.rs` | Subcommand implementations: instance lock, interface check, signal-driven `run` lifecycle. |
 | `examples/policy.yaml` | Example policy, used by unit tests. |
 | `tests/data/example.nft` | Golden `check` output for the example policy. |
 | `tests/data/example.kernel.nft` | Golden `nft list` output (counters stripped) after applying the example policy. |
 | `tests/data/sessions.kernel.nft` | Golden `nft list` output after adding and replacing sessions incrementally. |
-| `tests/kernel.rs` | `#[ignore]`d tests against a real kernel (needs CAP_NET_ADMIN): example golden, 5,000-rule policy, session add/replace/remove golden, 200-session churn. |
+| `tests/data/drop_log.netlink.hex` | What `nft --debug=mnl` sends for the drop log's sets and rules; `nfraw` must match it byte for byte. |
+| `tests/kernel.rs` | `#[ignore]`d tests against a real kernel (needs CAP_NET_ADMIN): example golden, permissive mode, 5,000-rule policy, session add/replace/remove golden, 200-session churn. |
 | `e2e/` | Docker Compose end-to-end stack (`run.sh`, `compose.yaml`, `Dockerfile`, `policy.yaml`, `dex.yaml`). |
 
 ## Commands
@@ -68,22 +72,40 @@ Keep these unless the user changes them:
 
 - **nftables layout:** there is one `inet drawbridge` table.
   - The `input` and `forward` base chains are filter chains at priority 0 with `policy accept`.
-  - Each base chain does `iifname <ext> jump client_filter`.
-  - `client_filter` runs `ct mark != 0 jump session_flows`, then
+  - Each base chain does `iifname <ext> jump client_filter`, then `iifname <ext> jump drop_log`,
+    then the **one default action**: `iifname <ext> counter drop` (`counter accept` in permissive
+    mode). Nothing else drops. Anything not accepted must fall back to the base chain.
+  - `client_filter` runs `ct mark != 0 goto session_flows`, then
     `ct state established,related accept`, then one portal accept rule per `--portal-listen`
-    address, then the per-client rules, then `jump sessions`, then `counter drop`.
+    address, then the per-client rules, then `jump sessions`, and ends without a verdict.
   - `sessions` holds one `ip[6] saddr <ip> jump session_<id>` per live session; each `session_<id>`
     chain holds that user's rules (with the session IP as `saddr`), and each of them does
     `ct mark set <id>` before accepting.
-  - `session_flows` holds `ip[6] saddr <ip> ct mark <id> return` per live session, then
-    `counter drop`. This is how ending a session also cuts the connections it opened; without it,
-    `ct state established` would keep them alive. **Drawbridge owns the conntrack mark** of
-    connections arriving on the external interface. Don't add anything else that sets ct marks
-    on them.
+  - `session_flows` holds `ip[6] saddr <ip> ct mark <id> accept` per live session and nothing
+    else. It is reached by `goto`, so a marked packet with no live session falls off its end
+    straight back to the base chain (the base chain's `jump` is the only return point), skipping
+    `ct state established`, and meets the default action. This is how ending a session also cuts
+    the connections it opened. Keep the `jump` in the base chains: from a base chain, a `goto`
+    would fall through to the chain policy (accept) instead. **Drawbridge owns the conntrack
+    mark** of connections arriving on the external interface. Don't add anything else that sets
+    ct marks on them.
+  - `drop_log` logs each packet about to meet the default action, with prefix
+    `drawbridge drop: ` (or `drawbridge would-drop: ` in permissive mode), once per key per 10s:
+    TCP and UDP `goto drop_log_ports`, keyed by `saddr . daddr . l4proto . dport`; the rest are
+    keyed by `saddr . daddr . l4proto`. Each log rule is
+    `<key> != @set limit rate 50/second burst 100 packets add @set { <key> } counter log`, on
+    dynamic timeout sets `drop_seen4[_proto]` / `drop_seen6[_proto]` of 65,536 entries, and is
+    followed by a miss rule `<key> != @set counter` that counts new keys the limit or a full set
+    kept out of the log. The inverted lookup is needed because a dynset `add` of an existing key
+    still matches. Logging can lose lines, never verdicts, because the default action is a
+    separate rule. The sets and the whole contents of both log chains are built by `nfraw`, not
+    rustables. A kernel rejection of those messages is reported as `FirewallError::DropLog`,
+    naming the logging modules.
   - Session ids are nonzero `u32`s that start at a random value each run, so connections marked by
     a previous run can't match a new session.
   - A session change is one batch: add new session chains, flush `sessions` and `session_flows`
-    and re-add their rules for every live session, then delete the removed chains. If it fails,
+    and re-add their rules for every live session, then delete the removed chains. It never
+    touches the drop log. If it fails,
     `SessionTable` falls back to a full `apply` from its state and retries every 5s until that
     succeeds. It never tears down. Until a retry succeeds, an expired session may stay enforced;
     this is logged at error.
@@ -104,6 +126,11 @@ Keep these unless the user changes them:
   for a misnamed interface match nothing. Names are limited to 1–15 characters from
   `[A-Za-z0-9_.-]`.
 - **Shutdown is fail-open.** It deletes the table. `teardown` reports a missing table as success.
+- **Permissive mode** (`--permissive`, `DRAWBRIDGE_PERMISSIVE`) changes only the default action
+  and the log prefix. Sessions, the portal and the drop log work as in enforcing mode, so it shows
+  exactly what enforcing would drop. `run` warns at startup when it is on. Connections it lets
+  through aren't marked, so they survive a restart into enforcing mode as `established`; the
+  README tells operators to flush conntrack after switching.
 - **Policy is allow-only and inline per client or user** (`clients[].cidr`,
   `users[].username`, `allow[].dest/proto/ports`).
   - Validate before touching the kernel.
@@ -145,6 +172,11 @@ The docs are sparse, so read the source in `~/.cargo/registry/src/*/rustables-0.
 - There is no port-range helper. Ranges are a transport `Payload` followed by `Cmp Gte` and
   `Cmp Lte`, with big-endian bytes.
 - `Rule::icmp()` is IPv4-only. ICMPv6 needs `Meta L4Proto` plus `IPPROTO_ICMPV6`.
+- It has no `dynset` or `limit` expression, names only the four 128-bit registers (so it can't
+  build concatenated keys), and its raw-expression type can't be built outside the crate. Sets
+  have no `NFTA_SET_DESC` (size) either. That's why `nfraw` exists. To change what it encodes,
+  write the nft equivalent, capture it with `nft --debug=mnl` (e.g. in the e2e image with
+  `--cap-add NET_ADMIN`), update `tests/data/drop_log.netlink.hex` and match it.
 - The build runs bindgen, so libclang must be installed (`libclang-dev` in the Docker builder).
 - rustables is licensed **GPL-3.0-or-later**.
 
@@ -164,5 +196,8 @@ The docs are sparse, so read the source in `~/.cargo/registry/src/*/rustables-0.
   - Dex (`e2e/dex.yaml`, 30s ID tokens) is the OIDC provider. It issues no `preferred_username`
     and keeps no SSO session, so the e2e uses `--oidc-username-claim email` and the "silent"
     re-auth step re-submits the password form.
+  - The kernel log isn't emitted from containers (non-init network namespaces) unless
+    `net.netfilter.nf_log_all_netns=1`, so the e2e checks the drop log through rule counters and
+    set contents, not log lines.
   - The external Docker network stands in for WireGuard. It has pinned IPv6 neighbour entries,
     because Drawbridge (correctly) drops neighbour discovery on the external interface.

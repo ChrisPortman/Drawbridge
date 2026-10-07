@@ -15,10 +15,16 @@ use std::sync::Mutex;
 use drawbridge::firewall;
 use drawbridge::policy::{Allow, Client, Policy, PortSpec, Proto};
 use drawbridge::ruleset::{
-    FILTER_CHAIN, Ruleset, SESSION_FLOWS_CHAIN, SESSIONS_CHAIN, SessionRules, TABLE,
+    FILTER_CHAIN, LOG_SETS, Mode, Ruleset, SESSION_FLOWS_CHAIN, SESSIONS_CHAIN, SessionRules, TABLE,
 };
 
 const PORTAL: &str = "192.168.50.1:8443";
+
+/// Chains without sessions: 2 base, client_filter, session_flows, sessions and the 2 log chains.
+const CHAINS: usize = 7;
+/// Rules outside client_filter: 3 per base chain (filter jump, log jump, default action), and in
+/// the log chains 2 gotos and a log and a miss rule per set.
+const FIXED_RULES: usize = 2 * 3 + 2 + 2 * LOG_SETS.len();
 
 /// The tests share one kernel table, so they must not run concurrently.
 static KERNEL: Mutex<()> = Mutex::new(());
@@ -53,10 +59,12 @@ fn nft_list_normalized() -> String {
     let mut lines = Vec::new();
     for line in String::from_utf8(out.stdout).unwrap().lines() {
         let mut tokens = Vec::new();
-        let mut words = line.split_whitespace();
+        let mut words = line.split_whitespace().peekable();
         while let Some(word) = words.next() {
-            if word == "packets" || word == "bytes" {
-                words.next(); // the counter value
+            // A counter's values; `packets` also appears in `limit ... burst N packets`.
+            let is_value = words.peek().is_some_and(|w| w.parse::<u64>().is_ok());
+            if (word == "packets" || word == "bytes") && is_value {
+                words.next();
             } else {
                 tokens.push(word);
             }
@@ -79,10 +87,13 @@ fn apply_and_teardown() {
     firewall::apply(&ruleset).unwrap();
 
     let listing = nft_json(&["list", "table", "inet", TABLE]).expect("table exists");
-    assert_eq!(count(&listing, "chain"), 5);
-    // One jump per base chain; in client_filter, the session-flows jump, ct, portal, per-client
-    // rules, sessions jump and final drop; and the session_flows drop.
-    assert_eq!(count(&listing, "rule"), 2 + 3 + ruleset.rules.len() + 2 + 1);
+    assert_eq!(count(&listing, "chain"), CHAINS);
+    assert_eq!(count(&listing, "set"), LOG_SETS.len());
+    // In client_filter: the session-flows goto, ct, portal, per-client rules and sessions jump.
+    assert_eq!(
+        count(&listing, "rule"),
+        FIXED_RULES + 3 + ruleset.rules.len() + 1
+    );
     assert!(nft_json(&["list", "chain", "inet", TABLE, FILTER_CHAIN]).is_some());
     // What the kernel holds must match the reviewed golden listing, so the netlink encoding
     // can't drift from what `check` renders.
@@ -134,7 +145,10 @@ fn apply_large_policy() {
 
     firewall::apply(&ruleset).unwrap();
     let listing = nft_json(&["list", "table", "inet", TABLE]).expect("table exists");
-    assert_eq!(count(&listing, "rule"), 2 + 2 + ruleset.rules.len() + 2 + 1);
+    assert_eq!(
+        count(&listing, "rule"),
+        FIXED_RULES + 2 + ruleset.rules.len() + 1
+    );
 
     assert!(firewall::teardown().unwrap());
 }
@@ -165,21 +179,21 @@ fn add_and_remove_sessions() {
     ruleset.sessions = live.to_vec();
     firewall::apply(&ruleset).unwrap();
     let rebuilt = nft_json(&["list", "table", "inet", TABLE]).unwrap();
-    assert_eq!(count(&rebuilt, "chain"), 7);
+    assert_eq!(count(&rebuilt, "chain"), CHAINS + 2);
 
-    // Removing every session leaves an empty dispatch chain, a session_flows chain that drops
-    // every marked connection, and no session chains.
+    // Removing every session leaves empty dispatch and session_flows chains, so every marked
+    // connection falls through to the default action, and no session chains.
     firewall::update_sessions(&[], &[1, 3], &[]).unwrap();
     let listing = nft_json(&["list", "chain", "inet", TABLE, SESSIONS_CHAIN]).unwrap();
     assert_eq!(count(&listing, "rule"), 0);
     let listing = nft_json(&["list", "chain", "inet", TABLE, SESSION_FLOWS_CHAIN]).unwrap();
-    assert_eq!(count(&listing, "rule"), 1);
+    assert_eq!(count(&listing, "rule"), 0);
     assert_eq!(
         count(
             &nft_json(&["list", "table", "inet", TABLE]).unwrap(),
             "chain"
         ),
-        5
+        CHAINS
     );
 
     assert!(firewall::teardown().unwrap());
@@ -205,7 +219,7 @@ fn session_churn() {
     let listing = nft_json(&["list", "chain", "inet", TABLE, SESSIONS_CHAIN]).unwrap();
     assert_eq!(count(&listing, "rule"), 200);
     let listing = nft_json(&["list", "chain", "inet", TABLE, SESSION_FLOWS_CHAIN]).unwrap();
-    assert_eq!(count(&listing, "rule"), 201);
+    assert_eq!(count(&listing, "rule"), 200);
 
     while let Some(s) = live.pop() {
         if live.len() % 2 == 0 {
@@ -220,7 +234,24 @@ fn session_churn() {
         }
     }
     let listing = nft_json(&["list", "table", "inet", TABLE]).unwrap();
-    assert_eq!(count(&listing, "chain"), 5);
+    assert_eq!(count(&listing, "chain"), CHAINS);
 
+    assert!(firewall::teardown().unwrap());
+}
+
+#[test]
+#[ignore = "needs CAP_NET_ADMIN; run inside `sudo unshare -n`"]
+fn permissive_accepts_and_logs_would_drop() {
+    let _guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+    let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
+    let mut ruleset = Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()]).unwrap();
+    ruleset.mode = Mode::Permissive;
+    firewall::apply(&ruleset).unwrap();
+
+    // Exactly the enforcing listing, but for the default action and the log prefix.
+    let expected = include_str!("data/example.kernel.nft")
+        .replace("\"wg0\" counter drop", "\"wg0\" counter accept")
+        .replace("\"drawbridge drop: \"", "\"drawbridge would-drop: \"");
+    assert_eq!(nft_list_normalized(), expected);
     assert!(firewall::teardown().unwrap());
 }

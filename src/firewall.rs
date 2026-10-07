@@ -13,14 +13,16 @@ use rustables::{
 };
 
 use crate::netlink::{self, NetlinkError};
+use crate::nfraw;
 use crate::policy::{PortSpec, Proto};
 use std::net::SocketAddr;
+use std::ops::Range;
 
 use ipnetwork::IpNetwork;
 
 use crate::ruleset::{
-    BASE_CHAIN_PRIORITY, BASE_CHAINS, FILTER_CHAIN, RuleSpec, Ruleset, SESSION_FLOWS_CHAIN,
-    SESSIONS_CHAIN, SessionRules, TABLE, session_chain,
+    BASE_CHAIN_PRIORITY, BASE_CHAINS, DROP_LOG_CHAIN, DROP_LOG_PORTS_CHAIN, FILTER_CHAIN, Mode,
+    RuleSpec, Ruleset, SESSION_FLOWS_CHAIN, SESSIONS_CHAIN, SessionRules, TABLE, session_chain,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +31,11 @@ pub enum FirewallError {
     Build(#[from] BuilderError),
     #[error("nftables netlink request failed")]
     Netlink(#[from] NetlinkError),
+    #[error(
+        "the kernel rejected the drop log; check that the nft_log, nf_log_syslog and nft_limit \
+         modules are available (built in, or loadable)"
+    )]
+    DropLog(#[source] NetlinkError),
 }
 
 fn table() -> Table {
@@ -37,8 +44,19 @@ fn table() -> Table {
 
 /// Atomically replaces the gateway table with one implementing `ruleset`.
 pub fn apply(ruleset: &Ruleset) -> Result<(), FirewallError> {
-    netlink::send_batch(&build_apply_batch(ruleset)?.finalize())?;
-    Ok(())
+    let (batch, drop_log) = apply_batch_bytes(ruleset)?;
+    netlink::send_batch(&batch).map_err(|e| match e {
+        NetlinkError::Kernel { seq, .. } if drop_log.contains(&seq) => FirewallError::DropLog(e),
+        e => e.into(),
+    })
+}
+
+/// The rustables-built batch for [`apply`], plus the drop log's hand-encoded sets and the whole
+/// contents of its chains, which go last: they need the log chains, and nothing in the batch
+/// refers to them. Also returns the drop log's sequence numbers.
+fn apply_batch_bytes(ruleset: &Ruleset) -> Result<(Vec<u8>, Range<u32>), BuilderError> {
+    let batch = build_apply_batch(ruleset)?.finalize();
+    Ok(nfraw::splice(batch, &nfraw::drop_log(ruleset.mode)))
 }
 
 /// Atomically installs `added` sessions, removes the chains of the `removed` session ids, and
@@ -79,6 +97,9 @@ fn build_apply_batch(ruleset: &Ruleset) -> Result<Batch, BuilderError> {
     // Jump targets must exist before the rules that reference them.
     chain(&table, SESSION_FLOWS_CHAIN).add_to_batch(&mut batch);
     chain(&table, SESSIONS_CHAIN).add_to_batch(&mut batch);
+    // Filled by nfraw (see apply_batch_bytes).
+    chain(&table, DROP_LOG_CHAIN).add_to_batch(&mut batch);
+    chain(&table, DROP_LOG_PORTS_CHAIN).add_to_batch(&mut batch);
     for session in &ruleset.sessions {
         add_session_chain(&mut batch, &table, session)?;
     }
@@ -90,21 +111,27 @@ fn build_apply_batch(ruleset: &Ruleset) -> Result<Batch, BuilderError> {
             .with_policy(ChainPolicy::Accept)
             .with_type(ChainType::Filter)
             .add_to_batch(&mut batch);
-        jump(
-            Rule::new(&chain)?.iiface(&ruleset.external_iface)?,
-            FILTER_CHAIN,
-        )
+        let external = || Rule::new(&chain)?.iiface(&ruleset.external_iface);
+        jump(external()?, FILTER_CHAIN).add_to_batch(&mut batch);
+        // Whatever comes back from client_filter is logged, then meets the default action.
+        jump(external()?, DROP_LOG_CHAIN).add_to_batch(&mut batch);
+        let default = external()?.with_expr(Counter::default());
+        match ruleset.mode {
+            Mode::Enforcing => default.drop(),
+            Mode::Permissive => default.accept(),
+        }
         .add_to_batch(&mut batch);
     }
 
-    // Marked connections belong to a session; drop them once it has gone (see SESSION_FLOWS_CHAIN).
-    jump(
-        Rule::new(&filter)?
-            .with_expr(Conntrack::new(ConntrackKey::Mark))
-            .with_expr(Cmp::new(CmpOp::Neq, 0u32.to_ne_bytes())),
-        SESSION_FLOWS_CHAIN,
-    )
-    .add_to_batch(&mut batch);
+    // Marked connections belong to a session; once it has gone, they fall through to the default
+    // action (see SESSION_FLOWS_CHAIN).
+    Rule::new(&filter)?
+        .with_expr(Conntrack::new(ConntrackKey::Mark))
+        .with_expr(Cmp::new(CmpOp::Neq, 0u32.to_ne_bytes()))
+        .with_expr(Immediate::new_verdict(VerdictKind::Goto {
+            chain: SESSION_FLOWS_CHAIN.to_string(),
+        }))
+        .add_to_batch(&mut batch);
     established_or_related(Rule::new(&filter)?)?
         .accept()
         .add_to_batch(&mut batch);
@@ -115,10 +142,6 @@ fn build_apply_batch(ruleset: &Ruleset) -> Result<Batch, BuilderError> {
         allow_rule(Rule::new(&filter)?, spec)?.add_to_batch(&mut batch);
     }
     jump(Rule::new(&filter)?, SESSIONS_CHAIN).add_to_batch(&mut batch);
-    Rule::new(&filter)?
-        .with_expr(Counter::default())
-        .drop()
-        .add_to_batch(&mut batch);
 
     add_live_sessions(&mut batch, &table, &ruleset.sessions)?;
     Ok(batch)
@@ -161,13 +184,9 @@ fn add_live_sessions(
             .snetwork(IpNetwork::from(session.ip))?
             .with_expr(Conntrack::new(ConntrackKey::Mark))
             .with_expr(Cmp::new(CmpOp::Eq, session.id.to_ne_bytes()))
-            .with_expr(Immediate::new_verdict(VerdictKind::Return))
+            .accept()
             .add_to_batch(batch);
     }
-    Rule::new(&flows)?
-        .with_expr(Counter::default())
-        .drop()
-        .add_to_batch(batch);
     Ok(())
 }
 
@@ -307,7 +326,8 @@ mod tests {
         let session =
             SessionRules::for_user(&policy, 1, "alice", "192.168.60.7".parse().unwrap()).unwrap();
         ruleset.sessions.push(session.clone());
-        assert!(!build_apply_batch(&ruleset).unwrap().finalize().is_empty());
+        let (batch, drop_log) = apply_batch_bytes(&ruleset).unwrap();
+        assert!(!batch.is_empty() && !drop_log.is_empty());
         let live = [session.clone()];
         assert!(
             !build_sessions_batch(&live, &[2], &live)

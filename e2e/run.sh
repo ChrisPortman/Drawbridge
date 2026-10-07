@@ -96,6 +96,30 @@ flow() { # flow <alive|dead> <service> <description>  (is the connection from fl
     report "$1" "$got" "$3"
 }
 
+# nft_counter <chain> <pattern>: total packets counted by the rules in <chain> matching <pattern>.
+nft_counter() {
+    dc exec -T gateway nft list chain inet drawbridge "$1" | grep -e "$2" |
+        grep -o 'packets [0-9]*' | awk '{n += $2} END {print n + 0}'
+}
+
+# The base chains' default action: "drop" or "accept" counted over input and forward.
+default_counter() {
+    echo $(($(nft_counter input "counter .* $1\$") + $(nft_counter forward "counter .* $1\$")))
+}
+
+stop_gateway() {
+    dc exec -T gateway pkill -TERM -x drawbridge
+    for _ in $(seq 20); do
+        dc exec -T gateway pgrep -x drawbridge >/dev/null || break
+        sleep 0.25
+    done
+    if dc exec -T gateway nft list table inet drawbridge >/dev/null 2>&1; then
+        report absent present "drawbridge table removed"
+    else
+        report absent absent "drawbridge table removed"
+    fi
+}
+
 wait_until() { # wait_until <unix seconds>
     local now
     now=$(date +%s)
@@ -125,6 +149,23 @@ ping_ closed client-denied $SERVER
 tcp closed client-denied  $GATEWAY 2222
 tcp open   server         172.30.0.10 7000   # internally originated traffic is not filtered
 
+echo "== drop log"
+# Three datagrams to one destination port, each from a new source port: one key, so one log line.
+logged=$(nft_counter drop_log_ports '@drop_seen4 limit')
+dropped=$(default_counter drop)
+dc exec -T client-denied sh -c "for i in 1 2 3; do echo probe | socat -u - UDP:$SERVER:8080; done"
+report 1 $(($(nft_counter drop_log_ports '@drop_seen4 limit') - logged)) "repeated drops are logged once"
+got=fewer
+(($(default_counter drop) - dropped >= 3)) && got=all
+report all "$got" "every repeated datagram is dropped"
+report 1 "$(dc exec -T gateway nft list set inet drawbridge drop_seen4 |
+    grep -c '172.30.0.11 . 10.10.0.20 . [a-z0-9]* . 8080')" "the dropped key is remembered"
+# The ICMP probes above went to the IPv4 set without ports.
+got=no
+(($(nft_counter drop_log '@drop_seen4_proto limit') > 0)) && got=yes
+report yes "$got" "dropped IPv4 ICMP is logged"
+report 0 "$(nft_counter drop_log_ports '@drop_seen4 counter')" "no IPv4 key went unlogged"
+
 echo "== gateway running: IPv6"
 tcp open   client-allowed $SERVER6 8080
 tcp closed client-allowed $SERVER6 9000   # allowed over IPv4 only
@@ -133,6 +174,12 @@ ping_ open client-allowed $SERVER6
 tcp closed client-denied  $SERVER6 8080
 ping_ closed client-denied $SERVER6
 tcp open   server         fd00:30::10 7000
+got=no
+(($(nft_counter drop_log_ports '@drop_seen6 limit') > 0)) && got=yes
+report yes "$got" "dropped IPv6 TCP is logged"
+got=no
+(($(nft_counter drop_log '@drop_seen6_proto limit') > 0)) && got=yes
+report yes "$got" "dropped ICMPv6 is logged"
 
 echo "== portal login"
 tcp open   client-user $GATEWAY 8443   # every client may reach the portal
@@ -171,16 +218,7 @@ echo "== second instance"
 refused "another drawbridge instance holds" "second instance refuses to start" drawbridge run
 
 echo "== gateway stopped"
-dc exec -T gateway pkill -TERM -x drawbridge
-for _ in $(seq 20); do
-    dc exec -T gateway pgrep -x drawbridge >/dev/null || break
-    sleep 0.25
-done
-if dc exec -T gateway nft list table inet drawbridge >/dev/null 2>&1; then
-    report absent present "drawbridge table removed"
-else
-    report absent absent "drawbridge table removed"
-fi
+stop_gateway
 # Fail-open: everything denied above is now reachable, proving the denials came from the rules.
 tcp open   client-denied $SERVER 8081
 tcp open   client-denied $SERVER 8999
@@ -194,6 +232,27 @@ tcp open   client-user   $SERVER 8081
 tcp open   client-user   $SERVER6 8081
 flow_start client-user $SERVER 8082
 flow alive client-user "new connection to the echo service"
+
+echo "== permissive mode"
+dc exec -d gateway env DRAWBRIDGE_PERMISSIVE=true drawbridge run
+for _ in $(seq 40); do
+    dc exec -T gateway nft list table inet drawbridge >/dev/null 2>&1 && break
+    sleep 0.25
+done
+logged=$(nft_counter drop_log_ports 'would-drop')
+accepted=$(default_counter accept)
+# Denied while enforcing (see above), now let through.
+tcp open   client-denied $SERVER 8081
+udp open   client-denied $SERVER 5353
+tcp open   client-denied $SERVER6 8081
+tcp open   client-allowed $SERVER 8080   # allowed traffic is unaffected
+got=no
+(($(nft_counter drop_log_ports 'would-drop') > logged)) && got=yes
+report yes "$got" "traffic outside the policy is logged as would-drop"
+got=no
+(($(default_counter accept) > accepted)) && got=yes
+report yes "$got" "traffic outside the policy reaches the accepting default action"
+stop_gateway
 
 echo "== misconfiguration"
 refused "not found" "unknown external interface refuses to start" \

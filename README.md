@@ -45,6 +45,11 @@ Behaviours to know up front:
   gateway host itself. The only built-in exception is the login portal.
 - **Every change is atomic.** Rules are installed in a single nftables transaction. A rejected
   change leaves the previous rules in force.
+- **Drops are logged.** Traffic that is dropped is logged to the kernel log, once per client,
+  destination, protocol and port every 10 seconds.
+- **Permissive mode for rollout.** With `--permissive`, traffic the policy doesn't allow is
+  accepted and logged as "would-drop", so you can tune the policy on a live gateway before
+  enforcing it.
 - **Stopping is fail-open.** On a clean shutdown, Drawbridge deletes its table, and traffic on the
   external interface is no longer filtered. If you need fail-closed behaviour, add your own
   default-deny rules outside Drawbridge's table.
@@ -60,6 +65,7 @@ Behaviours to know up front:
   - [Checking a policy](#checking-a-policy)
   - [Setting up the OIDC provider and TLS](#setting-up-the-oidc-provider-and-tls)
   - [Running as a service](#running-as-a-service)
+  - [Rolling out with permissive mode](#rolling-out-with-permissive-mode)
   - [Configuration reference](#configuration-reference)
   - [Operating Drawbridge](#operating-drawbridge)
   - [Security notes](#security-notes)
@@ -111,6 +117,10 @@ This section covers deploying, configuring and operating a Drawbridge gateway. I
   (`net.ipv4.ip_forward=1`, `net.ipv6.conf.all.forwarding=1`).
 - `CAP_NET_ADMIN` for Drawbridge. Add `CAP_NET_BIND_SERVICE` if the portal listens on a port
   below 1024.
+- The kernel modules for the [dropped-traffic log](#dropped-traffic-log): `nft_log`,
+  `nf_log_syslog` (`nf_log_ipv4` and `nf_log_ipv6` before Linux 5.12) and `nft_limit`. Distribution
+  kernels load them on demand. On hosts that disable module loading, load them at boot, or `run`
+  fails with "the kernel rejected the drop log".
 - Optionally, the `nft` command-line tool, to inspect what Drawbridge installed.
 
 **For user logins (the portal)**
@@ -212,16 +222,24 @@ at startup. Run it after every policy change; it's safe to run anywhere. This is
 ```text
 $ drawbridge check --policy examples/policy.yaml --external-iface wg0 --portal-listen 192.168.50.1:8443
 table inet drawbridge {
+	set drop_seen4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; size 65536; flags dynamic,timeout; timeout 10s; }
+	set drop_seen4_proto { type ipv4_addr . ipv4_addr . inet_proto; size 65536; flags dynamic,timeout; timeout 10s; }
+	set drop_seen6 { type ipv6_addr . ipv6_addr . inet_proto . inet_service; size 65536; flags dynamic,timeout; timeout 10s; }
+	set drop_seen6_proto { type ipv6_addr . ipv6_addr . inet_proto; size 65536; flags dynamic,timeout; timeout 10s; }
 	chain input {
 		type filter hook input priority 0; policy accept;
 		iifname "wg0" jump client_filter
+		iifname "wg0" jump drop_log
+		iifname "wg0" counter drop
 	}
 	chain forward {
 		type filter hook forward priority 0; policy accept;
 		iifname "wg0" jump client_filter
+		iifname "wg0" jump drop_log
+		iifname "wg0" counter drop
 	}
 	chain client_filter {
-		ct mark != 0x00000000 jump session_flows
+		ct mark != 0x00000000 goto session_flows
 		ct state established,related accept
 		ip daddr 192.168.50.1 tcp dport 8443 counter accept
 		ip saddr 192.168.50.0/24 ip daddr 10.0.1.0/24 tcp dport 443 counter accept
@@ -229,18 +247,28 @@ table inet drawbridge {
 		ip saddr 192.168.50.0/24 ip daddr 10.0.0.53/32 udp dport 53 counter accept
 		ip6 saddr fd00:50::/64 ip6 daddr fd00:1::/64 meta l4proto ipv6-icmp counter accept
 		jump sessions
-		counter drop
 	}
 	chain session_flows {
-		counter drop
 	}
 	chain sessions {
+	}
+	chain drop_log {
+		meta l4proto tcp goto drop_log_ports
+		meta l4proto udp goto drop_log_ports
+		ip saddr . ip daddr . meta l4proto != @drop_seen4_proto add @drop_seen4_proto { ip saddr . ip daddr . meta l4proto } counter log prefix "drawbridge drop: "
+		ip6 saddr . ip6 daddr . meta l4proto != @drop_seen6_proto add @drop_seen6_proto { ip6 saddr . ip6 daddr . meta l4proto } counter log prefix "drawbridge drop: "
+	}
+	chain drop_log_ports {
+		ip saddr . ip daddr . meta l4proto . th dport != @drop_seen4 add @drop_seen4 { ip saddr . ip daddr . meta l4proto . th dport } counter log prefix "drawbridge drop: "
+		ip6 saddr . ip6 daddr . meta l4proto . th dport != @drop_seen6 add @drop_seen6 { ip6 saddr . ip6 daddr . meta l4proto . th dport } counter log prefix "drawbridge drop: "
 	}
 }
 ```
 
 User rules don't appear here. They're added per session, at login (see
-[Inspecting the rules](#inspecting-the-rules)).
+[Inspecting the rules](#inspecting-the-rules)). The `set` definitions and the `drop_log` chains
+implement the [dropped-traffic log](#dropped-traffic-log). With `--permissive`, the base chains end
+in `counter accept` and the log prefix is `drawbridge would-drop: `.
 
 ### Setting up the OIDC provider and TLS
 
@@ -384,6 +412,29 @@ stateDiagram-v2
   sudo drawbridge teardown --lock-file /run/drawbridge/drawbridge.lock
   ```
 
+### Rolling out with permissive mode
+
+To put Drawbridge on a gateway that already carries client traffic, without cutting anyone off
+while you write the policy:
+
+1. Write a first policy and check it with `drawbridge check`.
+2. Start Drawbridge with `--permissive` (or `DRAWBRIDGE_PERMISSIVE=true`). Everything the policy
+   allows works as normal, including portal logins and user sessions. Everything else is
+   **accepted** and logged with the prefix `drawbridge would-drop: `. Drawbridge warns at startup
+   that it isn't enforcing.
+3. Watch the log (`journalctl -k -g 'drawbridge would-drop'`). Each line is traffic that enforcing
+   mode would drop. Add policy entries for what clients need, and restart to apply them.
+4. When nothing you need shows up any more, restart without `--permissive`.
+5. Flush the connection-tracking table, e.g. `sudo conntrack -F` (from the `conntrack` package).
+   Connections that permissive mode let through are otherwise still "established" and keep
+   working after the switch, however the policy treats them. Flushing also makes every other
+   tracked connection on the host be re-evaluated (and, for NAT, re-established), so do it at a
+   quiet moment.
+
+Permissive mode changes only the default action and the log prefix, so the log shows exactly what
+enforcing mode would drop. Connections from an expired user session are also accepted and logged,
+rather than cut.
+
 ### Configuration reference
 
 Every option can be given as a flag or as an environment variable. Environment variables are the
@@ -396,6 +447,7 @@ recommended form for a service. Run `drawbridge run --help` for the authoritativ
 | `--policy` | `DRAWBRIDGE_POLICY` | (required) | Path to the YAML policy. |
 | `--external-iface` | `DRAWBRIDGE_EXTERNAL_IFACE` | (required) | Client interface, e.g. `wg0`: 1–15 characters from `A-Za-z0-9_.-`. It must exist when `run` starts. |
 | `--lock-file` | `DRAWBRIDGE_LOCK_FILE` | `/run/drawbridge.lock` | Instance lock used by `run` and `teardown`. |
+| `--permissive` | `DRAWBRIDGE_PERMISSIVE` | off | Accept traffic the policy doesn't allow, logging it as `drawbridge would-drop: ` instead of dropping it. For rollout; see [Rolling out with permissive mode](#rolling-out-with-permissive-mode). The variable takes `true` or `false`; anything else is a startup error. |
 | | `RUST_LOG` | `info` | Log level/filter, e.g. `debug` or `drawbridge=debug`. |
 
 **Portal** (setting `--portal-listen` enables the portal and makes the other portal and OIDC
@@ -445,8 +497,7 @@ With alice logged in from `10.8.0.23`, the session parts look like this:
 
 ```text
 	chain session_flows {
-		ip saddr 10.8.0.23 ct mark 0x5f3a91c2 return
-		counter drop
+		ip saddr 10.8.0.23 ct mark 0x5f3a91c2 accept
 	}
 
 	chain sessions {
@@ -460,8 +511,37 @@ With alice logged in from `10.8.0.23`, the session parts look like this:
 	}
 ```
 
-Each rule has a `counter`, so `nft list` also shows packets and bytes per rule. The counter on the
-final `counter drop` in `client_filter` shows how much traffic is being denied.
+Each rule has a `counter`, so `nft list` also shows packets and bytes per rule. The counters on
+the last rule of the `input` and `forward` chains show how much traffic is being denied (or, in
+permissive mode, would be).
+
+#### Dropped-traffic log
+
+Every packet about to be dropped is logged to the kernel log, which journald and syslog collect,
+with the prefix `drawbridge drop: ` (`drawbridge would-drop: ` in permissive mode):
+
+```text
+drawbridge drop: IN=wg0 OUT=eth1 SRC=10.8.0.23 DST=10.0.30.5 ... PROTO=TCP SPT=51234 DPT=3389 ...
+```
+
+`IN` and `OUT` tell forwarded traffic (`OUT` set) from traffic to the gateway itself. To keep the
+log readable, each source, destination, protocol and destination port (TCP and UDP) is logged at
+most once every 10 seconds; retries and repeated attempts within that window aren't logged again,
+but are still dropped. Read it with `journalctl -k -g drawbridge`.
+
+The recently logged keys are kept in the sets `drop_seen4`, `drop_seen4_proto`, `drop_seen6` and
+`drop_seen6_proto` (65,536 entries each). `sudo nft list set inet drawbridge drop_seen4` shows
+what was logged in the last 10 seconds.
+
+To protect the journal from a scan, each of the four log rules writes at most 50 lines a second
+(after a burst of 100). A new key held back by that limit, or because its set is full, isn't
+logged then, but is counted by the rule after it (`... != @drop_seen4 counter`), and is logged on
+a later packet once there's room. So if those counters in `drop_log` and `drop_log_ports` aren't
+zero, the log is incomplete: someone, often a scanner, is generating more new keys than it shows.
+
+> **Note:** the kernel doesn't log from inside containers (non-initial network namespaces) unless
+> `net.netfilter.nf_log_all_netns=1` is set on the host. On a normal gateway host this doesn't
+> apply.
 
 #### Logs
 
@@ -471,6 +551,7 @@ messages:
 | Message | Meaning |
 |---|---|
 | `access provisioned` | Startup finished; the rules are in force. |
+| `permissive mode: …` | Started with `--permissive`: traffic outside the policy is accepted, not dropped. |
 | `portal listening` | The portal is accepting connections on the logged address. |
 | `session provisioned` / `session extended` / `session replaced` | A user logged in, renewed, or a different user took over an IP. |
 | `session expired` | A session reached its expiry and was removed. |
@@ -500,6 +581,9 @@ messages:
 - **Fail-open by design.** Stopping Drawbridge removes all filtering on the external interface. If
   an outage must never open the network, add your own default-deny rules outside Drawbridge's
   table.
+- **Permissive mode doesn't protect anything.** It accepts all traffic on the external interface
+  that the policy doesn't, so use it only while rolling out, and check that production runs
+  without `DRAWBRIDGE_PERMISSIVE`.
 - **The portal is the only automatic exception.** Every client may connect to the listen
   addresses; everything else, including the provider and DNS, must be allowed in the policy.
 - **Source IP is identity.** A session is bound to the TCP peer address the user logged in from.
@@ -571,8 +655,8 @@ flowchart TD
     iif -- no --> pass["accept (not filtered)"]
     iif -- yes --> mark{"ct mark set?<br/>(connection opened by a session)"}
     mark -- yes --> flows{"session_flows:<br/>session still live?"}
-    flows -- no --> drop1["drop"]
-    flows -- yes --> est
+    flows -- no --> log
+    flows -- yes --> acc0["accept"]
     mark -- no --> est{"established or related?"}
     est -- yes --> acc1["accept"]
     est -- no --> portalr{"portal address and port?"}
@@ -582,15 +666,18 @@ flowchart TD
     static -- no --> sess{"sessions: source IP<br/>has a live session?"}
     sess -- yes --> schain{"session chain:<br/>a rule matches?"}
     schain -- yes --> acc4["set ct mark, accept"]
-    schain -- no --> drop2["drop"]
-    sess -- no --> drop2
+    schain -- no --> log
+    sess -- no --> log
+    log["drop_log: log, unless this key<br/>was logged in the last 10s"] --> def["default action:<br/>drop (accept with --permissive)"]
 ```
 
 - Every session gets its own chain, `session_<id>`. Logins, extensions and expiries each change
   the firewall in one transaction.
 - Connections a session opens are tagged with the session's id as their conntrack mark. When the
-  session ends, `session_flows` drops their packets, so access really stops, not just for new
-  connections.
+  session ends, `session_flows` no longer accepts their packets, and they meet the default action,
+  so access really stops, not just for new connections.
+- There is exactly one default action, the last rule of each base chain. Everything not accepted
+  along the way returns to it, after `drop_log`.
 - **Drawbridge owns the conntrack mark** on connections arriving on the external interface. Don't
   run other tools that set conntrack marks on that traffic.
 - Session ids start at a random value on each run, so connections marked before a restart can't

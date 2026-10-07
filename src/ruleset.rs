@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use ipnetwork::IpNetwork;
 
@@ -16,14 +17,213 @@ pub const FILTER_CHAIN: &str = "client_filter";
 pub const BASE_CHAINS: [&str; 2] = ["input", "forward"];
 /// Regular chain dispatching each authenticated session's source IP to its own chain.
 pub const SESSIONS_CHAIN: &str = "sessions";
-/// Regular chain that drops packets of connections whose session has ended. Every connection a
-/// session accepts is tagged with `ct mark <session id>`, and `client_filter` sends marked packets
-/// here before its `ct state established,related accept`; only live sessions' marks return.
+/// Regular chain that accepts packets of connections whose session is still live. Every connection
+/// a session accepts is tagged with `ct mark <session id>`, and `client_filter` sends marked packets
+/// here by `goto`, before its `ct state established,related accept`. A packet matching no live
+/// session falls off the end and, as `goto` left no return point in `client_filter`, goes back to
+/// the base chain's default action.
 pub const SESSION_FLOWS_CHAIN: &str = "session_flows";
 /// Prefix of the per-session chains; the session id follows.
 pub const SESSION_CHAIN_PREFIX: &str = "session_";
 /// Priority of the base chains (`filter`).
 pub const BASE_CHAIN_PRIORITY: i32 = 0;
+/// Regular chain, jumped to by each base chain just before its default action, that logs the
+/// packet once per [`LOG_WINDOW`] for each key (see [`LogSet`]). TCP and UDP continue by `goto`
+/// in [`DROP_LOG_PORTS_CHAIN`], whose keys include the destination port.
+pub const DROP_LOG_CHAIN: &str = "drop_log";
+/// Regular chain logging TCP and UDP, reached by `goto` from [`DROP_LOG_CHAIN`].
+pub const DROP_LOG_PORTS_CHAIN: &str = "drop_log_ports";
+/// The protocols [`DROP_LOG_CHAIN`] sends to [`DROP_LOG_PORTS_CHAIN`].
+pub const PORT_PROTOS: [Proto; 2] = [Proto::Tcp, Proto::Udp];
+/// How long a logged key stays in its set, suppressing further log lines for it.
+pub const LOG_WINDOW: Duration = Duration::from_secs(10);
+/// Most keys each log set holds. Once full, new keys go unlogged (but still reach the default
+/// action) until old ones expire, which bounds kernel memory under a scan.
+pub const LOG_SET_SIZE: u32 = 65_536;
+/// Most log lines per second from each log rule, after a burst of [`LOG_BURST`]. This bounds the
+/// load a scan puts on the kernel log; keys it holds back are counted by [`MissRule`] and logged
+/// on a later packet.
+pub const LOG_RATE: u32 = 50;
+pub const LOG_BURST: u32 = 100;
+
+/// What happens to traffic from the external interface that nothing in the policy accepts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Drop it.
+    #[default]
+    Enforcing,
+    /// Accept it, for rolling out onto a gateway already carrying traffic: the log shows what
+    /// enforcing would drop.
+    Permissive,
+}
+
+impl Mode {
+    /// Prefix of the kernel log lines for traffic reaching the default action.
+    pub fn log_prefix(self) -> &'static str {
+        match self {
+            Mode::Enforcing => "drawbridge drop: ",
+            Mode::Permissive => "drawbridge would-drop: ",
+        }
+    }
+
+    /// The base chains' default action, as an nft verdict.
+    pub fn verdict(self) -> &'static str {
+        match self {
+            Mode::Enforcing => "drop",
+            Mode::Permissive => "accept",
+        }
+    }
+}
+
+/// An IP address family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    V4,
+    V6,
+}
+
+/// One field of a log set's key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyField {
+    SrcAddr,
+    DstAddr,
+    L4Proto,
+    DstPort,
+}
+
+/// A set of recently logged keys: source, destination and layer 4 protocol, plus the destination
+/// port when `ports` (TCP and UDP only). Each address family needs its own sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogSet {
+    pub family: Family,
+    pub ports: bool,
+}
+
+/// Every log set, in the order their rules appear within each chain: IPv4 first.
+pub const LOG_SETS: [LogSet; 4] = [
+    LogSet {
+        family: Family::V4,
+        ports: true,
+    },
+    LogSet {
+        family: Family::V4,
+        ports: false,
+    },
+    LogSet {
+        family: Family::V6,
+        ports: true,
+    },
+    LogSet {
+        family: Family::V6,
+        ports: false,
+    },
+];
+
+impl LogSet {
+    pub fn name(self) -> &'static str {
+        match (self.family, self.ports) {
+            (Family::V4, true) => "drop_seen4",
+            (Family::V4, false) => "drop_seen4_proto",
+            (Family::V6, true) => "drop_seen6",
+            (Family::V6, false) => "drop_seen6_proto",
+        }
+    }
+
+    /// The chain holding this set's log rule.
+    pub fn chain(self) -> &'static str {
+        if self.ports {
+            DROP_LOG_PORTS_CHAIN
+        } else {
+            DROP_LOG_CHAIN
+        }
+    }
+
+    /// The key's fields, in order. Both the nft rendering here and `nfraw`'s encoding follow it.
+    pub fn key(self) -> &'static [KeyField] {
+        use KeyField::*;
+        if self.ports {
+            &[SrcAddr, DstAddr, L4Proto, DstPort]
+        } else {
+            &[SrcAddr, DstAddr, L4Proto]
+        }
+    }
+
+    /// The key as an nft concatenation, rendering each field with `render`.
+    fn concat(self, render: impl Fn(Family, KeyField) -> &'static str) -> String {
+        let fields: Vec<_> = self.key().iter().map(|&f| render(self.family, f)).collect();
+        fields.join(" . ")
+    }
+}
+
+/// The nft expression reading `field`.
+fn key_expr(family: Family, field: KeyField) -> &'static str {
+    match (family, field) {
+        (Family::V4, KeyField::SrcAddr) => "ip saddr",
+        (Family::V4, KeyField::DstAddr) => "ip daddr",
+        (Family::V6, KeyField::SrcAddr) => "ip6 saddr",
+        (Family::V6, KeyField::DstAddr) => "ip6 daddr",
+        (_, KeyField::L4Proto) => "meta l4proto",
+        (_, KeyField::DstPort) => "th dport",
+    }
+}
+
+/// The nft data type of `field`.
+fn key_type(family: Family, field: KeyField) -> &'static str {
+    match (family, field) {
+        (Family::V4, KeyField::SrcAddr | KeyField::DstAddr) => "ipv4_addr",
+        (Family::V6, KeyField::SrcAddr | KeyField::DstAddr) => "ipv6_addr",
+        (_, KeyField::L4Proto) => "inet_proto",
+        (_, KeyField::DstPort) => "inet_service",
+    }
+}
+
+/// The definition of a log set.
+pub struct LogSetDef(pub LogSet);
+
+impl fmt::Display for LogSetDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "set {} {{ type {}; size {LOG_SET_SIZE}; flags dynamic,timeout; timeout {}s; }}",
+            self.0.name(),
+            self.0.concat(key_type),
+            LOG_WINDOW.as_secs()
+        )
+    }
+}
+
+/// The rule logging a packet whose key isn't in its set yet, within the rate limit, and adding
+/// the key.
+pub struct LogRule(pub LogSet, pub Mode);
+
+impl fmt::Display for LogRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let LogRule(set, mode) = *self;
+        let key = set.concat(key_expr);
+        let name = set.name();
+        write!(
+            f,
+            "{key} != @{name} limit rate {LOG_RATE}/second burst {LOG_BURST} packets \
+             add @{name} {{ {key} }} counter log prefix \"{}\"",
+            mode.log_prefix()
+        )
+    }
+}
+
+/// Follows a [`LogRule`], counting packets it didn't log although their key is new: over the rate
+/// limit, or with the set full.
+pub struct MissRule(pub LogSet);
+
+impl fmt::Display for MissRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} != @{} counter",
+            self.0.concat(key_expr),
+            self.0.name()
+        )
+    }
+}
 
 /// Name of the chain holding session `id`'s rules.
 pub fn session_chain(id: u32) -> String {
@@ -54,6 +254,8 @@ pub struct Ruleset {
     pub rules: Vec<RuleSpec>,
     /// Authenticated sessions, each in its own chain. Empty when built from a policy.
     pub sessions: Vec<SessionRules>,
+    /// [`Mode::Enforcing`] when built from a policy.
+    pub mode: Mode,
 }
 
 /// The rules for one authenticated session: traffic from `ip` jumps to [`SessionRules::chain`].
@@ -127,6 +329,7 @@ impl Ruleset {
             portal: portal.to_vec(),
             rules,
             sessions: Vec::new(),
+            mode: Mode::Enforcing,
         })
     }
 }
@@ -222,7 +425,7 @@ impl fmt::Display for DispatchRule<'_> {
     }
 }
 
-/// The `session_flows` rule letting a live session's connections through.
+/// The `session_flows` rule accepting a live session's connections.
 pub struct FlowRule<'a>(pub &'a SessionRules);
 
 impl fmt::Display for FlowRule<'_> {
@@ -230,7 +433,7 @@ impl fmt::Display for FlowRule<'_> {
         let s = self.0;
         write!(
             f,
-            "{} saddr {} ct mark {:#010x} return",
+            "{} saddr {} ct mark {:#010x} accept",
             family(s.ip),
             s.ip,
             s.id
@@ -241,22 +444,24 @@ impl fmt::Display for FlowRule<'_> {
 /// Renders the ruleset in `nft list` syntax, for `check` output and logging.
 impl fmt::Display for Ruleset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let iface = &self.external_iface;
         writeln!(f, "table inet {TABLE} {{")?;
+        for set in LOG_SETS {
+            writeln!(f, "\t{}", LogSetDef(set))?;
+        }
         for hook in BASE_CHAINS {
             writeln!(f, "\tchain {hook} {{")?;
             writeln!(
                 f,
                 "\t\ttype filter hook {hook} priority {BASE_CHAIN_PRIORITY}; policy accept;"
             )?;
-            writeln!(
-                f,
-                "\t\tiifname \"{}\" jump {FILTER_CHAIN}",
-                self.external_iface
-            )?;
+            writeln!(f, "\t\tiifname \"{iface}\" jump {FILTER_CHAIN}")?;
+            writeln!(f, "\t\tiifname \"{iface}\" jump {DROP_LOG_CHAIN}")?;
+            writeln!(f, "\t\tiifname \"{iface}\" counter {}", self.mode.verdict())?;
             writeln!(f, "\t}}")?;
         }
         writeln!(f, "\tchain {FILTER_CHAIN} {{")?;
-        writeln!(f, "\t\tct mark != 0x00000000 jump {SESSION_FLOWS_CHAIN}")?;
+        writeln!(f, "\t\tct mark != 0x00000000 goto {SESSION_FLOWS_CHAIN}")?;
         writeln!(f, "\t\tct state established,related accept")?;
         for &addr in &self.portal {
             writeln!(f, "\t\t{}", PortalRule(addr))?;
@@ -265,13 +470,11 @@ impl fmt::Display for Ruleset {
             writeln!(f, "\t\t{rule}")?;
         }
         writeln!(f, "\t\tjump {SESSIONS_CHAIN}")?;
-        writeln!(f, "\t\tcounter drop")?;
         writeln!(f, "\t}}")?;
         writeln!(f, "\tchain {SESSION_FLOWS_CHAIN} {{")?;
         for session in &self.sessions {
             writeln!(f, "\t\t{}", FlowRule(session))?;
         }
-        writeln!(f, "\t\tcounter drop")?;
         writeln!(f, "\t}}")?;
         writeln!(f, "\tchain {SESSIONS_CHAIN} {{")?;
         for session in &self.sessions {
@@ -282,6 +485,19 @@ impl fmt::Display for Ruleset {
             writeln!(f, "\tchain {} {{", session.chain())?;
             for rule in &session.rules {
                 writeln!(f, "\t\t{rule}")?;
+            }
+            writeln!(f, "\t}}")?;
+        }
+        for chain in [DROP_LOG_CHAIN, DROP_LOG_PORTS_CHAIN] {
+            writeln!(f, "\tchain {chain} {{")?;
+            if chain == DROP_LOG_CHAIN {
+                for proto in PORT_PROTOS {
+                    writeln!(f, "\t\tmeta l4proto {proto} goto {DROP_LOG_PORTS_CHAIN}")?;
+                }
+            }
+            for set in LOG_SETS.into_iter().filter(|s| s.chain() == chain) {
+                writeln!(f, "\t\t{}", LogRule(set, self.mode))?;
+                writeln!(f, "\t\t{}", MissRule(set))?;
             }
             writeln!(f, "\t}}")?;
         }
@@ -479,13 +695,13 @@ mod tests {
             SessionRules::for_user(&policy, 4, "alice", "fd00:60::7".parse().unwrap()).unwrap(),
         ];
         let text = rs.to_string();
-        let tail = &text[text.find("\tchain session_flows").unwrap()..];
+        let start = text.find("\tchain session_flows").unwrap();
+        let end = text.find("\tchain drop_log ").unwrap();
         assert_eq!(
-            tail,
+            &text[start..end],
             "\tchain session_flows {
-\t\tip saddr 192.168.60.7 ct mark 0x00000003 return
-\t\tip6 saddr fd00:60::7 ct mark 0x00000004 return
-\t\tcounter drop
+\t\tip saddr 192.168.60.7 ct mark 0x00000003 accept
+\t\tip6 saddr fd00:60::7 ct mark 0x00000004 accept
 \t}
 \tchain sessions {
 \t\tip saddr 192.168.60.7 jump session_3
@@ -499,8 +715,40 @@ mod tests {
 \t\tip6 saddr fd00:60::7/128 ip6 daddr fd00:1::/64 tcp dport 22 ct mark set 0x00000004 counter accept
 \t\tip6 saddr fd00:60::7/128 ip6 daddr fd00:1::/64 tcp dport 443 ct mark set 0x00000004 counter accept
 \t}
-}
 "
+        );
+    }
+
+    #[test]
+    fn permissive_accepts_and_logs_would_drop() {
+        let enforcing = example().to_string();
+        let mut rs = example();
+        rs.mode = Mode::Permissive;
+        let (drop, accept) = ("\"wg0\" counter drop", "\"wg0\" counter accept");
+        let (logged, would) = ("\"drawbridge drop: \"", "\"drawbridge would-drop: \"");
+        // One default action per base chain, one log rule per set.
+        assert_eq!(enforcing.matches(drop).count(), BASE_CHAINS.len());
+        assert_eq!(enforcing.matches(logged).count(), LOG_SETS.len());
+        let expected = enforcing.replace(drop, accept).replace(logged, would);
+        assert_eq!(rs.to_string(), expected);
+    }
+
+    #[test]
+    fn log_set_keys_follow_family_and_ports() {
+        let rendered: Vec<String> = LOG_SETS.map(|s| LogSetDef(s).to_string()).into();
+        assert_eq!(
+            rendered,
+            [
+                "set drop_seen4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; size 65536; flags dynamic,timeout; timeout 10s; }",
+                "set drop_seen4_proto { type ipv4_addr . ipv4_addr . inet_proto; size 65536; flags dynamic,timeout; timeout 10s; }",
+                "set drop_seen6 { type ipv6_addr . ipv6_addr . inet_proto . inet_service; size 65536; flags dynamic,timeout; timeout 10s; }",
+                "set drop_seen6_proto { type ipv6_addr . ipv6_addr . inet_proto; size 65536; flags dynamic,timeout; timeout 10s; }",
+            ]
+        );
+        assert!(
+            LOG_SETS
+                .iter()
+                .all(|s| (s.chain() == DROP_LOG_PORTS_CHAIN) == s.ports)
         );
     }
 

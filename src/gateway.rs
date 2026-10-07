@@ -10,14 +10,14 @@ use anyhow::{Context, bail};
 use axum_server::tls_rustls::RustlsConfig;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinSet;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::cli::{LockArgs, PolicyArgs, PortalArgs, RunArgs};
 use crate::firewall;
 use crate::oidc::{Oidc, OidcConfig};
 use crate::policy::Policy;
 use crate::portal::{self, Portal};
-use crate::ruleset::{Ruleset, TABLE};
+use crate::ruleset::{Mode, Ruleset, TABLE};
 use crate::session::{self, Kernel, SessionTable};
 
 /// How long open portal connections get to finish at shutdown.
@@ -25,7 +25,10 @@ const PORTAL_DRAIN: Duration = Duration::from_secs(2);
 
 fn load(args: &PolicyArgs) -> anyhow::Result<(Policy, Ruleset)> {
     let policy = Policy::load(&args.policy)?;
-    let ruleset = Ruleset::from_policy(&policy, &args.external_iface, &args.portal_listen)?;
+    let mut ruleset = Ruleset::from_policy(&policy, &args.external_iface, &args.portal_listen)?;
+    if args.permissive {
+        ruleset.mode = Mode::Permissive;
+    }
     Ok((policy, ruleset))
 }
 
@@ -152,8 +155,12 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
         iface = %iface,
         iface_index,
         rules = ruleset.rules.len(),
+        mode = ?ruleset.mode,
         "access provisioned"
     );
+    if ruleset.mode == Mode::Permissive {
+        warn!("permissive mode: traffic outside the policy is logged and allowed, not dropped");
+    }
 
     let mut servers = JoinSet::new();
     let server_handle = axum_server::Handle::new();

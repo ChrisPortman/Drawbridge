@@ -4,6 +4,7 @@ pub mod cli;
 pub mod firewall;
 pub mod gateway;
 pub mod netlink;
+mod nfraw;
 pub mod oidc;
 pub mod policy;
 pub mod portal;

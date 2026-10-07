@@ -45,6 +45,11 @@ pub struct PolicyArgs {
     /// 10.8.0.1:443). Setting this enables the portal; every client may connect to it.
     #[arg(long, env = "DRAWBRIDGE_PORTAL_LISTEN", value_delimiter = ',')]
     pub portal_listen: Vec<SocketAddr>,
+    /// Accept traffic the policy doesn't allow instead of dropping it, logging it as
+    /// "drawbridge would-drop". For rolling out onto a gateway already carrying traffic: tune the
+    /// policy until nothing you need is logged, then restart without this flag.
+    #[arg(long, env = "DRAWBRIDGE_PERMISSIVE")]
+    pub permissive: bool,
 }
 
 /// Login portal and OIDC settings. Required when `--portal-listen` is set.
