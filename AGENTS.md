@@ -183,7 +183,8 @@ The docs are sparse, so read the source in `~/.cargo/registry/src/*/rustables-0.
   write the nft equivalent, capture it with `nft --debug=mnl` (e.g. in the e2e image with
   `--cap-add NET_ADMIN`), update `tests/data/drop_log.netlink.hex` and match it.
 - The build runs bindgen, so libclang must be installed (`libclang-dev` in the Docker builder).
-- rustables is licensed **GPL-3.0-or-later**.
+- rustables is licensed **GPL-3.0-or-later**. Drawbridge's own source is `MIT OR Apache-2.0`
+  (`LICENSE-MIT`, `LICENSE-APACHE`); the GPL reaches only distributed binaries, through rustables.
 
 ## Conventions
 

@@ -691,7 +691,7 @@ flowchart TD
 - libclang (`libclang-dev` on Debian/Ubuntu), used by the nftables bindings at build time.
 
 Drawbridge links [rustables](https://crates.io/crates/rustables), which is licensed
-GPL-3.0-or-later, so distributed binaries are subject to its terms.
+GPL-3.0-or-later, so distributed binaries are subject to its terms (see [License](#license)).
 
 ### Installing
 
@@ -729,3 +729,21 @@ cargo test --no-run && sudo unshare -n cargo test --test kernel -- --ignored
 Never run `drawbridge run` or `teardown` on a development machine; they change its firewall. See
 [`AGENTS.md`](AGENTS.md) for the design invariants and code layout, and [`docs/`](docs/) for the
 specifications.
+
+## License
+
+The Drawbridge source is licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+Built binaries statically link [rustables](https://crates.io/crates/rustables), which is licensed
+GPL-3.0-or-later. A distributed `drawbridge` binary is therefore subject, as a whole, to the terms
+of GPL-3.0-or-later, including the obligation to provide its corresponding source.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions.
