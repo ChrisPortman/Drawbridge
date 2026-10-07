@@ -60,7 +60,7 @@ pub struct PolicyArgs {
 /// Login portal and OIDC settings. Required when `--portal-listen` is set.
 #[derive(Debug, Args)]
 pub struct PortalArgs {
-    /// The portal's base URL as clients reach it, e.g. https://gateway.example:443. The OIDC
+    /// The portal's base URL as clients reach it, e.g. `https://gateway.example:443`. The OIDC
     /// redirect URI is this URL's `/callback`.
     #[arg(long, env = "DRAWBRIDGE_PORTAL_URL")]
     pub portal_url: Option<url::Url>,

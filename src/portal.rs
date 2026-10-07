@@ -7,7 +7,9 @@
 //! - `GET /api/session`: the session as JSON, polled by the page to schedule re-authentication.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::io;
+use std::net::{IpAddr, SocketAddr, TcpListener};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -18,17 +20,19 @@ use axum::routing::get;
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
+use axum_server::tls_rustls::RustlsConfig;
 use serde::Deserialize;
+use tokio::task::{JoinError, JoinSet};
 use tracing::{info, warn};
 
 mod oidc;
 
-pub(crate) use oidc::{Authenticator, Oidc, OidcConfig};
+pub(crate) use oidc::OidcConfig;
 // `pub` so `cli` can re-export it: it is the type of a public CLI field.
 pub use oidc::Secret;
 
 use crate::session::{SessionError, SessionHandle, unix_secs};
-use oidc::PendingLogin;
+use oidc::{Authenticator, Oidc, OidcError, PendingLogin};
 
 /// Holds the session token. `__Host-` makes browsers insist on Secure, Path=/ and no Domain.
 const SESSION_COOKIE: &str = "__Host-drawbridge_session";
@@ -57,14 +61,150 @@ struct Pending {
     started: Instant,
 }
 
-pub(crate) struct Portal<A> {
+/// What the portal needs to start.
+#[derive(Debug)]
+pub(crate) struct PortalConfig {
+    pub(crate) oidc: OidcConfig,
+    pub(crate) tls_cert: PathBuf,
+    pub(crate) tls_key: PathBuf,
+    pub(crate) listen: Vec<SocketAddr>,
+}
+
+/// Why the portal couldn't start, or stopped.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PortalError {
+    #[error(
+        "loading TLS certificate {cert} and key {key}",
+        cert = .cert.display(),
+        key = .key.display()
+    )]
+    Tls {
+        cert: PathBuf,
+        key: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("contacting OIDC issuer {issuer}")]
+    Oidc {
+        issuer: String,
+        #[source]
+        source: OidcError,
+    },
+    #[error("binding portal listener {addr}")]
+    Bind {
+        addr: SocketAddr,
+        #[source]
+        source: io::Error,
+    },
+    #[error("portal listener {addr} stopped")]
+    Stopped { addr: SocketAddr },
+    #[error("portal listener {addr} failed")]
+    Failed {
+        addr: SocketAddr,
+        #[source]
+        source: io::Error,
+    },
+    #[error("portal task panicked")]
+    Panicked(#[source] JoinError),
+}
+
+/// A portal ready to serve: TLS loaded, the OIDC provider discovered and the listeners bound.
+/// Preparing it before the firewall is touched means a misconfiguration can't leave the table
+/// half-provisioned.
+pub(crate) struct Prepared {
+    oidc: Oidc,
+    tls: RustlsConfig,
+    listeners: Vec<TcpListener>,
+}
+
+impl Prepared {
+    /// Loads the TLS files, discovers the OIDC provider (network I/O) and binds every listener.
+    /// Installs rustls's ring crypto provider for the process if none is set.
+    pub(crate) async fn new(config: PortalConfig) -> Result<Self, PortalError> {
+        // rustls needs a process-wide crypto provider; `Err` only means one is installed.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls = RustlsConfig::from_pem_file(&config.tls_cert, &config.tls_key)
+            .await
+            .map_err(|source| PortalError::Tls {
+                cert: config.tls_cert.clone(),
+                key: config.tls_key.clone(),
+                source,
+            })?;
+        let issuer = config.oidc.issuer.clone();
+        let oidc = Oidc::discover(config.oidc)
+            .await
+            .map_err(|source| PortalError::Oidc { issuer, source })?;
+        let listeners = config
+            .listen
+            .iter()
+            .map(|&addr| {
+                let bind = || {
+                    let listener = TcpListener::bind(addr)?;
+                    listener.set_nonblocking(true)?;
+                    Ok(listener)
+                };
+                bind().map_err(|source| PortalError::Bind { addr, source })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Prepared {
+            oidc,
+            tls,
+            listeners,
+        })
+    }
+
+    /// Starts serving on every listener, provisioning logins through `sessions`.
+    pub(crate) fn serve(self, sessions: SessionHandle) -> io::Result<Servers> {
+        let app = router(Portal::new(self.oidc, sessions))
+            .into_make_service_with_connect_info::<SocketAddr>();
+        let mut servers = Servers::default();
+        for listener in self.listeners {
+            let addr = listener.local_addr()?;
+            let server = axum_server::from_tcp_rustls(listener, self.tls.clone())?
+                .handle(servers.handle.clone());
+            let app = app.clone();
+            servers
+                .tasks
+                .spawn(async move { (addr, server.serve(app).await) });
+            info!(%addr, "portal listening");
+        }
+        Ok(servers)
+    }
+}
+
+/// The running portal listeners. The default has none.
+#[derive(Default)]
+pub(crate) struct Servers {
+    tasks: JoinSet<(SocketAddr, io::Result<()>)>,
+    handle: axum_server::Handle<SocketAddr>,
+}
+
+impl Servers {
+    /// Waits for a listener to stop, which is always a failure. Returns `None` at once when there
+    /// are no listeners. Cancel-safe.
+    pub(crate) async fn stopped(&mut self) -> Option<PortalError> {
+        Some(match self.tasks.join_next().await? {
+            Ok((addr, Ok(()))) => PortalError::Stopped { addr },
+            Ok((addr, Err(source))) => PortalError::Failed { addr, source },
+            Err(e) => PortalError::Panicked(e),
+        })
+    }
+
+    /// Stops accepting, gives open connections `drain` to finish, and waits for every listener.
+    pub(crate) async fn shutdown(mut self, drain: Duration) {
+        self.handle.graceful_shutdown(Some(drain));
+        while self.tasks.join_next().await.is_some() {}
+    }
+}
+
+struct Portal<A> {
     auth: A,
     sessions: SessionHandle,
     pending: Mutex<HashMap<String, Pending>>,
 }
 
 impl<A: Authenticator> Portal<A> {
-    pub(crate) fn new(auth: A, sessions: SessionHandle) -> Arc<Self> {
+    fn new(auth: A, sessions: SessionHandle) -> Arc<Self> {
         Arc::new(Portal {
             auth,
             sessions,
@@ -119,7 +259,7 @@ fn client_prefix(ip: IpAddr) -> IpAddr {
     }
 }
 
-pub(crate) fn router<A: Authenticator>(portal: Arc<Portal<A>>) -> Router {
+fn router<A: Authenticator>(portal: Arc<Portal<A>>) -> Router {
     Router::new()
         .route("/", get(index::<A>))
         .route("/login", get(login::<A>))

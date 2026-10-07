@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 
 use crate::firewall::ruleset::{RuleSpec, Ruleset, SessionRules};
 use crate::firewall::{self, FirewallError};
-use crate::policy::{Policy, Proto};
+use crate::policy::Policy;
 
 /// How long to wait before retrying a failed firewall rebuild.
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -197,7 +197,7 @@ impl<E: Enforcer> SessionTable<E> {
         (s.token == token && s.expires_at > now).then(|| SessionInfo {
             username: s.username.clone(),
             expires_at: unix_secs(s.expires_at),
-            access: s.rules.rules.iter().map(describe).collect(),
+            access: s.rules.rules.iter().map(RuleSpec::describe).collect(),
         })
     }
 
@@ -298,14 +298,6 @@ pub(crate) fn unix_secs(t: SystemTime) -> u64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn describe(rule: &RuleSpec) -> String {
-    match (rule.proto, rule.ports) {
-        (Proto::Any, _) => format!("{} any", rule.dst),
-        (proto, Some(ports)) => format!("{} {proto}/{ports}", rule.dst),
-        (proto, None) => format!("{} {proto}", rule.dst),
-    }
 }
 
 enum Command {

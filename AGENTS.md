@@ -24,14 +24,14 @@ not explicitly allowed is dropped. See `docs/` for the specifications:
 | `src/main.rs` | Thin binary: tracing setup, `Cli::parse()`, dispatch to `cli::{run, check, teardown}`. **No logic here.** |
 | `src/lib.rs` | Library crate root. Declares the top-level modules: `cli`, `firewall`, `policy` (`pub`) and `portal`, `session` (`pub(crate)`). |
 | `src/cli.rs` | Clap definitions (`run`, `check`, `teardown`); every flag has a `DRAWBRIDGE_*` env var. Re-exports the subcommands from `gateway`, and `Secret` (a flag's type) from `portal`. |
-| `src/cli/gateway.rs` | Subcommand implementations: instance lock, interface check, signal-driven `run` lifecycle. |
+| `src/cli/gateway.rs` | Subcommand implementations: instance lock, interface check, portal flags → `PortalConfig`, signal-driven `run` lifecycle. |
 | `src/policy.rs` | Serde YAML schema (`clients`, `users`), `Policy::load`/`parse`/`validate`. Shared by every other module. |
 | `src/firewall.rs` | `Ruleset` → `rustables` batch; `apply` / `update_sessions` / `teardown`. Builds what touches the kernel. |
 | `src/firewall/ruleset.rs` | Pure `Policy` → `Ruleset` IR, including portal rules, `SessionRules`, `Mode` and the drop log's `LogSet`s; `Display` renders nft-style text (used by `check`). |
 | `src/firewall/netlink.rs` | Sends finalized batches with buffers sized to the batch, and parses the kernel's acks. |
 | `src/firewall/nfraw.rs` | Hand-encoded nf_tables messages for the drop log's sets and rules (which rustables can't express), spliced into the rustables batch. |
 | `src/session.rs` | `SessionTable` state machine (login, extend, expire, rebuild on failure) behind an `Enforcer` trait; `spawn` runs it as the single task that changes sessions. |
-| `src/portal.rs` | Axum router: `/`, `/login`, `/callback`, `/api/session`; cookies, pending-login store, security headers. Re-exports what callers need from `oidc`. |
+| `src/portal.rs` | `Prepared` (TLS, OIDC discovery, listener binds) and `Servers` (serve, graceful shutdown); Axum router: `/`, `/login`, `/callback`, `/api/session`; cookies, pending-login store, security headers. Re-exports `OidcConfig` and `Secret` from `oidc`. |
 | `src/portal/oidc.rs` | OIDC relying party (`openidconnect`): discovery, auth URL with PKCE/nonce, code exchange, ID-token verification, username claim. `Authenticator` trait for tests. |
 | `src/portal/*.html` | Confirmation page (inline JS schedules silent re-auth) and message template, embedded with `include_str!`. |
 | `examples/policy.yaml` | Example policy, used by unit tests. |

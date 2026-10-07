@@ -302,6 +302,17 @@ pub struct RuleSpec {
     pub mark: Option<u32>,
 }
 
+impl RuleSpec {
+    /// What the rule lets through, for people rather than nft: `10.0.1.0/24 tcp/443`.
+    pub(crate) fn describe(&self) -> String {
+        match (self.proto, self.ports) {
+            (Proto::Any, _) => format!("{} any", self.dst),
+            (proto, Some(ports)) => format!("{} {proto}/{ports}", self.dst),
+            (proto, None) => format!("{} {proto}", self.dst),
+        }
+    }
+}
+
 impl Ruleset {
     /// Validates the policy, then expands it into one rule per client × allow entry × dest × port
     /// spec, in policy order. `portal` addresses get an accept rule ahead of the client rules.
@@ -600,6 +611,33 @@ mod tests {
             Ruleset::from_policy(&policy, "wg0", &[]),
             Err(RulesetError::Policy(_))
         ));
+    }
+
+    #[test]
+    fn describes_rules_for_people() {
+        let rule = |proto, ports| RuleSpec {
+            src: "192.168.60.7/32".parse().unwrap(),
+            dst: "10.0.1.0/24".parse().unwrap(),
+            proto,
+            ports,
+            mark: None,
+        };
+        let https = Some(PortSpec { lo: 443, hi: 443 });
+        let range = Some(PortSpec { lo: 8000, hi: 8080 });
+        assert_eq!(rule(Proto::Tcp, https).describe(), "10.0.1.0/24 tcp/443");
+        assert_eq!(
+            rule(Proto::Udp, range).describe(),
+            "10.0.1.0/24 udp/8000-8080"
+        );
+        assert_eq!(rule(Proto::Udp, None).describe(), "10.0.1.0/24 udp");
+        assert_eq!(rule(Proto::Icmp, None).describe(), "10.0.1.0/24 icmp");
+        assert_eq!(rule(Proto::Any, None).describe(), "10.0.1.0/24 any");
+        let v6 = RuleSpec {
+            src: "fd00:60::7/128".parse().unwrap(),
+            dst: "fd00:10::/64".parse().unwrap(),
+            ..rule(Proto::Tcp, https)
+        };
+        assert_eq!(v6.describe(), "fd00:10::/64 tcp/443");
     }
 
     #[test]

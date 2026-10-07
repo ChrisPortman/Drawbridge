@@ -1,22 +1,20 @@
 //! Subcommand implementations.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use axum_server::tls_rustls::RustlsConfig;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use super::{LockArgs, PolicyArgs, PortalArgs, RunArgs};
 use crate::firewall;
 use crate::firewall::ruleset::{Mode, Ruleset, TABLE};
 use crate::policy::Policy;
-use crate::portal::{self, Oidc, OidcConfig, Portal};
+use crate::portal::{OidcConfig, PortalConfig, Prepared, Servers};
 use crate::session::{self, Kernel, SessionTable};
 
 /// How long open portal connections get to finish at shutdown.
@@ -31,67 +29,34 @@ fn load(args: &PolicyArgs) -> anyhow::Result<(Policy, Ruleset)> {
     Ok((policy, ruleset))
 }
 
-/// Everything the portal needs, set up before the firewall is touched so a misconfiguration
-/// can't leave the table half-provisioned.
-struct PreparedPortal {
-    oidc: Oidc,
-    tls: RustlsConfig,
-    listeners: Vec<TcpListener>,
-}
-
 /// Unwraps a required portal option, naming its flag and environment variable.
 fn required<T>(value: Option<T>, flag: &str) -> anyhow::Result<T> {
     let env = format!("DRAWBRIDGE_{}", flag.to_uppercase().replace('-', "_"));
     value.with_context(|| format!("--{flag} ({env}) is required when the portal is enabled"))
 }
 
-async fn prepare_portal(
-    args: &PortalArgs,
-    listen: &[SocketAddr],
-) -> anyhow::Result<PreparedPortal> {
+/// Builds the portal's configuration from its flags, which are required once it is enabled.
+fn portal_config(args: &PortalArgs, listen: &[SocketAddr]) -> anyhow::Result<PortalConfig> {
     let url = required(args.portal_url.clone(), "portal-url")?;
     if url.scheme() != "https" {
         bail!("--portal-url must be an https URL, got {url}");
     }
     let redirect_url = url.join("callback").context("building the redirect URL")?;
-    let cert = required(args.tls_cert.as_ref(), "tls-cert")?;
-    let key = required(args.tls_key.as_ref(), "tls-key")?;
-    let config = OidcConfig {
-        issuer: required(args.oidc_issuer.clone(), "oidc-issuer")?,
-        client_id: required(args.oidc_client_id.clone(), "oidc-client-id")?,
-        client_secret: required(args.oidc_client_secret.clone(), "oidc-client-secret")?,
-        redirect_url: redirect_url.into(),
-        username_claim: args.oidc_username_claim.clone(),
-        scopes: args.oidc_scopes.clone(),
-        allow_insecure_http: args.oidc_allow_insecure_http,
-    };
-
-    let tls = RustlsConfig::from_pem_file(cert, key)
-        .await
-        .with_context(|| {
-            format!(
-                "loading TLS certificate {} and key {}",
-                cert.display(),
-                key.display()
-            )
-        })?;
-    let issuer = config.issuer.clone();
-    let oidc = Oidc::discover(config)
-        .await
-        .with_context(|| format!("contacting OIDC issuer {issuer}"))?;
-    let listeners = listen
-        .iter()
-        .map(|&addr| {
-            let l = TcpListener::bind(addr)
-                .with_context(|| format!("binding portal listener {addr}"))?;
-            l.set_nonblocking(true)?;
-            Ok(l)
-        })
-        .collect::<anyhow::Result<_>>()?;
-    Ok(PreparedPortal {
-        oidc,
-        tls,
-        listeners,
+    let tls_cert = required(args.tls_cert.clone(), "tls-cert")?;
+    let tls_key = required(args.tls_key.clone(), "tls-key")?;
+    Ok(PortalConfig {
+        oidc: OidcConfig {
+            issuer: required(args.oidc_issuer.clone(), "oidc-issuer")?,
+            client_id: required(args.oidc_client_id.clone(), "oidc-client-id")?,
+            client_secret: required(args.oidc_client_secret.clone(), "oidc-client-secret")?,
+            redirect_url: redirect_url.into(),
+            username_claim: args.oidc_username_claim.clone(),
+            scopes: args.oidc_scopes.clone(),
+            allow_insecure_http: args.oidc_allow_insecure_http,
+        },
+        tls_cert,
+        tls_key,
+        listen: listen.to_vec(),
     })
 }
 
@@ -134,12 +99,11 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
     let iface_index = nix::net::if_::if_nametoindex(iface.as_str())
         .with_context(|| format!("external interface {iface:?} not found"))?;
 
+    // Set up before touching nftables, so a misconfiguration can't leave the table provisioned.
     let prepared = if listen.is_empty() {
         None
     } else {
-        // rustls needs a process-wide crypto provider; `Err` only means one is installed.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        Some(prepare_portal(&args.portal, listen).await?)
+        Some(Prepared::new(portal_config(&args.portal, listen)?).await?)
     };
 
     // Install handlers before touching nftables so a signal during apply still reaches teardown.
@@ -161,10 +125,9 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
         warn!("permissive mode: traffic outside the policy is logged and allowed, not dropped");
     }
 
-    let mut servers = JoinSet::new();
-    let server_handle = axum_server::Handle::new();
+    let mut servers = Servers::default();
     let mut sessions_task = None;
-    if let Some(p) = prepared {
+    if let Some(portal) = prepared {
         let (sessions, task) = session::spawn(SessionTable::new(
             Arc::new(policy),
             Kernel {
@@ -173,16 +136,7 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
             args.portal.session_max_ttl,
         ));
         sessions_task = Some(task);
-        let app = portal::router(Portal::new(p.oidc, sessions))
-            .into_make_service_with_connect_info::<SocketAddr>();
-        for listener in p.listeners {
-            let addr = listener.local_addr()?;
-            let server = axum_server::from_tcp_rustls(listener, p.tls.clone())?
-                .handle(server_handle.clone());
-            let app = app.clone();
-            servers.spawn(async move { (addr, server.serve(app).await) });
-            info!(%addr, "portal listening");
-        }
+        servers = portal.serve(sessions).context("starting the portal")?;
     }
 
     // A dead portal or session manager can't be recovered from; shut down (fail-open) and report.
@@ -195,11 +149,7 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
     let failure = tokio::select! {
         _ = sigint.recv() => { info!("received SIGINT"); None }
         _ = sigterm.recv() => { info!("received SIGTERM"); None }
-        Some(joined) = servers.join_next() => Some(match joined {
-            Ok((addr, Ok(()))) => anyhow::anyhow!("portal listener {addr} stopped"),
-            Ok((addr, Err(e))) => anyhow::Error::new(e).context(format!("portal listener {addr} failed")),
-            Err(e) => anyhow::Error::new(e).context("portal task panicked"),
-        }),
+        Some(e) = servers.stopped() => Some(e.into()),
         exited = sessions_exited => {
             // The handle has completed; awaiting it again below would panic and skip teardown.
             sessions_task = None;
@@ -213,8 +163,7 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
         error!("{e:#}");
     }
 
-    server_handle.graceful_shutdown(Some(PORTAL_DRAIN));
-    while servers.join_next().await.is_some() {}
+    servers.shutdown(PORTAL_DRAIN).await;
     // The session manager must be gone before teardown, or a rebuild could recreate the table.
     if let Some(task) = sessions_task {
         task.abort();
