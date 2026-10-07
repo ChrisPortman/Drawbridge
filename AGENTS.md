@@ -152,9 +152,10 @@ Keep these unless the user changes them:
     `--oidc-allow-insecure-http` is set (the e2e sets it for Dex).
   - The portal is a confidential client (secret + PKCE). The browser only holds the `__Host-`
     session cookie (HttpOnly, Secure, SameSite=Lax, no Max-Age), checked against the source IP.
-  - `run` sets up the portal (TLS files, OIDC discovery, listener binds) before `apply`. At
-    shutdown it stops the portal, aborts the session manager *then* tears down, so a rebuild
-    can't recreate the table.
+  - `run` sets up the portal (TLS files, OIDC discovery, listener binds, TLS servers) before
+    `apply`, so `Prepared::serve` can't fail. Nothing after `apply` may return early: every exit
+    goes through teardown. At shutdown it stops the portal, aborts the session manager *then*
+    tears down, so a rebuild can't recreate the table.
 - `firewall/ruleset.rs` stays pure and kernel-free. Test rule generation there, not in
   `firewall.rs`.
 - Keep the public API minimal: `pub` only for what `main.rs` and `tests/kernel.rs` use (and what

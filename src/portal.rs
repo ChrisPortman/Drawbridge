@@ -20,7 +20,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
-use axum_server::tls_rustls::RustlsConfig;
+use axum_server::Server;
+use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use serde::Deserialize;
 use tokio::task::{JoinError, JoinSet};
 use tracing::{info, warn};
@@ -108,13 +109,13 @@ pub(crate) enum PortalError {
     Panicked(#[source] JoinError),
 }
 
-/// A portal ready to serve: TLS loaded, the OIDC provider discovered and the listeners bound.
-/// Preparing it before the firewall is touched means a misconfiguration can't leave the table
-/// half-provisioned.
+/// A portal ready to serve: TLS loaded, the OIDC provider discovered and the TLS servers built
+/// on bound listeners. Everything fallible happens here, before the firewall is touched, so
+/// [`serve`](Self::serve) can't fail and leave the table provisioned without a portal.
 pub(crate) struct Prepared {
     oidc: Oidc,
-    tls: RustlsConfig,
-    listeners: Vec<TcpListener>,
+    servers: Vec<(SocketAddr, Server<SocketAddr, RustlsAcceptor>)>,
+    handle: axum_server::Handle<SocketAddr>,
 }
 
 impl Prepared {
@@ -134,41 +135,42 @@ impl Prepared {
         let oidc = Oidc::discover(config.oidc)
             .await
             .map_err(|source| PortalError::Oidc { issuer, source })?;
-        let listeners = config
+        let handle = axum_server::Handle::new();
+        let servers = config
             .listen
             .iter()
             .map(|&addr| {
                 let bind = || {
                     let listener = TcpListener::bind(addr)?;
                     listener.set_nonblocking(true)?;
-                    Ok(listener)
+                    let bound = listener.local_addr()?;
+                    let server = axum_server::from_tcp_rustls(listener, tls.clone())?;
+                    Ok((bound, server.handle(handle.clone())))
                 };
                 bind().map_err(|source| PortalError::Bind { addr, source })
             })
             .collect::<Result<_, _>>()?;
         Ok(Prepared {
             oidc,
-            tls,
-            listeners,
+            servers,
+            handle,
         })
     }
 
     /// Starts serving on every listener, provisioning logins through `sessions`.
-    pub(crate) fn serve(self, sessions: SessionHandle) -> io::Result<Servers> {
+    pub(crate) fn serve(self, sessions: SessionHandle) -> Servers {
         let app = router(Portal::new(self.oidc, sessions))
             .into_make_service_with_connect_info::<SocketAddr>();
-        let mut servers = Servers::default();
-        for listener in self.listeners {
-            let addr = listener.local_addr()?;
-            let server = axum_server::from_tcp_rustls(listener, self.tls.clone())?
-                .handle(servers.handle.clone());
+        let mut tasks = JoinSet::new();
+        for (addr, server) in self.servers {
             let app = app.clone();
-            servers
-                .tasks
-                .spawn(async move { (addr, server.serve(app).await) });
+            tasks.spawn(async move { (addr, server.serve(app).await) });
             info!(%addr, "portal listening");
         }
-        Ok(servers)
+        Servers {
+            tasks,
+            handle: self.handle,
+        }
     }
 }
 

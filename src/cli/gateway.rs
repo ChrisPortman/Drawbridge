@@ -112,6 +112,7 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
 
     // The apply batch is atomic: if it fails, the previous state (including any table left by an
     // earlier run) is still in place, so tearing down here could only remove enforcement.
+    // Nothing after it may return early: every exit must go through the teardown below.
     firewall::apply(&ruleset).context("provisioning access")?;
     info!(
         table = TABLE,
@@ -136,7 +137,7 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
             args.portal.session_max_ttl,
         ));
         sessions_task = Some(task);
-        servers = portal.serve(sessions).context("starting the portal")?;
+        servers = portal.serve(sessions);
     }
 
     // A dead portal or session manager can't be recovered from; shut down (fail-open) and report.
