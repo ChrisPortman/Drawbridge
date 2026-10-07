@@ -60,7 +60,7 @@ enum Progress {
 }
 
 /// Sends a finalized batch and waits until the kernel has acked its last message.
-pub fn send_batch(batch: &[u8]) -> Result<(), NetlinkError> {
+pub(crate) fn send_batch(batch: &[u8]) -> Result<(), NetlinkError> {
     let last_seq = last_acked_seq(batch)?;
     let sock = open_socket(batch.len(), last_seq)?;
 

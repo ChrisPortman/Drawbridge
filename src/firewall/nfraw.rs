@@ -1,7 +1,7 @@
 //! Hand-encoded nf_tables messages for the drop log, which rustables 0.9 can't express: sets with
 //! a size and timeout, and rules that build a concatenated key in consecutive 32-bit registers,
 //! look it up and add it from the packet path (`dynset`). The encoding matches what `nft` 1.1
-//! sends for what [`Ruleset`](crate::ruleset::Ruleset) renders in the log chains. The messages are
+//! sends for what [`Ruleset`](super::ruleset::Ruleset) renders in the log chains. The messages are
 //! appended to a finalized rustables batch with [`splice`].
 
 use std::mem::size_of;
@@ -24,11 +24,11 @@ use rustables::sys::{
     NLM_F_CREATE, nfgenmsg, nlmsghdr,
 };
 
-use crate::policy::Proto;
-use crate::ruleset::{
+use super::ruleset::{
     DROP_LOG_CHAIN, DROP_LOG_PORTS_CHAIN, Family, KeyField, LOG_BURST, LOG_RATE, LOG_SET_SIZE,
     LOG_SETS, LOG_WINDOW, LogSet, Mode, PORT_PROTOS, TABLE,
 };
+use crate::policy::Proto;
 
 const HEADER_LEN: usize = size_of::<nlmsghdr>() + size_of::<nfgenmsg>();
 /// nft's datatype ids, which a concatenated set key type packs 6 bits apiece.
@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn matches_nft_encoding() {
-        let fixture: Vec<&str> = include_str!("../tests/data/drop_log.netlink.hex")
+        let fixture: Vec<&str> = include_str!("../../tests/data/drop_log.netlink.hex")
             .lines()
             .filter(|l| !l.starts_with('#'))
             .collect();

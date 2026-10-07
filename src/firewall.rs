@@ -1,6 +1,16 @@
 //! Translates a [`Ruleset`] into nf_tables netlink batches via `rustables`, sent with
-//! [`netlink::send_batch`].
+//! `netlink::send_batch`.
 
+mod netlink;
+mod nfraw;
+pub mod ruleset;
+
+pub use netlink::NetlinkError;
+
+use std::net::SocketAddr;
+use std::ops::Range;
+
+use ipnetwork::IpNetwork;
 use rustables::error::BuilderError;
 use rustables::expr::{
     Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Counter, HighLevelPayload,
@@ -12,15 +22,8 @@ use rustables::{
     Table,
 };
 
-use crate::netlink::{self, NetlinkError};
-use crate::nfraw;
 use crate::policy::{PortSpec, Proto};
-use std::net::SocketAddr;
-use std::ops::Range;
-
-use ipnetwork::IpNetwork;
-
-use crate::ruleset::{
+use ruleset::{
     BASE_CHAIN_PRIORITY, BASE_CHAINS, DROP_LOG_CHAIN, DROP_LOG_PORTS_CHAIN, FILTER_CHAIN, Mode,
     RuleSpec, Ruleset, SESSION_FLOWS_CHAIN, SESSIONS_CHAIN, SessionRules, TABLE, session_chain,
 };

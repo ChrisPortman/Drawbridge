@@ -21,19 +21,19 @@ not explicitly allowed is dropped. See `docs/` for the specifications:
 
 | Path | Purpose |
 |---|---|
-| `src/main.rs` | Thin binary: tracing setup, `Cli::parse()`, dispatch. **No logic here.** |
-| `src/lib.rs` | Library crate root. All other modules live in the library. |
-| `src/cli.rs` | Clap definitions (`run`, `check`, `teardown`); every flag has a `DRAWBRIDGE_*` env var. |
-| `src/policy.rs` | Serde YAML schema (`clients`, `users`), `Policy::load`/`parse`/`validate`. |
-| `src/ruleset.rs` | Pure `Policy` → `Ruleset` IR, including portal rules, `SessionRules`, `Mode` and the drop log's `LogSet`s; `Display` renders nft-style text (used by `check`). |
+| `src/main.rs` | Thin binary: tracing setup, `Cli::parse()`, dispatch to `cli::{run, check, teardown}`. **No logic here.** |
+| `src/lib.rs` | Library crate root. Declares the top-level modules: `cli`, `firewall`, `policy` (`pub`) and `portal`, `session` (`pub(crate)`). |
+| `src/cli.rs` | Clap definitions (`run`, `check`, `teardown`); every flag has a `DRAWBRIDGE_*` env var. Re-exports the subcommands from `gateway`, and `Secret` (a flag's type) from `portal`. |
+| `src/cli/gateway.rs` | Subcommand implementations: instance lock, interface check, signal-driven `run` lifecycle. |
+| `src/policy.rs` | Serde YAML schema (`clients`, `users`), `Policy::load`/`parse`/`validate`. Shared by every other module. |
 | `src/firewall.rs` | `Ruleset` → `rustables` batch; `apply` / `update_sessions` / `teardown`. Builds what touches the kernel. |
+| `src/firewall/ruleset.rs` | Pure `Policy` → `Ruleset` IR, including portal rules, `SessionRules`, `Mode` and the drop log's `LogSet`s; `Display` renders nft-style text (used by `check`). |
+| `src/firewall/netlink.rs` | Sends finalized batches with buffers sized to the batch, and parses the kernel's acks. |
+| `src/firewall/nfraw.rs` | Hand-encoded nf_tables messages for the drop log's sets and rules (which rustables can't express), spliced into the rustables batch. |
 | `src/session.rs` | `SessionTable` state machine (login, extend, expire, rebuild on failure) behind an `Enforcer` trait; `spawn` runs it as the single task that changes sessions. |
-| `src/oidc.rs` | OIDC relying party (`openidconnect`): discovery, auth URL with PKCE/nonce, code exchange, ID-token verification, username claim. `Authenticator` trait for tests. |
-| `src/portal.rs` | Axum router: `/`, `/login`, `/callback`, `/api/session`; cookies, pending-login store, security headers. |
+| `src/portal.rs` | Axum router: `/`, `/login`, `/callback`, `/api/session`; cookies, pending-login store, security headers. Re-exports what callers need from `oidc`. |
+| `src/portal/oidc.rs` | OIDC relying party (`openidconnect`): discovery, auth URL with PKCE/nonce, code exchange, ID-token verification, username claim. `Authenticator` trait for tests. |
 | `src/portal/*.html` | Confirmation page (inline JS schedules silent re-auth) and message template, embedded with `include_str!`. |
-| `src/netlink.rs` | Sends finalized batches with buffers sized to the batch, and parses the kernel's acks. |
-| `src/nfraw.rs` | Hand-encoded nf_tables messages for the drop log's sets and rules (which rustables can't express), spliced into the rustables batch. |
-| `src/gateway.rs` | Subcommand implementations: instance lock, interface check, signal-driven `run` lifecycle. |
 | `examples/policy.yaml` | Example policy, used by unit tests. |
 | `tests/data/example.nft` | Golden `check` output for the example policy. |
 | `tests/data/example.kernel.nft` | Golden `nft list` output (counters stripped) after applying the example policy. |
@@ -155,7 +155,11 @@ Keep these unless the user changes them:
   - `run` sets up the portal (TLS files, OIDC discovery, listener binds) before `apply`. At
     shutdown it stops the portal, aborts the session manager *then* tears down, so a rebuild
     can't recreate the table.
-- `ruleset.rs` stays pure and kernel-free. Test rule generation there, not in `firewall.rs`.
+- `firewall/ruleset.rs` stays pure and kernel-free. Test rule generation there, not in
+  `firewall.rs`.
+- Keep the public API minimal: `pub` only for what `main.rs` and `tests/kernel.rs` use (and what
+  their signatures name). Everything else is `pub(crate)`. Callers outside a top-level module use
+  its re-exports or its `pub` child modules (only `firewall::ruleset`), not its private children.
 - If you change rule generation or rendering, update `tests/data/example.nft`,
   `tests/data/example.kernel.nft` and the e2e checks to match.
 
@@ -182,8 +186,8 @@ The docs are sparse, so read the source in `~/.cargo/registry/src/*/rustables-0.
 
 ## Conventions
 
-- Rust 2024 edition. Library errors use `thiserror`; `gateway.rs` and `main.rs` use `anyhow` with
-  `.context(...)`.
+- Rust 2024 edition. Library errors use `thiserror`; `cli/gateway.rs` and `main.rs` use `anyhow`
+  with `.context(...)`.
 - Log with `tracing`; the level is set by `RUST_LOG` and defaults to `info`.
 - Put unit tests in `#[cfg(test)] mod tests` next to the code they test. Fixtures go in `examples/`
   or `tests/data/`.

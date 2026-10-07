@@ -14,7 +14,7 @@ pub const TABLE: &str = "drawbridge";
 pub const FILTER_CHAIN: &str = "client_filter";
 /// Filter base chains that send external-interface traffic to [`FILTER_CHAIN`], named after the
 /// netfilter hook each one attaches to.
-pub const BASE_CHAINS: [&str; 2] = ["input", "forward"];
+pub(crate) const BASE_CHAINS: [&str; 2] = ["input", "forward"];
 /// Regular chain dispatching each authenticated session's source IP to its own chain.
 pub const SESSIONS_CHAIN: &str = "sessions";
 /// Regular chain that accepts packets of connections whose session is still live. Every connection
@@ -24,27 +24,27 @@ pub const SESSIONS_CHAIN: &str = "sessions";
 /// the base chain's default action.
 pub const SESSION_FLOWS_CHAIN: &str = "session_flows";
 /// Prefix of the per-session chains; the session id follows.
-pub const SESSION_CHAIN_PREFIX: &str = "session_";
+pub(crate) const SESSION_CHAIN_PREFIX: &str = "session_";
 /// Priority of the base chains (`filter`).
-pub const BASE_CHAIN_PRIORITY: i32 = 0;
+pub(crate) const BASE_CHAIN_PRIORITY: i32 = 0;
 /// Regular chain, jumped to by each base chain just before its default action, that logs the
 /// packet once per [`LOG_WINDOW`] for each key (see [`LogSet`]). TCP and UDP continue by `goto`
 /// in [`DROP_LOG_PORTS_CHAIN`], whose keys include the destination port.
-pub const DROP_LOG_CHAIN: &str = "drop_log";
+pub(crate) const DROP_LOG_CHAIN: &str = "drop_log";
 /// Regular chain logging TCP and UDP, reached by `goto` from [`DROP_LOG_CHAIN`].
-pub const DROP_LOG_PORTS_CHAIN: &str = "drop_log_ports";
+pub(crate) const DROP_LOG_PORTS_CHAIN: &str = "drop_log_ports";
 /// The protocols [`DROP_LOG_CHAIN`] sends to [`DROP_LOG_PORTS_CHAIN`].
-pub const PORT_PROTOS: [Proto; 2] = [Proto::Tcp, Proto::Udp];
+pub(crate) const PORT_PROTOS: [Proto; 2] = [Proto::Tcp, Proto::Udp];
 /// How long a logged key stays in its set, suppressing further log lines for it.
-pub const LOG_WINDOW: Duration = Duration::from_secs(10);
+pub(crate) const LOG_WINDOW: Duration = Duration::from_secs(10);
 /// Most keys each log set holds. Once full, new keys go unlogged (but still reach the default
 /// action) until old ones expire, which bounds kernel memory under a scan.
-pub const LOG_SET_SIZE: u32 = 65_536;
+pub(crate) const LOG_SET_SIZE: u32 = 65_536;
 /// Most log lines per second from each log rule, after a burst of [`LOG_BURST`]. This bounds the
 /// load a scan puts on the kernel log; keys it holds back are counted by [`MissRule`] and logged
 /// on a later packet.
-pub const LOG_RATE: u32 = 50;
-pub const LOG_BURST: u32 = 100;
+pub(crate) const LOG_RATE: u32 = 50;
+pub(crate) const LOG_BURST: u32 = 100;
 
 /// What happens to traffic from the external interface that nothing in the policy accepts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -59,7 +59,7 @@ pub enum Mode {
 
 impl Mode {
     /// Prefix of the kernel log lines for traffic reaching the default action.
-    pub fn log_prefix(self) -> &'static str {
+    pub(crate) fn log_prefix(self) -> &'static str {
         match self {
             Mode::Enforcing => "drawbridge drop: ",
             Mode::Permissive => "drawbridge would-drop: ",
@@ -67,7 +67,7 @@ impl Mode {
     }
 
     /// The base chains' default action, as an nft verdict.
-    pub fn verdict(self) -> &'static str {
+    pub(crate) fn verdict(self) -> &'static str {
         match self {
             Mode::Enforcing => "drop",
             Mode::Permissive => "accept",
@@ -120,7 +120,7 @@ pub const LOG_SETS: [LogSet; 4] = [
 ];
 
 impl LogSet {
-    pub fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match (self.family, self.ports) {
             (Family::V4, true) => "drop_seen4",
             (Family::V4, false) => "drop_seen4_proto",
@@ -130,7 +130,7 @@ impl LogSet {
     }
 
     /// The chain holding this set's log rule.
-    pub fn chain(self) -> &'static str {
+    pub(crate) fn chain(self) -> &'static str {
         if self.ports {
             DROP_LOG_PORTS_CHAIN
         } else {
@@ -139,7 +139,7 @@ impl LogSet {
     }
 
     /// The key's fields, in order. Both the nft rendering here and `nfraw`'s encoding follow it.
-    pub fn key(self) -> &'static [KeyField] {
+    pub(crate) fn key(self) -> &'static [KeyField] {
         use KeyField::*;
         if self.ports {
             &[SrcAddr, DstAddr, L4Proto, DstPort]
@@ -178,7 +178,7 @@ fn key_type(family: Family, field: KeyField) -> &'static str {
 }
 
 /// The definition of a log set.
-pub struct LogSetDef(pub LogSet);
+pub(crate) struct LogSetDef(pub(crate) LogSet);
 
 impl fmt::Display for LogSetDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -194,7 +194,7 @@ impl fmt::Display for LogSetDef {
 
 /// The rule logging a packet whose key isn't in its set yet, within the rate limit, and adding
 /// the key.
-pub struct LogRule(pub LogSet, pub Mode);
+pub(crate) struct LogRule(pub(crate) LogSet, pub(crate) Mode);
 
 impl fmt::Display for LogRule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -212,7 +212,7 @@ impl fmt::Display for LogRule {
 
 /// Follows a [`LogRule`], counting packets it didn't log although their key is new: over the rate
 /// limit, or with the set full.
-pub struct MissRule(pub LogSet);
+pub(crate) struct MissRule(pub(crate) LogSet);
 
 impl fmt::Display for MissRule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -226,7 +226,7 @@ impl fmt::Display for MissRule {
 }
 
 /// Name of the chain holding session `id`'s rules.
-pub fn session_chain(id: u32) -> String {
+pub(crate) fn session_chain(id: u32) -> String {
     format!("{SESSION_CHAIN_PREFIX}{id}")
 }
 
@@ -258,7 +258,8 @@ pub struct Ruleset {
     pub mode: Mode,
 }
 
-/// The rules for one authenticated session: traffic from `ip` jumps to [`SessionRules::chain`].
+/// The rules for one authenticated session: traffic from `ip` jumps to its own `session_<id>`
+/// chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRules {
     /// Nonzero; also the `ct mark` of the session's connections.
@@ -285,7 +286,7 @@ impl SessionRules {
         Some(SessionRules { id, ip, rules })
     }
 
-    pub fn chain(&self) -> String {
+    pub(crate) fn chain(&self) -> String {
         session_chain(self.id)
     }
 }
@@ -401,7 +402,7 @@ fn family(ip: IpAddr) -> &'static str {
 }
 
 /// The portal accept rule for one listen address.
-pub struct PortalRule(pub SocketAddr);
+pub(crate) struct PortalRule(pub(crate) SocketAddr);
 
 impl fmt::Display for PortalRule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -416,7 +417,7 @@ impl fmt::Display for PortalRule {
 }
 
 /// The `sessions` chain rule sending a session's traffic to its chain.
-pub struct DispatchRule<'a>(pub &'a SessionRules);
+pub(crate) struct DispatchRule<'a>(pub(crate) &'a SessionRules);
 
 impl fmt::Display for DispatchRule<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -426,7 +427,7 @@ impl fmt::Display for DispatchRule<'_> {
 }
 
 /// The `session_flows` rule accepting a live session's connections.
-pub struct FlowRule<'a>(pub &'a SessionRules);
+pub(crate) struct FlowRule<'a>(pub(crate) &'a SessionRules);
 
 impl fmt::Display for FlowRule<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -510,7 +511,7 @@ mod tests {
     use super::*;
 
     fn example_policy() -> Policy {
-        Policy::parse(include_str!("../examples/policy.yaml")).unwrap()
+        Policy::parse(include_str!("../../examples/policy.yaml")).unwrap()
     }
 
     const PORTAL: &str = "192.168.50.1:8443";
@@ -756,7 +757,7 @@ mod tests {
     fn renders_example() {
         assert_eq!(
             example().to_string(),
-            include_str!("../tests/data/example.nft")
+            include_str!("../../tests/data/example.nft")
         );
     }
 }

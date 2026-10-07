@@ -42,7 +42,7 @@ should follow.
 ### 2. Idiomatic Rust
 - **Errors:**
   - `thiserror` enums in the library and `anyhow` with `.context(...)` at the binary and
-    `gateway.rs` edge;
+    `cli/gateway.rs` edge;
   - `?` rather than `match`/`unwrap` chains;
   - no `unwrap`/`expect` on fallible paths outside tests, unless an invariant makes it infallible
     and the message says which.
@@ -78,7 +78,7 @@ should follow.
   - policy parsing and **each** validation error;
   - ruleset expansion and normalisation;
   - rendering, through the golden file `tests/data/example.nft`;
-  - byte encodings in `firewall.rs`.
+  - byte encodings in `firewall.rs` and `firewall/nfraw.rs`.
 - Edge and error cases should be covered as well as the happy path. Boundaries matter: port 0,
   65535, `lo == hi`, empty lists, IPv6.
 - Thin glue doesn't need its own unit tests: `main.rs`, clap structs, and the code that sends
@@ -98,8 +98,8 @@ should follow.
 ### 5. Sensible architecture
 - Respect the layering in `AGENTS.md`:
   - `main.rs` stays a thin binary;
-  - `policy` (schema and validation) → `ruleset` (pure IR, no kernel) → `firewall` (the only
-    kernel-touching code) → `gateway` (lifecycle).
+  - `policy` (schema and validation) → `firewall::ruleset` (pure IR, no kernel) → `firewall` (the
+    only kernel-touching code) → `cli::gateway` (lifecycle).
   - Flag logic leaking across these boundaries, e.g. kernel types in `ruleset`, validation in
     `firewall`, or business logic in `main.rs`.
 - Dependencies point one way, and there are no cycles. New modules should earn their place.

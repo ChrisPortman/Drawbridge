@@ -21,8 +21,14 @@ use axum_extra::extract::cookie::{Cookie, SameSite};
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use crate::oidc::{Authenticator, PendingLogin};
+mod oidc;
+
+pub(crate) use oidc::{Authenticator, Oidc, OidcConfig};
+// `pub` so `cli` can re-export it: it is the type of a public CLI field.
+pub use oidc::Secret;
+
 use crate::session::{SessionError, SessionHandle, unix_secs};
+use oidc::PendingLogin;
 
 /// Holds the session token. `__Host-` makes browsers insist on Secure, Path=/ and no Domain.
 const SESSION_COOKIE: &str = "__Host-drawbridge_session";
@@ -51,14 +57,14 @@ struct Pending {
     started: Instant,
 }
 
-pub struct Portal<A> {
+pub(crate) struct Portal<A> {
     auth: A,
     sessions: SessionHandle,
     pending: Mutex<HashMap<String, Pending>>,
 }
 
 impl<A: Authenticator> Portal<A> {
-    pub fn new(auth: A, sessions: SessionHandle) -> Arc<Self> {
+    pub(crate) fn new(auth: A, sessions: SessionHandle) -> Arc<Self> {
         Arc::new(Portal {
             auth,
             sessions,
@@ -113,7 +119,7 @@ fn client_prefix(ip: IpAddr) -> IpAddr {
     }
 }
 
-pub fn router<A: Authenticator>(portal: Arc<Portal<A>>) -> Router {
+pub(crate) fn router<A: Authenticator>(portal: Arc<Portal<A>>) -> Router {
     Router::new()
         .route("/", get(index::<A>))
         .route("/login", get(login::<A>))
@@ -355,8 +361,8 @@ mod tests {
     use openidconnect::{Nonce, PkceCodeVerifier};
     use tower::ServiceExt;
 
+    use super::oidc::{AuthRequest, Identity, OidcError};
     use super::*;
-    use crate::oidc::{AuthRequest, Identity, OidcError};
     use crate::policy::Policy;
     use crate::session::{NoopEnforcer, SessionTable};
 

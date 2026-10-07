@@ -13,15 +13,15 @@ use rand::RngExt;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
+use crate::firewall::ruleset::{RuleSpec, Ruleset, SessionRules};
 use crate::firewall::{self, FirewallError};
 use crate::policy::{Policy, Proto};
-use crate::ruleset::{RuleSpec, Ruleset, SessionRules};
 
 /// How long to wait before retrying a failed firewall rebuild.
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
-pub enum SessionError {
+pub(crate) enum SessionError {
     #[error("no access policy for user {0:?}")]
     NoPolicy(String),
     #[error("the login has already expired")]
@@ -33,7 +33,7 @@ pub enum SessionError {
 }
 
 /// Applies session changes to the firewall. [`Kernel`] is the real one.
-pub trait Enforcer: Send + 'static {
+pub(crate) trait Enforcer: Send + 'static {
     /// Incremental change; see [`firewall::update_sessions`].
     fn update(
         &mut self,
@@ -46,8 +46,8 @@ pub trait Enforcer: Send + 'static {
 }
 
 /// Enforces through the kernel, rebuilding from the static `base` ruleset.
-pub struct Kernel {
-    pub base: Ruleset,
+pub(crate) struct Kernel {
+    pub(crate) base: Ruleset,
 }
 
 impl Enforcer for Kernel {
@@ -98,15 +98,15 @@ struct Session {
 
 /// What `/api/session` reports about a live session.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct SessionInfo {
-    pub username: String,
+pub(crate) struct SessionInfo {
+    username: String,
     /// Seconds since the Unix epoch.
-    pub expires_at: u64,
+    expires_at: u64,
     /// What the session may reach, one entry per rule, e.g. `10.0.1.0/24 tcp/443`.
-    pub access: Vec<String>,
+    access: Vec<String>,
 }
 
-pub struct SessionTable<E> {
+pub(crate) struct SessionTable<E> {
     policy: Arc<Policy>,
     enforcer: E,
     by_ip: HashMap<IpAddr, Session>,
@@ -121,7 +121,7 @@ pub struct SessionTable<E> {
 }
 
 impl<E: Enforcer> SessionTable<E> {
-    pub fn new(policy: Arc<Policy>, enforcer: E, max_ttl: Duration) -> Self {
+    pub(crate) fn new(policy: Arc<Policy>, enforcer: E, max_ttl: Duration) -> Self {
         SessionTable {
             policy,
             enforcer,
@@ -137,7 +137,7 @@ impl<E: Enforcer> SessionTable<E> {
     ///
     /// A login matching the session already held by `ip` extends it and keeps its token, so
     /// several browsers on one host can share it. A different user from `ip` replaces it.
-    pub fn login(
+    pub(crate) fn login(
         &mut self,
         ip: IpAddr,
         username: &str,
@@ -192,7 +192,7 @@ impl<E: Enforcer> SessionTable<E> {
     }
 
     /// The session `token` names, if it is live and belongs to `ip`.
-    pub fn status(&self, token: &str, ip: IpAddr, now: SystemTime) -> Option<SessionInfo> {
+    pub(crate) fn status(&self, token: &str, ip: IpAddr, now: SystemTime) -> Option<SessionInfo> {
         let s = self.by_ip.get(&ip)?;
         (s.token == token && s.expires_at > now).then(|| SessionInfo {
             username: s.username.clone(),
@@ -202,7 +202,7 @@ impl<E: Enforcer> SessionTable<E> {
     }
 
     /// Removes every session expired by `now`.
-    pub fn expire(&mut self, now: SystemTime) {
+    pub(crate) fn expire(&mut self, now: SystemTime) {
         let expired: Vec<IpAddr> = self
             .by_ip
             .iter()
@@ -224,7 +224,7 @@ impl<E: Enforcer> SessionTable<E> {
     }
 
     /// Retries a rebuild after an earlier failure. Returns whether the kernel is now in sync.
-    pub fn retry(&mut self) -> bool {
+    pub(crate) fn retry(&mut self) -> bool {
         if self.dirty {
             match self.enforcer.rebuild(&self.live()) {
                 Ok(()) => {
@@ -238,7 +238,7 @@ impl<E: Enforcer> SessionTable<E> {
     }
 
     /// When the next session expires, or sooner if a rebuild is pending.
-    pub fn next_wakeup(&self, now: SystemTime) -> Option<Duration> {
+    pub(crate) fn next_wakeup(&self, now: SystemTime) -> Option<Duration> {
         let expiry = self
             .by_ip
             .values()
@@ -294,7 +294,7 @@ fn new_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub fn unix_secs(t: SystemTime) -> u64 {
+pub(crate) fn unix_secs(t: SystemTime) -> u64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
@@ -324,12 +324,12 @@ enum Command {
 
 /// Talks to the task started by [`spawn`].
 #[derive(Clone)]
-pub struct SessionHandle {
+pub(crate) struct SessionHandle {
     tx: mpsc::Sender<Command>,
 }
 
 impl SessionHandle {
-    pub async fn login(
+    pub(crate) async fn login(
         &self,
         ip: IpAddr,
         username: String,
@@ -348,7 +348,7 @@ impl SessionHandle {
         rx.await.map_err(|_| SessionError::Closed)?
     }
 
-    pub async fn status(&self, token: String, ip: IpAddr) -> Option<SessionInfo> {
+    pub(crate) async fn status(&self, token: String, ip: IpAddr) -> Option<SessionInfo> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Command::Status { token, ip, reply })
@@ -359,7 +359,9 @@ impl SessionHandle {
 }
 
 /// Runs `table` in a task until every [`SessionHandle`] is dropped.
-pub fn spawn<E: Enforcer>(table: SessionTable<E>) -> (SessionHandle, tokio::task::JoinHandle<()>) {
+pub(crate) fn spawn<E: Enforcer>(
+    table: SessionTable<E>,
+) -> (SessionHandle, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(64);
     (SessionHandle { tx }, tokio::spawn(run(table, rx)))
 }
@@ -419,7 +421,7 @@ mod tests {
                 ids(live)
             ));
             if self.fail_update {
-                return Err(crate::netlink::NetlinkError::Timeout.into());
+                return Err(crate::firewall::NetlinkError::Timeout.into());
             }
             Ok(())
         }
@@ -428,7 +430,7 @@ mod tests {
             let ids: Vec<_> = live.iter().map(|r| r.id).collect();
             self.calls.push(format!("rebuild ={ids:?}"));
             if self.fail_rebuild {
-                return Err(crate::netlink::NetlinkError::Timeout.into());
+                return Err(crate::firewall::NetlinkError::Timeout.into());
             }
             Ok(())
         }

@@ -26,7 +26,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A secret whose `Debug` output is redacted, so logging a config can't leak it.
 #[derive(Clone)]
-pub struct Secret(pub String);
+pub struct Secret(String);
 
 impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -43,7 +43,7 @@ impl FromStr for Secret {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum OidcError {
+pub(crate) enum OidcError {
     #[error("invalid OIDC configuration: {0}")]
     Config(String),
     #[error("failed to build HTTP client")]
@@ -68,7 +68,7 @@ pub enum OidcError {
 
 /// Claims outside the OIDC standard set, so any string claim can serve as the username.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct ExtraClaims(HashMap<String, serde_json::Value>);
+pub(crate) struct ExtraClaims(HashMap<String, serde_json::Value>);
 
 impl AdditionalClaims for ExtraClaims {}
 
@@ -105,45 +105,45 @@ type Client = openidconnect::Client<
 
 /// Relying-party settings, from the `DRAWBRIDGE_OIDC_*` options.
 #[derive(Debug, Clone)]
-pub struct OidcConfig {
-    pub issuer: String,
-    pub client_id: String,
-    pub client_secret: Secret,
-    pub redirect_url: String,
+pub(crate) struct OidcConfig {
+    pub(crate) issuer: String,
+    pub(crate) client_id: String,
+    pub(crate) client_secret: Secret,
+    pub(crate) redirect_url: String,
     /// The ID-token claim holding the username matched against `users[].username`.
-    pub username_claim: String,
+    pub(crate) username_claim: String,
     /// Requested in addition to `openid`.
-    pub scopes: Vec<String>,
+    pub(crate) scopes: Vec<String>,
     /// Permit `http://` provider URLs, which expose the client secret and tokens on the wire.
-    pub allow_insecure_http: bool,
+    pub(crate) allow_insecure_http: bool,
 }
 
 /// State kept between redirecting to the provider and its callback.
 #[derive(Debug)]
-pub struct PendingLogin {
-    pub nonce: Nonce,
-    pub pkce_verifier: PkceCodeVerifier,
+pub(crate) struct PendingLogin {
+    pub(crate) nonce: Nonce,
+    pub(crate) pkce_verifier: PkceCodeVerifier,
 }
 
 /// An authorization request: send the browser to `url`; `state` comes back on the callback.
 #[derive(Debug)]
-pub struct AuthRequest {
-    pub url: String,
-    pub state: String,
-    pub pending: PendingLogin,
+pub(crate) struct AuthRequest {
+    pub(crate) url: String,
+    pub(crate) state: String,
+    pub(crate) pending: PendingLogin,
 }
 
 /// A verified login.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Identity {
-    pub username: String,
+pub(crate) struct Identity {
+    pub(crate) username: String,
     /// The ID token's `exp`: access is deprovisioned then unless the browser re-authenticates.
-    pub expires_at: SystemTime,
+    pub(crate) expires_at: SystemTime,
 }
 
 /// The parts of the OIDC flow the portal depends on, so its handlers can be tested without a
 /// provider.
-pub trait Authenticator: Send + Sync + 'static {
+pub(crate) trait Authenticator: Send + Sync + 'static {
     /// Builds an authorization request; `silent` asks the provider not to interact (`prompt=none`).
     fn authorize(&self, silent: bool) -> AuthRequest;
     /// Redeems `code` and verifies the resulting ID token against `pending`.
@@ -154,7 +154,7 @@ pub trait Authenticator: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Identity, OidcError>> + Send;
 }
 
-pub struct Oidc {
+pub(crate) struct Oidc {
     client: Client,
     http: reqwest::Client,
     username_claim: String,
@@ -163,7 +163,7 @@ pub struct Oidc {
 
 impl Oidc {
     /// Fetches the provider's metadata and signing keys.
-    pub async fn discover(config: OidcConfig) -> Result<Self, OidcError> {
+    pub(crate) async fn discover(config: OidcConfig) -> Result<Self, OidcError> {
         let issuer =
             IssuerUrl::new(config.issuer.clone()).map_err(|e| OidcError::Config(e.to_string()))?;
         let https = |what: &str, url: &url::Url| {

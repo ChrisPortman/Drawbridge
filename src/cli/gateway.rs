@@ -12,12 +12,11 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
-use crate::cli::{LockArgs, PolicyArgs, PortalArgs, RunArgs};
+use super::{LockArgs, PolicyArgs, PortalArgs, RunArgs};
 use crate::firewall;
-use crate::oidc::{Oidc, OidcConfig};
+use crate::firewall::ruleset::{Mode, Ruleset, TABLE};
 use crate::policy::Policy;
-use crate::portal::{self, Portal};
-use crate::ruleset::{Mode, Ruleset, TABLE};
+use crate::portal::{self, Oidc, OidcConfig, Portal};
 use crate::session::{self, Kernel, SessionTable};
 
 /// How long open portal connections get to finish at shutdown.

@@ -6,6 +6,11 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+mod gateway;
+
+pub use crate::portal::Secret;
+pub use gateway::{check, run, teardown};
+
 #[derive(Debug, Parser)]
 #[command(version, about = "Drawbridge: identity-aware L3/L4 access gateway")]
 pub struct Cli {
@@ -72,7 +77,7 @@ pub struct PortalArgs {
     pub oidc_client_id: Option<String>,
     /// Prefer the environment variable, so the secret doesn't show in the process list.
     #[arg(long, env = "DRAWBRIDGE_OIDC_CLIENT_SECRET", hide_env_values = true)]
-    pub oidc_client_secret: Option<crate::oidc::Secret>,
+    pub oidc_client_secret: Option<Secret>,
     /// ID-token claim matched against `users[].username`. `email` counts only when verified.
     /// Use a claim only administrators can change: some providers let users edit
     /// `preferred_username`, which would let them pick whose access they get.

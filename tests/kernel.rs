@@ -12,11 +12,14 @@
 use std::process::Command;
 use std::sync::Mutex;
 
-use drawbridge::firewall;
-use drawbridge::policy::{Allow, Client, Policy, PortSpec, Proto};
-use drawbridge::ruleset::{
-    FILTER_CHAIN, LOG_SETS, Mode, Ruleset, SESSION_FLOWS_CHAIN, SESSIONS_CHAIN, SessionRules, TABLE,
+use drawbridge::firewall::{
+    self,
+    ruleset::{
+        FILTER_CHAIN, LOG_SETS, Mode, Ruleset, SESSION_FLOWS_CHAIN, SESSIONS_CHAIN, SessionRules,
+        TABLE,
+    },
 };
+use drawbridge::policy::{Allow, Client, Policy, PortSpec, Proto};
 
 const PORTAL: &str = "192.168.50.1:8443";
 

@@ -78,7 +78,7 @@ This is the core risk. Reason precisely about nftables semantics.
 - **Interaction with the host:** priority 0 relative to other tables, drop finality, and whether
   another table's `accept` can or cannot bypass these rules.
 - **Tests:**
-  - Do `ruleset.rs` unit tests, `tests/kernel.rs` and `e2e/run.sh` cover the paths changed?
+  - Do `firewall/ruleset.rs` unit tests, `tests/kernel.rs` and `e2e/run.sh` cover the paths changed?
   - Name the missing negative tests: traffic that must be **denied**.
 
 ### 4. Supply chain and `unsafe`
