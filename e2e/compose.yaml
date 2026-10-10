@@ -109,9 +109,12 @@ services:
 
   # Root and NET_ADMIN only to route replies to clients back through the gateway.
   dex:
-    image: ghcr.io/dexidp/dex:v2.44.0
+    image: ghcr.io/dexidp/dex:v2.46.0
     user: root
     cap_add: [NET_ADMIN]
+    environment:
+      # Goes with the `sessions:` block in dex.yaml; Dex needs both for SSO sessions.
+      DEX_SESSIONS_ENABLED: "true"
     entrypoint:
       - sh
       - -c

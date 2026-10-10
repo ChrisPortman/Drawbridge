@@ -202,15 +202,22 @@ The docs are sparse, so read the source in `~/.cargo/registry/src/*/rustables-0.
 - Log with `tracing`; the level is set by `RUST_LOG` and defaults to `info`.
 - Put unit tests in `#[cfg(test)] mod tests` next to the code they test. Fixtures go in `examples/`
   or `tests/data/`.
-- Keep e2e assertions in `e2e/run.sh` and use the `tcp` / `udp` / `ping_` / `refused` / `login`
-  helpers.
+- Keep e2e assertions in `e2e/run.sh` and use the `tcp` / `udp` / `ping_` / `refused` / `login` /
+  `silent_login` / `log_has` helpers.
   - Every "closed" check needs a real listener behind it, and a matching "open" check after
     shutdown, so a denial is shown to come from the rules.
   - The e2e addresses and MACs are fixed in `compose.yaml`, `entrypoint.sh` and `policy.yaml`, so
     keep the three in sync.
-  - Dex (`e2e/dex.yaml`, 30s ID tokens) is the OIDC provider. It issues no `preferred_username`
-    and keeps no SSO session, so the e2e uses `--oidc-username-claim email` and the "silent"
-    re-auth step re-submits the password form.
+  - Dex v2.46 (`e2e/dex.yaml`, 30s ID tokens) is the OIDC provider. It issues no
+    `preferred_username`, so the e2e uses `--oidc-username-claim email`.
+  - Dex runs with its experimental auth sessions on (`DEX_SESSIONS_ENABLED` in `compose.yaml`
+    plus the `sessions:` block; it needs both). It keeps an SSO session in the `dex_session`
+    cookie, so `silent_login` completes with no form. Before logging in as another user, or to
+    test the `login_required` fallback, drop that cookie with `forget_provider`; otherwise Dex
+    logs the browser in again as the previous user.
+  - Dex logs a login from its session only at debug, so `dex.yaml` sets debug logging. `log_has`
+    checks gateway and Dex log lines in `docker compose logs --since/--until` windows and prints
+    them as evidence.
   - The kernel log isn't emitted from containers (non-init network namespaces) unless
     `net.netfilter.nf_log_all_netns=1`, so the e2e checks the drop log through rule counters and
     set contents, not log lines.

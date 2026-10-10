@@ -1,9 +1,20 @@
-# Dex for the e2e stack: in-memory, static users, short-lived ID tokens so expiry is testable.
+# Dex for the e2e stack: in-memory, static users, short-lived ID tokens so expiry is testable, and
+# an SSO session so prompt=none re-authenticates without a form, as with a production provider.
+# Test-only: don't use it as a template (plain http, fixed secrets, debug logging).
 issuer: http://10.10.0.30:5556/dex
 storage: {type: memory}
 web: {http: 0.0.0.0:5556}
 expiry:
   idTokens: 30s
+# Auth sessions are experimental in Dex: this block needs DEX_SESSIONS_ENABLED=true (compose.yaml),
+# and Dex refuses to start with only one of the two. The session lives in the dex_session cookie.
+sessions:
+  absoluteLifetime: 1h
+  validIfNotUsedFor: 10m
+  rememberMeCheckedByDefault: false   # the cookie lasts for the browser session only
+# Dex logs a login from its session ("session: re-authenticated from session") only at debug.
+logger:
+  level: debug
 oauth2:
   skipApprovalScreen: true
   passwordConnector: local
