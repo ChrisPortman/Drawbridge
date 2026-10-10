@@ -6,7 +6,16 @@ Guidance for coding agents working on Drawbridge, an identity-aware L3/L4 access
 
 A Rust service that turns a YAML allow-list policy into nftables rules on a Linux gateway. Clients are
 identified by source CIDR and arrive on a dedicated external interface (e.g. WireGuard `wg0`). Anything
-not explicitly allowed is dropped. See `docs/` for the specifications:
+not explicitly allowed is dropped.
+
+**GitHub issues are the specification from now on.** A feature issue states what to build and a bug
+issue states what is broken. Don't add new specification documents to `docs/`. Design decision records
+in `docs/decisions/` (`NNNN-<issue-slug>.md`) capture why a design was chosen, and are written when a
+feature is planned. Use the `plan-feature` skill for feature issues and the `fix-bug` skill for bug
+issues (see `.claude/skills/`).
+
+The documents below specify the milestones built before issues took over. They describe the current
+behaviour and are background; where an open issue conflicts with one, the issue wins:
 
 - `docs/00-specification.overview.md`: the full vision, with OIDC/OAuth identity, sessions and Axum.
 - `docs/01-specification.prototype.md`: the prototype. It provisions static per-client rules on
@@ -14,8 +23,8 @@ not explicitly allowed is dropped. See `docs/` for the specifications:
 - `docs/02-specification.oidc.md`: users log in to an HTTPS portal through OIDC, and their
   per-user allow list is applied to their source IP until their ID token expires. Group-based
   access is out of scope. Don't add it unless asked.
-- `docs/03-specification.permissive_mode.md`: the **current milestone**. `--permissive` accepts
-  instead of dropping, and a deduplicated kernel log records what is (or would be) dropped.
+- `docs/03-specification.permissive_mode.md`: the last milestone specified this way. `--permissive`
+  accepts instead of dropping, and a deduplicated kernel log records what is (or would be) dropped.
 
 ## Layout
 
