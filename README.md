@@ -713,11 +713,28 @@ cargo clippy --all-targets
 
 The end-to-end test starts a Docker Compose stack:
 - a gateway, a server and three clients on a stand-in for WireGuard;
-- [Dex](https://dexidp.io/) as the OIDC provider.
+- [Dex](https://dexidp.io/) as the OIDC provider, with SSO sessions and 30s ID tokens.
 
 It checks static allow and deny paths over IPv4 and IPv6, and portal logins: refused users, IP
-binding, re-authentication, and expiry cutting a live connection. Finally, it checks that
-everything opens up again after shutdown.
+binding, silent re-authentication from the provider's SSO session, the fallback to the login form
+when the provider has no session, and expiry cutting a live connection. Gateway and Dex log lines
+showing each extension are printed with the checks. Finally, it checks that everything opens up
+again after shutdown.
+
+To watch re-authentication in a browser on a Linux host (which can reach the stack's bridge
+addresses), start the stack on its own from `e2e/` (`run.sh` tears it down when it exits):
+
+```sh
+docker compose -p drawbridge-e2e up -d --build --wait
+docker compose -p drawbridge-e2e logs -f gateway dex    # in another terminal
+```
+
+Open `https://172.30.0.2:8443/`, accept the self-signed certificate and log in as
+`alice@example.com` with password `password`. The countdown starts at about 30s; a few seconds
+before it ends the page goes through Dex without showing a form and the countdown resets. The logs
+show `session extended` from the gateway and `re-authenticated from session` from Dex. Keep the tab
+in the foreground, since browsers throttle background timers. Stop the stack with
+`docker compose -p drawbridge-e2e down`.
 
 The kernel integration tests need `CAP_NET_ADMIN`. Run them in a throwaway network namespace, or
 in the e2e image:
