@@ -73,6 +73,14 @@ pub struct InitArgs {
     /// Don't open a browser to log in; follow the URL that `login` prints instead.
     #[arg(long, env = "DRAWBRIDGE_NO_BROWSER")]
     pub no_browser: bool,
+    /// Don't check the portal's TLS certificate. **Only for test setups**: anyone between you and
+    /// the gateway could then pose as the portal and take your session.
+    #[arg(
+        long,
+        env = "DRAWBRIDGE_INSECURE_SKIP_TLS_VERIFY",
+        conflicts_with = "ca_cert"
+    )]
+    pub insecure_skip_tls_verify: bool,
     #[command(flatten)]
     pub unit: UnitArgs,
 }
@@ -102,6 +110,10 @@ pub struct ClientArgs {
     /// PEM CA certificates to trust for the portal, besides the system's, comma-separated.
     #[arg(long, env = "DRAWBRIDGE_CA_CERT", value_delimiter = ',')]
     pub ca_cert: Vec<PathBuf>,
+    /// Don't check the portal's TLS certificate. **Only for test setups**: anyone between you and
+    /// the gateway could then pose as the portal and take your session.
+    #[arg(long, env = "DRAWBRIDGE_INSECURE_SKIP_TLS_VERIFY")]
+    pub insecure_skip_tls_verify: bool,
 }
 
 #[derive(Debug, Args)]
@@ -254,7 +266,14 @@ mod tests {
             init.ca_cert,
             [PathBuf::from("a.pem"), PathBuf::from("b.pem")]
         );
-        assert!(init.no_browser);
+        assert!(init.no_browser && !init.insecure_skip_tls_verify);
+        assert!(
+            parse("client init --portal-url https://gw.example --insecure-skip-tls-verify").is_ok()
+        );
+        // Trusting a CA and trusting anything don't mix.
+        let both = "client init --portal-url https://gw.example --ca-cert a.pem \
+                    --insecure-skip-tls-verify";
+        assert!(parse(both).is_err());
         assert!(parse("client login").is_ok());
         assert!(parse("client logout").is_ok());
         assert!(parse("client service --portal-url https://gw.example").is_ok());

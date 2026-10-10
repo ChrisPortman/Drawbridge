@@ -418,7 +418,7 @@ log_has present gateway "$t3" "$(now_ts)" "session expired" \
 
 echo "== client CLI"
 # The user service logs in through the browser and refreshes the session until it is stopped.
-report 0 "$(cli init --portal-url "$PORTAL" --ca-cert /etc/drawbridge/ca.crt --no-browser \
+report 0 "$(cli init --portal-url "$PORTAL" --insecure-skip-tls-verify --no-browser \
     >/dev/null; echo $?)" "client init succeeds"
 unit=$(dc exec -T client-user cat /home/user/.config/systemd/user/drawbridge-client.service)
 evidence <<<"$unit"
@@ -446,6 +446,9 @@ dc exec -T client-user cat /tmp/cli-login.out | evidence
 report yes "$(dc exec -T client-user grep -q '^Logged in as alice@example.com' /tmp/cli-login.out &&
     echo yes || echo no)" "client login reports the logged-in user"
 log_has present gateway "$tl" "$(now_ts)" "session provisioned" "gateway provisions the CLI session"
+# The portal's certificate is self-signed, so the e2e turns the client's checks off.
+report yes "$(service_log | grep -q 'TLS certificate checks for the portal are off' && echo yes ||
+    echo no)" "the service warns that certificate checks are off"
 tcp open   client-user $SERVER 8081
 flow_start client-user $SERVER 8082
 flow alive client-user "connection opened during the CLI session"

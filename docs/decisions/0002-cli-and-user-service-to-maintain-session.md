@@ -134,6 +134,20 @@ nor `re-authenticated from session` in the window.
 `--ca-cert`. Chosen: **the OS store plus `--ca-cert`**, so CAs installed on the machine work. The
 gateway's OIDC client turns native roots off to keep today's trust.
 
+**Turning certificate checks off** (asked for after the PR was opened). The user asked for an
+option that disables validation of the portal's and the IdP's certificates, and for the e2e to
+use it to drop its test CA. The client service only connects to the portal (the browser talks to
+the IdP, the gateway exchanges codes with it), so it covers the portal:
+`--insecure-skip-tls-verify` / `DRAWBRIDGE_INSECURE_SKIP_TLS_VERIFY` on `client init` (saved in
+`client.yaml`) and on the service, which warns at startup when it is on. The URL must still be
+https, and a flag can only turn the checks off, never back on over the file (re-running `init`
+without it does). `client login` shows "(portal certificate checks off)", and `init` refuses
+`--ca-cert` together with it. The trade-off accepted is a footgun for production use; the help
+and README mark it as for test setups only, and `--ca-cert` stays the way to trust an internal
+CA. The e2e no longer exercises the verified path; a unit test does instead, against a local TLS
+server with a self-signed test certificate (`tests/data/portal-test.crt`): refused by default,
+accepted through `--ca-cert`, and accepted with checks off.
+
 **Optional e2e checks.** The user chose both: a second refresh (rotation works) and the lost-session
 path.
 
@@ -314,7 +328,10 @@ Found during implementation:
   characters, so `POST /api/cli/token` validates the verifier first (`s256`); a unit test found it.
 - **e2e certificate.** The image's self-signed portal certificate was a CA certificate, which
   rustls refuses as a server's own (`CaUsedAsEndEntity`); curl never noticed with `-k`. The image
-  now builds a test CA and a server certificate from it; the CLI trusts the CA.
+  first built a test CA and a server certificate from it, for the CLI's `--ca-cert`. After the PR
+  was opened, the user asked for an option that turns the client's certificate checks off and for
+  the e2e to use it instead: the image is back to its single self-signed certificate, and the
+  e2e's `client init` uses `--insecure-skip-tls-verify` (see Decisions).
 - **e2e plumbing.** The stub `systemctl` must detach what it backgrounds from its caller's output
   (dash keeps copies of redirected descriptors in function calls), or `client login`, which reads
   systemctl's output, waits forever. A gateway restarted with `dc exec -d` logs to the exec, so

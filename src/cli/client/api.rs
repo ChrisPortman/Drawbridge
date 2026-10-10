@@ -17,6 +17,15 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 /// How long to wait before retrying when the portal names no time.
 const RETRY_DEFAULT: Duration = Duration::from_secs(5);
 
+/// Which certificates the portal may present.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Trust<'a> {
+    /// One from the system's CAs or these.
+    Verified { extra_cas: &'a [PathBuf] },
+    /// Any at all: for test setups only.
+    Insecure,
+}
+
 pub(super) struct PortalClient {
     http: reqwest::Client,
     base: Url,
@@ -38,8 +47,8 @@ pub(super) enum Refresh {
 }
 
 impl PortalClient {
-    /// A client for the portal at `base` that trusts the system's CAs and `ca_certs`.
-    pub(super) fn new(base: Url, ca_certs: &[PathBuf]) -> anyhow::Result<Self> {
+    /// A client for the portal at `base`.
+    pub(super) fn new(base: Url, trust: Trust) -> anyhow::Result<Self> {
         if base.scheme() != "https" {
             bail!("the portal URL must be https, got {base}");
         }
@@ -49,8 +58,13 @@ impl PortalClient {
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(TIMEOUT);
-        for cert in load_certs(ca_certs)? {
-            builder = builder.add_root_certificate(cert);
+        match trust {
+            Trust::Verified { extra_cas } => {
+                for cert in load_certs(extra_cas)? {
+                    builder = builder.add_root_certificate(cert);
+                }
+            }
+            Trust::Insecure => builder = builder.danger_accept_invalid_certs(true),
         }
         let http = builder.build().context("building the HTTPS client")?;
         Ok(PortalClient { http, base })
@@ -210,6 +224,8 @@ fn classify(status: StatusCode) -> Class {
 mod tests {
     use super::*;
 
+    const NO_CAS: Trust = Trust::Verified { extra_cas: &[] };
+
     #[test]
     fn classifies_refresh_answers() {
         assert_eq!(classify(StatusCode::OK), Class::Extended);
@@ -225,7 +241,7 @@ mod tests {
 
     #[test]
     fn builds_portal_urls() {
-        let client = PortalClient::new("https://gw.example:8443".parse().unwrap(), &[]).unwrap();
+        let client = PortalClient::new("https://gw.example:8443".parse().unwrap(), NO_CAS).unwrap();
         assert_eq!(
             client.login_url(40123, "abc", "st").as_str(),
             "https://gw.example:8443/login?cli_port=40123&cli_challenge=abc&cli_state=st"
@@ -234,7 +250,10 @@ mod tests {
             client.url("api/session").as_str(),
             "https://gw.example:8443/api/session"
         );
-        assert!(PortalClient::new("http://gw.example".parse().unwrap(), &[]).is_err());
+        assert!(PortalClient::new("http://gw.example".parse().unwrap(), NO_CAS).is_err());
+        // Even without certificate checks, the portal is only spoken to over https.
+        let insecure = PortalClient::new("http://gw.example".parse().unwrap(), Trust::Insecure);
+        assert!(insecure.is_err());
     }
 
     #[test]
@@ -242,11 +261,70 @@ mod tests {
         let path = std::env::temp_dir().join(format!("drawbridge-ca-{}", std::process::id()));
         std::fs::write(&path, "not a certificate\n").unwrap();
         let base: Url = "https://gw.example".parse().unwrap();
-        let result = PortalClient::new(base.clone(), std::slice::from_ref(&path));
+        let result = PortalClient::new(
+            base.clone(),
+            Trust::Verified {
+                extra_cas: std::slice::from_ref(&path),
+            },
+        );
         std::fs::remove_file(&path).unwrap();
         assert!(result.is_err());
         let missing = [PathBuf::from("/nonexistent/ca.pem")];
-        assert!(PortalClient::new(base, &missing).is_err());
+        assert!(
+            PortalClient::new(
+                base,
+                Trust::Verified {
+                    extra_cas: &missing
+                }
+            )
+            .is_err()
+        );
+    }
+
+    /// Serves `DELETE /api/session` over TLS on 127.0.0.1 with a self-signed certificate (for
+    /// 127.0.0.1, not a CA) from `tests/data`; returns its base URL.
+    async fn self_signed_portal() -> Url {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data");
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            format!("{dir}/portal-test.crt"),
+            format!("{dir}/portal-test.key"),
+        )
+        .await
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().route(
+            "/api/session",
+            axum::routing::delete(|| async { axum::http::StatusCode::NO_CONTENT }),
+        );
+        let server = axum_server::from_tcp_rustls(listener, tls).unwrap();
+        tokio::spawn(server.serve(app.into_make_service()));
+        format!("https://127.0.0.1:{port}").parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn certificates_are_checked_unless_turned_off() {
+        let base = self_signed_portal().await;
+        let cert = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/portal-test.crt"
+        ));
+        // Not signed by a trusted CA: refused, so no token is sent.
+        let checked = PortalClient::new(base.clone(), NO_CAS).unwrap();
+        let refused = checked.end("token").await.unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("certificate"),
+            "{refused:#}"
+        );
+        // Trusted through --ca-cert.
+        let extra_cas = std::slice::from_ref(&cert);
+        let trusted = PortalClient::new(base.clone(), Trust::Verified { extra_cas }).unwrap();
+        trusted.end("token").await.unwrap();
+        // Or not checked at all.
+        let insecure = PortalClient::new(base, Trust::Insecure).unwrap();
+        insecure.end("token").await.unwrap();
     }
 
     #[tokio::test]
@@ -256,7 +334,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let base = format!("https://127.0.0.1:{port}").parse().unwrap();
-        let client = PortalClient::new(base, &[]).unwrap();
+        let client = PortalClient::new(base, NO_CAS).unwrap();
         let started = std::time::Instant::now();
         assert!(client.end("token").await.is_err());
         assert!(started.elapsed() < TIMEOUT);

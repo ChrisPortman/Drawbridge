@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use super::{ClientArgs, InitArgs, UnitArgs};
 use crate::portal::{CliTokenJson, LoginError, SessionJson};
-use api::{PortalClient, Refresh};
+use api::{PortalClient, Refresh, Trust};
 use loopback::Callback;
 use notify::notify;
 use openidconnect::CsrfToken;
@@ -51,6 +51,8 @@ struct SettingsFile {
     ca_cert: Vec<PathBuf>,
     #[serde(default = "yes")]
     open_browser: bool,
+    #[serde(default)]
+    insecure_skip_tls_verify: bool,
 }
 
 fn yes() -> bool {
@@ -63,6 +65,26 @@ struct Settings {
     portal_url: url::Url,
     ca_cert: Vec<PathBuf>,
     open_browser: bool,
+    insecure_skip_tls_verify: bool,
+}
+
+impl Settings {
+    fn trust(&self) -> Trust<'_> {
+        trust(self.insecure_skip_tls_verify, &self.ca_cert)
+    }
+}
+
+/// The portal's certificate checks; warns when they are off.
+fn trust(insecure: bool, extra_cas: &[PathBuf]) -> Trust<'_> {
+    if insecure {
+        warn!(
+            "TLS certificate checks for the portal are off (--insecure-skip-tls-verify): \
+             for test setups only"
+        );
+        Trust::Insecure
+    } else {
+        Trust::Verified { extra_cas }
+    }
 }
 
 /// The settings file (if present), overridden by flags and the environment.
@@ -94,10 +116,14 @@ fn load_settings(args: &ClientArgs) -> anyhow::Result<Settings> {
     } else {
         args.ca_cert.clone()
     };
+    // The flag can only turn the checks off, never back on over the file.
+    let insecure_skip_tls_verify =
+        args.insecure_skip_tls_verify || file.as_ref().is_some_and(|f| f.insecure_skip_tls_verify);
     Ok(Settings {
         portal_url,
         ca_cert,
         open_browser: file.is_none_or(|f| f.open_browser),
+        insecure_skip_tls_verify,
     })
 }
 
@@ -140,7 +166,8 @@ fn unit_state(unit: &UnitArgs) -> anyhow::Result<unit::UnitState> {
 
 pub fn init(args: &InitArgs) -> anyhow::Result<()> {
     // Checks the URL and the CA files now, so mistakes show here rather than in the journal.
-    PortalClient::new(args.portal_url.clone(), &args.ca_cert)?;
+    let insecure = args.insecure_skip_tls_verify;
+    PortalClient::new(args.portal_url.clone(), trust(insecure, &args.ca_cert))?;
     let ca_cert = args
         .ca_cert
         .iter()
@@ -150,6 +177,7 @@ pub fn init(args: &InitArgs) -> anyhow::Result<()> {
         portal_url: args.portal_url.to_string(),
         ca_cert,
         open_browser: !args.no_browser,
+        insecure_skip_tls_verify: insecure,
     };
     let config = unit::default_config_path()?;
     write_file(&config, &serde_norway::to_string(&settings)?)?;
@@ -225,6 +253,8 @@ struct Session {
     token: String,
     username: String,
     expires: Instant,
+    /// The portal's certificate isn't checked, which the status says.
+    insecure: bool,
 }
 
 impl Session {
@@ -233,6 +263,7 @@ impl Session {
             token: json.token,
             username: String::new(),
             expires: Instant::now(),
+            insecure: false,
         };
         session.update(&json.session);
         session
@@ -249,8 +280,13 @@ impl Session {
     }
 
     fn status(&self) -> String {
+        let insecure = if self.insecure {
+            " (portal certificate checks off)"
+        } else {
+            ""
+        };
         format!(
-            "Logged in as {}; access expires in {} unless refreshed",
+            "Logged in as {}; access expires in {} unless refreshed{insecure}",
             self.username,
             unit::human(self.remaining())
         )
@@ -280,12 +316,13 @@ impl Signals {
 
 pub async fn service(args: &ClientArgs) -> anyhow::Result<()> {
     let settings = load_settings(args)?;
-    let portal = PortalClient::new(settings.portal_url, &settings.ca_cert)?;
+    let portal = PortalClient::new(settings.portal_url.clone(), settings.trust())?;
     let mut signals = Signals::new()?;
     let Some(mut session) = log_in(&portal, settings.open_browser, &mut signals).await? else {
         info!("stopped before the login completed");
         return Ok(());
     };
+    session.insecure = settings.insecure_skip_tls_verify;
     info!(username = session.username, "logged in");
     notify(&format!("READY=1\nSTATUS={}\n", session.status()));
     keep_alive(&portal, &mut session, &mut signals).await
@@ -501,6 +538,7 @@ mod tests {
             config: Some(config.to_path_buf()),
             portal_url: None,
             ca_cert: Vec::new(),
+            insecure_skip_tls_verify: false,
         }
     }
 
@@ -544,6 +582,30 @@ mod tests {
         assert_eq!(settings.portal_url.as_str(), "https://other.example/");
         assert_eq!(settings.ca_cert, [PathBuf::from("/tmp/ca.pem")]);
         assert!(settings.open_browser, "the browser opens by default");
+    }
+
+    #[test]
+    fn certificate_checks_stay_on_unless_turned_off() {
+        let file = TempFile::new("verify", "portal_url: https://gw.example/\n");
+        assert!(
+            !load_settings(&args(&file.0))
+                .unwrap()
+                .insecure_skip_tls_verify
+        );
+        let mut flag = args(&file.0);
+        flag.insecure_skip_tls_verify = true;
+        let settings = load_settings(&flag).unwrap();
+        assert!(matches!(settings.trust(), Trust::Insecure));
+
+        let file = TempFile::new(
+            "insecure",
+            "portal_url: https://gw.example/\ninsecure_skip_tls_verify: true\n",
+        );
+        assert!(
+            load_settings(&args(&file.0))
+                .unwrap()
+                .insecure_skip_tls_verify
+        );
     }
 
     #[test]

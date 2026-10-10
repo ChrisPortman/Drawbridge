@@ -50,6 +50,7 @@ behaviour and are background; where an open issue conflicts with one, the issue 
 | `tests/data/example.nft` | Golden `check` output for the example policy. |
 | `tests/data/example.kernel.nft` | Golden `nft list` output (counters stripped) after applying the example policy. |
 | `tests/data/sessions.kernel.nft` | Golden `nft list` output after adding and replacing sessions incrementally. |
+| `tests/data/portal-test.{crt,key}` | Self-signed (not CA) certificate for 127.0.0.1; the client's certificate-check tests serve it. Test-only. |
 | `tests/data/drop_log.netlink.hex` | What `nft --debug=mnl` sends for the drop log's sets and rules; `nfraw` must match it byte for byte. |
 | `tests/kernel.rs` | `#[ignore]`d tests against a real kernel (needs CAP_NET_ADMIN): example golden, permissive mode, 5,000-rule policy, session add/replace/remove golden, 200-session churn. |
 | `e2e/` | Docker Compose end-to-end stack (`run.sh`, `compose.yaml`, `Dockerfile`, `policy.yaml`, `dex.yaml`, `systemctl-stub`). |
@@ -245,8 +246,10 @@ The docs are sparse, so read the source in `~/.cargo/registry/src/*/rustables-0.
     `DRAWBRIDGE_SYSTEMCTL=systemctl-stub`. The stub runs the unit's `ExecStart` with a notify
     socket and models `activating` → `active` on READY=1, `inactive`/`failed` on exit. It is not
     systemd: keep it small, and detach anything it backgrounds from its caller's output.
-  - The portal certificate comes from a test CA built into the image; the CLI trusts
-    `/etc/drawbridge/ca.crt` (rustls refuses a CA certificate as a server's own).
+  - The portal certificate is self-signed, so the e2e's `client init` uses
+    `--insecure-skip-tls-verify`. (`openssl req -x509` makes it a CA certificate, which rustls
+    refuses as a server's own even through `--ca-cert`.) The verified path, `--ca-cert` included,
+    is tested in `cli/client/api.rs` against `tests/data/portal-test.crt`.
   - A gateway restarted with `dc exec -d` logs to the exec, not the container; send its output to
     `/proc/1/fd/1` when `log_has` must see it.
   - The external Docker network stands in for WireGuard. It has pinned IPv6 neighbour entries,

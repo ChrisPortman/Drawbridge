@@ -546,6 +546,7 @@ variables override it for the service)
 | `--portal-url` | `DRAWBRIDGE_PORTAL_URL` | (required for `init`) | The portal's `https://` URL, as for the gateway. |
 | `--ca-cert` | `DRAWBRIDGE_CA_CERT` | | PEM CA certificates to trust for the portal besides the system's, comma-separated. |
 | `--no-browser` | `DRAWBRIDGE_NO_BROWSER` | off | `init` only: don't open a browser; `login` still prints the URL. |
+| `--insecure-skip-tls-verify` | `DRAWBRIDGE_INSECURE_SKIP_TLS_VERIFY` | off | Don't check the portal's certificate. **For test setups only**: anyone on the path could then pose as the portal and take the session. The service warns at startup, and `client login` shows "(portal certificate checks off)". Can't be combined with `--ca-cert`. Once `init` has saved it, the variable can't turn checks back on; re-run `init` without the flag. (The service talks only to the portal; the browser checks the provider's certificate.) |
 | `--config` | `DRAWBRIDGE_CLIENT_CONFIG` | `$XDG_CONFIG_HOME/drawbridge/client.yaml` | The service's settings file. |
 
 `init` writes `~/.config/drawbridge/client.yaml` and the user unit
@@ -850,7 +851,7 @@ docker compose -p drawbridge-e2e up -d --build --wait
 docker compose -p drawbridge-e2e logs -f gateway dex    # in another terminal
 ```
 
-Open `https://172.30.0.2:8443/`, accept the certificate (from the stack's own test CA) and log in
+Open `https://172.30.0.2:8443/`, accept the self-signed certificate and log in
 as `alice@example.com` with password `password`. The countdown starts at about 30s; a few seconds
 before it ends the page refreshes and the countdown resets. The gateway logs
 `session extended … via="refresh"`. Keep the tab
