@@ -30,26 +30,29 @@ behaviour and are background; where an open issue conflicts with one, the issue 
 
 | Path | Purpose |
 |---|---|
-| `src/main.rs` | Thin binary: tracing setup, `Cli::parse()`, dispatch to `cli::{run, check, teardown}`. **No logic here.** |
+| `src/main.rs` | Thin binary: tracing setup, `Cli::parse()`, dispatch to `cli::{run, check, teardown}` (`server`) and `cli::{init, login, logout, service}` (`client`). **No logic here.** |
 | `src/lib.rs` | Library crate root. Declares the top-level modules: `cli`, `firewall`, `policy` (`pub`) and `portal`, `session` (`pub(crate)`). |
-| `src/cli.rs` | Clap definitions (`run`, `check`, `teardown`); every flag has a `DRAWBRIDGE_*` env var. Re-exports the subcommands from `gateway`, and `Secret` (a flag's type) from `portal`. |
-| `src/cli/gateway.rs` | Subcommand implementations: instance lock, interface check, portal flags → `PortalConfig`, signal-driven `run` lifecycle. |
+| `src/cli.rs` | Clap definitions: `server run|check|teardown`, `client init|login|logout` and the hidden `client service`; every flag has a `DRAWBRIDGE_*` env var. Re-exports the subcommands from `gateway` and `client`, and `Secret` (a flag's type) from `portal`. |
+| `src/cli/gateway.rs` | `server` implementations: instance lock, interface check, portal flags → `PortalConfig`, signal-driven `run` lifecycle. |
+| `src/cli/client.rs` | `client` implementations: `init` writes `client.yaml` and the user unit; `login`/`logout` only start/stop it through `systemctl --user`; `service` (what the unit runs) logs in through the loopback handoff, refreshes, and ends the session on SIGTERM. |
+| `src/cli/client/*.rs` | `unit` (pure: unit file, XDG paths, `systemctl show` parsing, timing), `notify` (`sd_notify`), `api` (the service's portal client), `loopback` (the 127.0.0.1 listener). |
 | `src/policy.rs` | Serde YAML schema (`clients`, `users`), `Policy::load`/`parse`/`validate`. Shared by every other module. |
 | `src/firewall.rs` | `Ruleset` → `rustables` batch; `apply` / `update_sessions` / `teardown`. Builds what touches the kernel. |
 | `src/firewall/ruleset.rs` | Pure `Policy` → `Ruleset` IR, including portal rules, `SessionRules`, `Mode` and the drop log's `LogSet`s; `Display` renders nft-style text (used by `check`). |
 | `src/firewall/netlink.rs` | Sends finalized batches with buffers sized to the batch, and parses the kernel's acks. |
 | `src/firewall/nfraw.rs` | Hand-encoded nf_tables messages for the drop log's sets and rules (which rustables can't express), spliced into the rustables batch. |
-| `src/session.rs` | `SessionTable` state machine (login, extend, expire, rebuild on failure) behind an `Enforcer` trait; `spawn` runs it as the single task that changes sessions. |
-| `src/portal.rs` | `Prepared` (TLS, OIDC discovery, listener binds) and `Servers` (serve, graceful shutdown); Axum router: `/`, `/login`, `/callback`, `/api/session`; cookies, pending-login store, security headers. Re-exports `OidcConfig` and `Secret` from `oidc`. |
-| `src/portal/oidc.rs` | OIDC relying party (`openidconnect`): discovery, auth URL with PKCE/nonce, code exchange, ID-token verification, username claim. `Authenticator` trait for tests. |
-| `src/portal/*.html` | Confirmation page (inline JS schedules silent re-auth) and message template, embedded with `include_str!`. |
+| `src/session.rs` | `SessionTable` state machine (login, extend, refresh leases, logout, expire, rebuild on failure) behind an `Enforcer` trait; `spawn` runs it as the single task that changes sessions. |
+| `src/portal.rs` | `Prepared` (TLS, OIDC discovery, listener binds) and `Servers` (serve, graceful shutdown); Axum router: `/`, `/login`, `/callback`, `/api/session` (GET, DELETE), `/api/session/refresh`, `/api/cli/token`; cookies, the bounded pending-login and CLI-grant stores, security headers. Re-exports `OidcConfig` and `Secret` from `oidc`, and the wire types from `api`. |
+| `src/portal/api.rs` | JSON API types and constants shared by the portal and the client service. |
+| `src/portal/oidc.rs` | OIDC relying party (`openidconnect`): discovery, auth URL with PKCE/nonce, code exchange, refresh, ID-token verification, username claim. `Authenticator` trait for tests. |
+| `src/portal/*.html` | Confirmation page (inline JS refreshes, falling back to silent re-auth) and message template, embedded with `include_str!`. |
 | `examples/policy.yaml` | Example policy, used by unit tests. |
 | `tests/data/example.nft` | Golden `check` output for the example policy. |
 | `tests/data/example.kernel.nft` | Golden `nft list` output (counters stripped) after applying the example policy. |
 | `tests/data/sessions.kernel.nft` | Golden `nft list` output after adding and replacing sessions incrementally. |
 | `tests/data/drop_log.netlink.hex` | What `nft --debug=mnl` sends for the drop log's sets and rules; `nfraw` must match it byte for byte. |
 | `tests/kernel.rs` | `#[ignore]`d tests against a real kernel (needs CAP_NET_ADMIN): example golden, permissive mode, 5,000-rule policy, session add/replace/remove golden, 200-session churn. |
-| `e2e/` | Docker Compose end-to-end stack (`run.sh`, `compose.yaml`, `Dockerfile`, `policy.yaml`, `dex.yaml`). |
+| `e2e/` | Docker Compose end-to-end stack (`run.sh`, `compose.yaml`, `Dockerfile`, `policy.yaml`, `dex.yaml`, `systemctl-stub`). |
 
 ## Commands
 
@@ -58,7 +61,7 @@ cargo build
 cargo test                                   # unit tests, no privileges needed
 cargo clippy --all-targets                   # keep warning-free
 cargo fmt
-cargo run -- check --policy examples/policy.yaml --external-iface wg0 \
+cargo run -- server check --policy examples/policy.yaml --external-iface wg0 \
     --portal-listen 192.168.50.1:8443          # print planned ruleset (matches tests/data/example.nft)
 ./e2e/run.sh                                 # full end-to-end test (Docker + Compose v2, no root)
 ```
@@ -72,7 +75,7 @@ docker run --rm --cap-add NET_ADMIN -v "$PWD/target/debug/deps/kernel-<hash>:/t:
     --entrypoint /t drawbridge-e2e --ignored
 ```
 
-Never run `drawbridge run` or `teardown` on the development host itself. They change the host
+Never run `drawbridge server run` or `teardown` on the development host itself. They change the host
 firewall. Use a network namespace or the e2e containers.
 
 ## Design invariants
@@ -153,9 +156,25 @@ Keep these unless the user changes them:
   - One session per source IP. Another login by the same user extends it and keeps its token; a
     different user replaces it.
   - A session lasts until the ID token's `exp`, capped at `--session-max-ttl` (default 15m) from
-    each login. The page re-authenticates (top-level redirect to
-    `/login?silent=1`, i.e. `prompt=none`) at 80% of the remaining lifetime, and `/callback`
-    pushes the expiry out. Without re-auth, the session manager removes it at `exp`.
+    each login or refresh. At 80% of the remaining lifetime the page (or the client service)
+    calls `POST /api/session/refresh`: the gateway redeems the session's refresh token, verifies
+    the new ID token (same username required) and extends exactly as a re-login does. On 409 (no
+    usable refresh token) the page falls back to a top-level `/login?silent=1` (`prompt=none`);
+    the service exits instead. Without either, the session manager removes it at `exp`.
+  - Refresh tokens (`offline_access`) live only in the session table, in memory, and never leave
+    the gateway. One refresh per session runs at a time (`begin_refresh` lease), and the provider
+    is called outside the session task, in a spawned task so a dropped request can't strand it.
+  - `DELETE /api/session` ends a session at once through the normal update batch, which also
+    cuts its connections. Requests that change a session (`POST /api/session/refresh`,
+    `DELETE /api/session`, `POST /api/cli/token`) require `X-Drawbridge: 1`.
+  - A CLI login (`/login?cli_port&cli_challenge&cli_state`) sets no cookie: `/callback` verifies
+    the login and redirects to `http://127.0.0.1:<port>/` (nothing else) with a one-time code and
+    the service's state, which its listener checks. The code is valid 60s, once, from the same IP
+    and with the S256 verifier; the session is provisioned only when it is redeemed. The session
+    token never appears in a URL.
+  - The client service holds the token only in memory. Its unit is `Type=notify` (READY once
+    logged in) with `Restart=no`; a lost session fails the unit rather than reopening a browser.
+    A session it can't refresh (409) is held until it expires, so a stop still ends it.
   - Sessions live in memory only: a restart drops them (users log in again).
   - Provider URLs (issuer, token endpoint, JWKS) must be https unless
     `--oidc-allow-insecure-http` is set (the e2e sets it for Dex).
@@ -197,13 +216,14 @@ The docs are sparse, so read the source in `~/.cargo/registry/src/*/rustables-0.
 
 ## Conventions
 
-- Rust 2024 edition. Library errors use `thiserror`; `cli/gateway.rs` and `main.rs` use `anyhow`
-  with `.context(...)`.
+- Rust 2024 edition. Library errors use `thiserror`; `cli/gateway.rs`, `cli/client*` and
+  `main.rs` use `anyhow` with `.context(...)`.
 - Log with `tracing`; the level is set by `RUST_LOG` and defaults to `info`.
 - Put unit tests in `#[cfg(test)] mod tests` next to the code they test. Fixtures go in `examples/`
   or `tests/data/`.
 - Keep e2e assertions in `e2e/run.sh` and use the `tcp` / `udp` / `ping_` / `refused` / `login` /
-  `silent_login` / `log_has` helpers.
+  `silent_login` / `page_refresh` / `log_has` helpers, and `cli` / `stub` / `unit_state` /
+  `drive_login` for the client CLI.
   - Every "closed" check needs a real listener behind it, and a matching "open" check after
     shutdown, so a denial is shown to come from the rules.
   - The e2e addresses and MACs are fixed in `compose.yaml`, `entrypoint.sh` and `policy.yaml`, so
@@ -221,5 +241,13 @@ The docs are sparse, so read the source in `~/.cargo/registry/src/*/rustables-0.
   - The kernel log isn't emitted from containers (non-init network namespaces) unless
     `net.netfilter.nf_log_all_netns=1`, so the e2e checks the drop log through rule counters and
     set contents, not log lines.
+  - `drawbridge client` runs as `user` (uid 1000) in client-user, with
+    `DRAWBRIDGE_SYSTEMCTL=systemctl-stub`. The stub runs the unit's `ExecStart` with a notify
+    socket and models `activating` → `active` on READY=1, `inactive`/`failed` on exit. It is not
+    systemd: keep it small, and detach anything it backgrounds from its caller's output.
+  - The portal certificate comes from a test CA built into the image; the CLI trusts
+    `/etc/drawbridge/ca.crt` (rustls refuses a CA certificate as a server's own).
+  - A gateway restarted with `dc exec -d` logs to the exec, not the container; send its output to
+    `/proc/1/fd/1` when `log_has` must see it.
   - The external Docker network stands in for WireGuard. It has pinned IPv6 neighbour entries,
     because Drawbridge (correctly) drops neighbour discovery on the external interface.

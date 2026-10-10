@@ -21,7 +21,7 @@ flowchart LR
     subgraph gw["Gateway host"]
         nft["nftables<br/>table inet drawbridge"]
         portal["Login portal<br/>https://10.8.0.1"]
-        db["drawbridge run"]
+        db["drawbridge server run"]
         db -- "rules" --> nft
         db --- portal
     end
@@ -58,6 +58,7 @@ Behaviours to know up front:
 ## Contents
 
 - [For users](#for-users)
+  - [From the command line](#from-the-command-line-linux-with-systemd)
 - [For network administrators](#for-network-administrators)
   - [Deployment requirements](#deployment-requirements)
   - [Commands](#commands)
@@ -83,8 +84,8 @@ Your administrator will give you the portal address, e.g. `https://gateway.vpn.e
 2. **Log in.** You're taken straight to your organisation's login page. Once you've logged in, you
    come back to a page saying **"Access provisioned"**. It shows your account name, what you can
    now reach (e.g. `10.0.30.0/24 tcp/22`), and a countdown.
-3. **Keep that tab open** while you work. It quietly renews your login before it runs out. You may
-   see the page reload briefly when it does.
+3. **Keep that tab open** while you work. It quietly renews your login before it runs out. With
+   some providers you may see the page reload briefly when it does.
 
 When you're finished, close the tab. Your access ends when the current login runs out (by default
 within 15 minutes), and connections you still have open, such as SSH sessions, are cut at that
@@ -101,6 +102,41 @@ If something goes wrong:
 
 Access belongs to your machine's address, not to your browser. Other programs on the same machine
 use it too, and if someone else logs in from the same machine, their access replaces yours.
+
+### From the command line (Linux with systemd)
+
+Instead of keeping a tab open, you can let a user service keep your access alive. It runs until you
+log out, stop it, or shut the machine down. Set it up once with the portal address (add
+`--ca-cert <file>` if your administrator gave you a CA certificate for the portal):
+
+```sh
+drawbridge client init --portal-url https://gateway.vpn.example.com
+```
+
+Then:
+
+```sh
+drawbridge client login    # opens your browser to log in; returns once access is live
+drawbridge client logout   # ends your access straight away
+```
+
+`login` prints the login URL and opens it in your browser. Log in as usual; the browser then shows
+"Login received" and the command reports `Logged in as …`. If no browser opens (there's no
+desktop, or you ran `init --no-browser`), open the printed URL yourself, in a browser **on the same
+machine**: the login hands your access to the service through `127.0.0.1`.
+
+`login` and `logout` only start and stop the `drawbridge-client` user service, so
+`systemctl --user start drawbridge-client` and `systemctl --user stop drawbridge-client` do the
+same, and `systemctl --user status drawbridge-client` shows where things stand. The service keeps
+your access in memory only and never writes it to disk. If the gateway ends your session (for
+example when it restarts), or can't renew it, the service stops with a failure rather than
+opening your browser unprompted; run `drawbridge client login` again.
+
+The command-line login is meant for a machine you don't share. As with the browser, access
+belongs to the machine's address, so other users on it share your access anyway. They can also
+see the login URL in the process list (unless `/proc` is mounted with `hidepid=2`), and could try
+to get you to open a login link of their own, to take over your session. Details are in
+`journalctl --user -u drawbridge-client`.
 
 ## For network administrators
 
@@ -130,13 +166,20 @@ This section covers deploying, configuring and operating a Drawbridge gateway. I
 
 ### Commands
 
-Drawbridge has three subcommands:
+The gateway's commands are under `drawbridge server`:
 
 | Command | Purpose |
 |---|---|
-| `drawbridge check` | Validate a policy and print the ruleset `run` would install. It needs no privileges and doesn't touch the kernel. |
-| `drawbridge run` | Install the rules, serve the portal, and wait for SIGINT/SIGTERM; then remove the rules. |
-| `drawbridge teardown` | Remove Drawbridge's nftables table, e.g. after a crash. A missing table counts as success. |
+| `drawbridge server check` | Validate a policy and print the ruleset `run` would install. It needs no privileges and doesn't touch the kernel. |
+| `drawbridge server run` | Install the rules, serve the portal, and wait for SIGINT/SIGTERM; then remove the rules. |
+| `drawbridge server teardown` | Remove Drawbridge's nftables table, e.g. after a crash. A missing table counts as success. |
+
+`drawbridge client init`, `login` and `logout` are for users' machines; see
+[From the command line](#from-the-command-line-linux-with-systemd).
+
+> **Upgrading from a version with top-level `run`, `check` and `teardown`:** change your unit's
+> `ExecStart` to `drawbridge server run` *before* restarting. Otherwise the old instance shuts down
+> (removing all filtering, as every shutdown does) and the new one refuses to start.
 
 ### Writing a policy
 
@@ -206,7 +249,7 @@ Rules are additive and allow-only; there is no deny. Replies to allowed connecti
 permitted. Unknown fields are rejected, so typos fail loudly. Errors name the offending entry:
 
 ```text
-$ drawbridge check --policy policy.yaml --external-iface wg0
+$ drawbridge server check --policy policy.yaml --external-iface wg0
 2026-10-07T04:26:44.253051Z ERROR drawbridge: users[1].allow[0]: ports are only valid with tcp or udp, not icmp
 ```
 
@@ -220,7 +263,7 @@ at startup. Run it after every policy change; it's safe to run anywhere. This is
 [`examples/policy.yaml`](examples/policy.yaml):
 
 ```text
-$ drawbridge check --policy examples/policy.yaml --external-iface wg0 --portal-listen 192.168.50.1:8443
+$ drawbridge server check --policy examples/policy.yaml --external-iface wg0 --portal-listen 192.168.50.1:8443
 table inet drawbridge {
 	set drop_seen4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; size 65536; flags dynamic,timeout; timeout 10s; }
 	set drop_seen4_proto { type ipv4_addr . ipv4_addr . inet_proto; size 65536; flags dynamic,timeout; timeout 10s; }
@@ -279,15 +322,23 @@ for a web application:
 
 | Setting | Value |
 |---|---|
-| Grant type | Authorization code (Drawbridge always uses PKCE with S256) |
+| Grant types | Authorization code (Drawbridge always uses PKCE with S256) and refresh token |
 | Redirect URI | `<portal-url>/callback`, e.g. `https://gateway.vpn.example.com/callback` |
-| Scopes | `openid` plus whatever `--oidc-scopes` asks for (`profile` by default; add `email` if you match on email) |
+| Scopes | `openid` plus whatever `--oidc-scopes` asks for (`profile,offline_access` by default; add `email` if you match on email) |
 | Token endpoint authentication | Client secret (basic) |
 
+`offline_access` asks the provider for a refresh token, which Drawbridge keeps on the gateway and
+uses to extend sessions: the browser page and the `drawbridge client` service ask the gateway to
+refresh, and never see the token. Without refresh tokens, browsers fall back to re-authenticating
+with the provider (silently, if it keeps an SSO session), and the client service can't keep a
+session beyond its first ID token. If your provider refuses the `offline_access` scope, remove it
+from `--oidc-scopes`, or logins fail.
+
 **Authentik:** create an *OAuth2/OpenID Provider* with client type *Confidential*, add the
-redirect URI above, and attach it to an *Application*. The issuer is
-`https://<authentik-host>/application/o/<application-slug>/`. Authentik keeps an SSO session, so
-background re-authentication happens without the user seeing anything.
+redirect URI above, add the `offline_access` scope mapping to its scopes, and attach it to an
+*Application*. The issuer is `https://<authentik-host>/application/o/<application-slug>/`.
+Authentik also keeps an SSO session, so the fallback re-authentication happens without the user
+seeing anything.
 
 Drawbridge refuses to start if the issuer, the token endpoint or the signing-key URL isn't
 `https` (unless `--oidc-allow-insecure-http` is set). It also refuses if the provider can't be
@@ -356,7 +407,7 @@ Wants=network-online.target
 After=network-online.target wg-quick@wg0.service
 
 [Service]
-ExecStart=/usr/local/bin/drawbridge run
+ExecStart=/usr/local/bin/drawbridge server run
 EnvironmentFile=/etc/drawbridge/drawbridge.env
 User=drawbridge
 Group=drawbridge
@@ -388,11 +439,11 @@ journalctl -u drawbridge -f
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Checks: drawbridge run
+    [*] --> Checks: drawbridge server run
     Checks --> Refused: invalid policy, lock held, missing interface, TLS or OIDC error
     Refused --> [*]: exit 1, firewall untouched
     Checks --> Enforcing: rules applied atomically, portal listening
-    Enforcing --> Enforcing: logins, re-authentications, expiries
+    Enforcing --> Enforcing: logins, refreshes, logouts, expiries
     Enforcing --> Stopped: SIGTERM / SIGINT
     Stopped --> [*]: portal closed, table deleted (fail-open)
 ```
@@ -403,13 +454,14 @@ stateDiagram-v2
 - **Reloading the policy:** restart the service. The new rules apply atomically, but **user
   sessions are not kept across restarts.** Users lose access until they log in again. Reloading
   the portal page is enough when the provider still has their SSO session, and an open page also
-  logs in again at its next scheduled renewal.
+  logs in again at its next scheduled renewal. The `drawbridge client` service stops at its next
+  refresh, and its users run `drawbridge client login` again.
 - **Shutdown** (SIGTERM/SIGINT) closes the portal, then deletes the table.
 - **After a crash or `kill -9`**, the table stays in place, still enforcing the last rules. The
   next `run` replaces it, or remove it by hand:
 
   ```sh
-  sudo drawbridge teardown --lock-file /run/drawbridge/drawbridge.lock
+  sudo drawbridge server teardown --lock-file /run/drawbridge/drawbridge.lock
   ```
 
 ### Rolling out with permissive mode
@@ -417,7 +469,7 @@ stateDiagram-v2
 To put Drawbridge on a gateway that already carries client traffic, without cutting anyone off
 while you write the policy:
 
-1. Write a first policy and check it with `drawbridge check`.
+1. Write a first policy and check it with `drawbridge server check`.
 2. Start Drawbridge with `--permissive` (or `DRAWBRIDGE_PERMISSIVE=true`). Everything the policy
    allows works as normal, including portal logins and user sessions. Everything else is
    **accepted** and logged with the prefix `drawbridge would-drop: `. Drawbridge warns at startup
@@ -438,7 +490,7 @@ rather than cut.
 ### Configuration reference
 
 Every option can be given as a flag or as an environment variable. Environment variables are the
-recommended form for a service. Run `drawbridge run --help` for the authoritative list.
+recommended form for a service. Run `drawbridge server run --help` for the authoritative list.
 
 **Core**
 
@@ -468,21 +520,39 @@ options required)
 | `--oidc-client-id` | `DRAWBRIDGE_OIDC_CLIENT_ID` | | Client ID registered with the provider. |
 | `--oidc-client-secret` | `DRAWBRIDGE_OIDC_CLIENT_SECRET` | | Client secret. **Use the environment variable**, so the secret doesn't appear in the process list. |
 | `--oidc-username-claim` | `DRAWBRIDGE_OIDC_USERNAME_CLAIM` | `preferred_username` | ID-token claim matched against `users[].username`. |
-| `--oidc-scopes` | `DRAWBRIDGE_OIDC_SCOPES` | `profile` | Scopes to request besides `openid`, comma-separated, e.g. `profile,email`. |
+| `--oidc-scopes` | `DRAWBRIDGE_OIDC_SCOPES` | `profile,offline_access` | Scopes to request besides `openid`, comma-separated, e.g. `profile,email,offline_access`. `offline_access` gets the refresh tokens that extend sessions. |
 | `--oidc-allow-insecure-http` | `DRAWBRIDGE_OIDC_ALLOW_INSECURE_HTTP` | off | Permit `http://` provider URLs. **For test setups only**: the secret and tokens then travel in cleartext. |
 
 **Sessions**
 
 | Flag | Environment variable | Default | Description |
 |---|---|---|---|
-| `--session-max-ttl` | `DRAWBRIDGE_SESSION_MAX_TTL` | `15m` | The longest one login or re-authentication keeps access, whatever the token's lifetime. Accepts `900`, `30s`, `15m` or `2h`; `0` means follow the token alone. |
+| `--session-max-ttl` | `DRAWBRIDGE_SESSION_MAX_TTL` | `15m` | The longest one login, refresh or re-authentication keeps access, whatever the token's lifetime. Accepts `900`, `30s`, `15m` or `2h`; `0` means follow the token alone. |
 
 A session lasts until the ID token expires, or until `--session-max-ttl` after the most recent
-login, whichever comes first. The portal page re-authenticates in the background at 80% of the
-remaining time. Once the page is closed, access, including open connections, ends at the next
-expiry. Browsers slow down timers in background tabs, so keep the provider's ID-token lifetime and
+login or refresh, whichever comes first. The portal page (or the client service) refreshes it at
+80% of the remaining time, through the refresh token the gateway holds. If the session has none,
+the page re-authenticates with the provider instead. Once the page is closed (or the service
+stopped), access, including open connections, ends at the next expiry, or at once on
+`drawbridge client logout`. Browsers slow down timers in background tabs, so keep the provider's ID-token lifetime and
 `--session-max-ttl` at a few minutes or more; otherwise renewals can arrive late and access lapses
 briefly.
+
+**Client** (`drawbridge client init`; `client.yaml` holds the result, and the same flags and
+variables override it for the service)
+
+| Flag | Environment variable | Default | Description |
+|---|---|---|---|
+| `--portal-url` | `DRAWBRIDGE_PORTAL_URL` | (required for `init`) | The portal's `https://` URL, as for the gateway. |
+| `--ca-cert` | `DRAWBRIDGE_CA_CERT` | | PEM CA certificates to trust for the portal besides the system's, comma-separated. |
+| `--no-browser` | `DRAWBRIDGE_NO_BROWSER` | off | `init` only: don't open a browser; `login` still prints the URL. |
+| `--config` | `DRAWBRIDGE_CLIENT_CONFIG` | `$XDG_CONFIG_HOME/drawbridge/client.yaml` | The service's settings file. |
+
+`init` writes `~/.config/drawbridge/client.yaml` and the user unit
+`~/.config/systemd/user/drawbridge-client.service` (`Type=notify`, `Restart=no`, no core dumps,
+a light sandbox), and reloads the user manager. The service opens the browser through
+`systemd-run --user`, as a unit of its own outside that sandbox. `systemd-analyze --user verify ~/.config/systemd/user/drawbridge-client.service`
+checks the unit.
 
 ### Operating Drawbridge
 
@@ -553,8 +623,10 @@ messages:
 | `access provisioned` | Startup finished; the rules are in force. |
 | `permissive mode: …` | Started with `--permissive`: traffic outside the policy is accepted, not dropped. |
 | `portal listening` | The portal is accepting connections on the logged address. |
-| `session provisioned` / `session extended` / `session replaced` | A user logged in, renewed, or a different user took over an IP. |
-| `session expired` | A session reached its expiry and was removed. |
+| `session provisioned` / `session extended` / `session replaced` | A user logged in, renewed (`via="refresh"` or `via="login"`), or a different user took over an IP. |
+| `session expired` / `session ended` | A session reached its expiry, or its user logged out; it was removed. |
+| `refresh token rejected; refresh disabled for this session` | The provider refused the refresh token. The session runs to its expiry; browsers re-authenticate, the client service stops. |
+| `refresh failed; provider unreachable` | A refresh couldn't reach the provider; clients retry. |
 | `login refused: no policy for user` | The username isn't in the policy (the user saw "No access"). |
 | `login verification failed` / `provider refused the login` | Token verification failed, or the provider returned an error. |
 | `session update failed; rebuilding` | An incremental change failed; Drawbridge is rebuilding the whole table from its state. |
@@ -574,7 +646,9 @@ messages:
 | `portal listen address … must be a specific address` | Use the gateway's client-side address, not `0.0.0.0` or `[::]`. |
 | The login page never loads | Clients can't reach the provider or DNS. Add a static `clients` rule for them. |
 | "No access" after logging in | The username claim's value doesn't exactly match a `users[].username`. Check the claim name and case; log at `debug` to see the verified username. |
-| Access ends while the page is open | The provider can't re-authenticate silently (it shows its login form instead), or the tab's timers were throttled. Check the provider's SSO session settings and token lifetimes. |
+| Access ends while the page is open | The provider issues no refresh tokens and can't re-authenticate silently (it shows its login form instead), or the tab's timers were throttled. Check that `--oidc-scopes` has `offline_access` and the client may use the refresh-token grant, and the provider's token lifetimes. |
+| `drawbridge client login` fails with `session lost: the gateway cannot refresh this session` | The provider issued no refresh token, or refused it. As above. |
+| The client service logs `client token request from another address` at the gateway / `address_mismatch` | The browser reached the portal from a different address than the service, e.g. over IPv6 while the service used IPv4. Use a portal URL that resolves to one address family. |
 
 ### Security notes
 
@@ -593,7 +667,19 @@ messages:
 - **Sessions and cookies.** The browser holds only a random 256-bit session token. It's in a
   `__Host-` cookie marked HttpOnly, Secure and SameSite=Lax, valid only from the same source IP.
   Logins use state, nonce and PKCE, and the login cookie ties each callback to the browser and
-  address that started it.
+  address that started it. Requests that refresh or end a session must carry an `X-Drawbridge`
+  header, which another site's page can't send.
+- **Refresh tokens stay on the gateway,** in memory, and are dropped (not revoked at the provider)
+  when the session ends. A session can therefore last as long as the provider keeps honouring its
+  refresh token while a page or client service is running, at most `--session-max-ttl` per
+  refresh. Set the provider's idle and absolute refresh-token lifetimes to bound how long one
+  login can last. To cut someone off, disable them at the provider: their next refresh fails.
+- **The command-line handoff.** For `drawbridge client`, the portal sends the browser to
+  `http://127.0.0.1:<port>/` with a one-time code instead of setting a cookie. The code is valid
+  for 60 seconds, once, from the same source IP, and only together with the PKCE verifier the
+  service holds, so the session token never appears in a URL. Access is provisioned only when the
+  code is redeemed. The redirect carries a random state from the service, whose listener ignores
+  anything else. The portal never redirects anywhere but `127.0.0.1`.
 - **Protect the secrets.** Keep the client secret in an environment file readable only by root,
   and the TLS key readable only by the service.
 - **Choose the username claim carefully.** See
@@ -633,15 +719,46 @@ sequenceDiagram
 
     loop While the page stays open
         Note over B: At 80% of the remaining lifetime
-        B->>P: GET /login?silent=1
-        P-->>B: 303 to provider (prompt=none)
-        I-->>B: 303 to /callback (no interaction)
-        B->>P: GET /callback
+        B->>P: POST /api/session/refresh
+        P->>I: Refresh token grant
+        I-->>P: New ID token (and refresh token)
         P->>S: Extend session to the new expiry
+        Note over B,P: No refresh token (409): GET /login?silent=1,<br/>prompt=none, through /callback as above
     end
 
-    Note over S: Browser closed: no re-authentication
+    Note over S: Browser closed: no refresh
     S->>N: At expiry, remove the session chain, cutting its open connections
+```
+
+With `drawbridge client`, the user service takes the page's place:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant C as drawbridge client login
+    participant V as drawbridge-client.service
+    participant B as Browser
+    participant P as Drawbridge portal
+
+    U->>C: drawbridge client login
+    C->>V: systemctl --user start
+    V->>V: Listen on 127.0.0.1:N, make a PKCE verifier and a state
+    V-->>C: STATUS=Log in at /login?cli_port=N&cli_challenge=...&cli_state=...
+    V->>B: Open the login URL
+    B->>P: GET /login?cli_port=N&..., then the provider, then /callback
+    P-->>B: 303 to http://127.0.0.1:N/?code=one-time&state=...
+    B->>V: GET /?code=one-time&state=...
+    V->>P: POST /api/cli/token (code, verifier)
+    P->>P: Provision the session
+    P-->>V: Session token
+    V-->>C: READY=1: access is live
+    loop Until stopped
+        V->>P: POST /api/session/refresh, at 80% of the remaining lifetime
+    end
+    U->>C: drawbridge client logout
+    C->>V: systemctl --user stop (SIGTERM)
+    V->>P: DELETE /api/session: the session ends now
 ```
 
 ### How the rules are laid out
@@ -713,13 +830,17 @@ cargo clippy --all-targets
 
 The end-to-end test starts a Docker Compose stack:
 - a gateway, a server and three clients on a stand-in for WireGuard;
-- [Dex](https://dexidp.io/) as the OIDC provider, with SSO sessions and 30s ID tokens.
+- [Dex](https://dexidp.io/) as the OIDC provider, with SSO sessions, refresh tokens and 30s ID
+  tokens.
 
 It checks static allow and deny paths over IPv4 and IPv6, and portal logins: refused users, IP
-binding, silent re-authentication from the provider's SSO session, the fallback to the login form
-when the provider has no session, and expiry cutting a live connection. Gateway and Dex log lines
-showing each extension are printed with the checks. Finally, it checks that everything opens up
-again after shutdown.
+binding, refreshes, silent re-authentication from the provider's SSO session, the fallback to the
+login form when the provider has no session, and expiry cutting a live connection. It runs
+`drawbridge client init`, `login` and `logout` as an unprivileged user, with a stand-in for
+`systemctl` (`e2e/systemctl-stub`), and checks that the service's refreshes keep access past the
+first token's expiry and that logging out cuts it at once. Gateway and Dex log lines and the CLI's
+output are printed with the checks. Finally, it checks that everything opens up again after
+shutdown, and restarts the gateway without refresh tokens to check the fallbacks.
 
 To watch re-authentication in a browser on a Linux host (which can reach the stack's bridge
 addresses), start the stack on its own from `e2e/` (`run.sh` tears it down when it exits):
@@ -729,10 +850,10 @@ docker compose -p drawbridge-e2e up -d --build --wait
 docker compose -p drawbridge-e2e logs -f gateway dex    # in another terminal
 ```
 
-Open `https://172.30.0.2:8443/`, accept the self-signed certificate and log in as
-`alice@example.com` with password `password`. The countdown starts at about 30s; a few seconds
-before it ends the page goes through Dex without showing a form and the countdown resets. The logs
-show `session extended` from the gateway and `re-authenticated from session` from Dex. Keep the tab
+Open `https://172.30.0.2:8443/`, accept the certificate (from the stack's own test CA) and log in
+as `alice@example.com` with password `password`. The countdown starts at about 30s; a few seconds
+before it ends the page refreshes and the countdown resets. The gateway logs
+`session extended … via="refresh"`. Keep the tab
 in the foreground, since browsers throttle background timers. Stop the stack with
 `docker compose -p drawbridge-e2e down`.
 
@@ -743,7 +864,7 @@ in the e2e image:
 cargo test --no-run && sudo unshare -n cargo test --test kernel -- --ignored
 ```
 
-Never run `drawbridge run` or `teardown` on a development machine; they change its firewall. See
+Never run `drawbridge server run` or `teardown` on a development machine; they change its firewall. See
 [`AGENTS.md`](AGENTS.md) for the design invariants and code layout, and [`docs/`](docs/) for the
 specifications.
 

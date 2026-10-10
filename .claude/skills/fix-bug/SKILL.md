@@ -31,7 +31,7 @@ Find out what *should* happen, from authoritative sources, in this order:
 3. The issue itself (its stated expectation), and the code's own doc comments and tests.
 
 Then check the claimed behaviour against the code by reading it. You may run `cargo test`, `drawbridge
-check`, or targeted unit tests to observe behaviour. **Never run `drawbridge run` or `teardown` on the
+check`, or targeted unit tests to observe behaviour. **Never run `drawbridge server run` or `teardown` on the
 host.** Anything touching the kernel needs `unshare -n` or the e2e containers.
 
 ### Reach a verdict

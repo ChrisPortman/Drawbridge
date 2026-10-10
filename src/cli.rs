@@ -6,9 +6,11 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+mod client;
 mod gateway;
 
 pub use crate::portal::Secret;
+pub use client::{init, login, logout, service};
 pub use gateway::{check, run, teardown};
 
 #[derive(Debug, Parser)]
@@ -20,12 +22,86 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run the gateway.
+    Server {
+        #[command(subcommand)]
+        command: ServerCommand,
+    },
+    /// Log in to a gateway from this machine and keep the session alive.
+    Client {
+        #[command(subcommand)]
+        command: ClientCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServerCommand {
     /// Provision the policy, wait for SIGINT/SIGTERM, then deprovision it.
     Run(Box<RunArgs>),
     /// Validate the policy and print the ruleset that `run` would install.
     Check(PolicyArgs),
     /// Remove the gateway's nftables table, e.g. after a crash.
     Teardown(LockArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ClientCommand {
+    /// Write the client settings and the drawbridge-client user service.
+    Init(InitArgs),
+    /// Start drawbridge-client.service, which logs you in through your browser, and wait until
+    /// access is live. Same as `systemctl --user start drawbridge-client`. If you interrupt it,
+    /// the login carries on in the background; `logout` cancels it.
+    Login(UnitArgs),
+    /// Stop drawbridge-client.service, which ends the session at the gateway. Same as
+    /// `systemctl --user stop drawbridge-client`.
+    Logout(UnitArgs),
+    /// The process drawbridge-client.service runs: logs in, keeps the session alive, and ends
+    /// it when stopped.
+    #[command(hide = true)]
+    Service(ClientArgs),
+}
+
+/// `client init` settings, saved to `$XDG_CONFIG_HOME/drawbridge/client.yaml`.
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    /// The gateway portal's base URL, e.g. `https://gateway.example:443`.
+    #[arg(long, env = "DRAWBRIDGE_PORTAL_URL")]
+    pub portal_url: url::Url,
+    /// PEM CA certificates to trust for the portal, besides the system's, comma-separated.
+    #[arg(long, env = "DRAWBRIDGE_CA_CERT", value_delimiter = ',')]
+    pub ca_cert: Vec<PathBuf>,
+    /// Don't open a browser to log in; follow the URL that `login` prints instead.
+    #[arg(long, env = "DRAWBRIDGE_NO_BROWSER")]
+    pub no_browser: bool,
+    #[command(flatten)]
+    pub unit: UnitArgs,
+}
+
+/// How to reach the user's service manager.
+#[derive(Debug, Args)]
+pub struct UnitArgs {
+    /// The systemctl binary; tests substitute a stand-in.
+    #[arg(
+        long,
+        env = "DRAWBRIDGE_SYSTEMCTL",
+        default_value = "systemctl",
+        hide = true
+    )]
+    pub systemctl: PathBuf,
+}
+
+/// The client service's settings. Flags and environment variables override the settings file.
+#[derive(Debug, Args)]
+pub struct ClientArgs {
+    /// Settings file; defaults to `$XDG_CONFIG_HOME/drawbridge/client.yaml`.
+    #[arg(long, env = "DRAWBRIDGE_CLIENT_CONFIG")]
+    pub config: Option<PathBuf>,
+    /// The gateway portal's base URL.
+    #[arg(long, env = "DRAWBRIDGE_PORTAL_URL")]
+    pub portal_url: Option<url::Url>,
+    /// PEM CA certificates to trust for the portal, besides the system's, comma-separated.
+    #[arg(long, env = "DRAWBRIDGE_CA_CERT", value_delimiter = ',')]
+    pub ca_cert: Vec<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -87,12 +163,14 @@ pub struct PortalArgs {
         default_value = "preferred_username"
     )]
     pub oidc_username_claim: String,
-    /// Scopes to request besides `openid`, comma-separated.
+    /// Scopes to request besides `openid`, comma-separated. `offline_access` asks for the refresh
+    /// tokens that keep sessions alive; without them, browsers re-authenticate with the
+    /// provider and the client service can't extend its session.
     #[arg(
         long,
         env = "DRAWBRIDGE_OIDC_SCOPES",
         value_delimiter = ',',
-        default_value = "profile"
+        default_value = "profile,offline_access"
     )]
     pub oidc_scopes: Vec<String>,
     /// Permit an `http://` issuer, token endpoint or JWKS URL. Only for test setups: the client
@@ -132,7 +210,68 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
+
+    fn parse(args: &str) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("drawbridge").chain(args.split_whitespace()))
+    }
+
+    #[test]
+    fn command_tree_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn parses_server_and_client_commands() {
+        let cli = parse("server check --policy p.yaml --external-iface wg0").unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Server {
+                command: ServerCommand::Check(_)
+            }
+        ));
+        let cli = parse("server teardown --lock-file /tmp/l").unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Server {
+                command: ServerCommand::Teardown(_)
+            }
+        ));
+        let cli = parse(
+            "client init --portal-url https://gw.example:8443 --ca-cert a.pem,b.pem --no-browser",
+        )
+        .unwrap();
+        let Command::Client {
+            command: ClientCommand::Init(init),
+        } = cli.command
+        else {
+            panic!("not init");
+        };
+        assert_eq!(init.portal_url.as_str(), "https://gw.example:8443/");
+        assert_eq!(
+            init.ca_cert,
+            [PathBuf::from("a.pem"), PathBuf::from("b.pem")]
+        );
+        assert!(init.no_browser);
+        assert!(parse("client login").is_ok());
+        assert!(parse("client logout").is_ok());
+        assert!(parse("client service --portal-url https://gw.example").is_ok());
+        // The old top-level commands are gone.
+        assert!(parse("run").is_err());
+    }
+
+    #[test]
+    fn service_is_hidden_from_help() {
+        let help = Cli::command()
+            .find_subcommand_mut("client")
+            .unwrap()
+            .render_help()
+            .to_string();
+        let listed = |name: &str| help.lines().any(|l| l.trim_start().starts_with(name));
+        assert!(listed("login") && !listed("service"), "{help}");
+    }
 
     #[test]
     fn parses_durations() {

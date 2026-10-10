@@ -15,8 +15,8 @@ use openidconnect::core::{
 use openidconnect::{
     AdditionalClaims, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EmptyExtraTokenFields,
     EndpointMaybeSet, EndpointNotSet, EndpointSet, IdTokenClaims, IdTokenFields, IssuerUrl, Nonce,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, StandardErrorResponse,
-    StandardTokenResponse, TokenResponse, reqwest,
+    OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken,
+    RequestTokenError, Scope, StandardErrorResponse, StandardTokenResponse, TokenResponse, reqwest,
 };
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -31,6 +31,17 @@ pub struct Secret(String);
 impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Secret([redacted])")
+    }
+}
+
+#[cfg(test)]
+impl Secret {
+    pub(crate) fn new(s: String) -> Self {
+        Secret(s)
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
     }
 }
 
@@ -141,6 +152,25 @@ pub(crate) struct Identity {
     pub(crate) expires_at: SystemTime,
 }
 
+/// A completed login or refresh: who, and the refresh token the provider issued, if any.
+#[derive(Debug)]
+pub(crate) struct LoggedIn {
+    pub(crate) identity: Identity,
+    pub(crate) refresh_token: Option<Secret>,
+}
+
+/// Why a refresh didn't produce a new ID token.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RefreshFailure {
+    /// The provider refused the refresh token, or what it returned can't be used: refreshing
+    /// this session won't work again.
+    #[error("refresh rejected")]
+    Rejected(#[source] OidcError),
+    /// The provider couldn't be reached or answered unintelligibly; a later attempt may work.
+    #[error("provider unreachable")]
+    Unreachable(#[source] OidcError),
+}
+
 /// The parts of the OIDC flow the portal depends on, so its handlers can be tested without a
 /// provider.
 pub(crate) trait Authenticator: Send + Sync + 'static {
@@ -151,7 +181,12 @@ pub(crate) trait Authenticator: Send + Sync + 'static {
         &self,
         code: String,
         pending: PendingLogin,
-    ) -> impl Future<Output = Result<Identity, OidcError>> + Send;
+    ) -> impl Future<Output = Result<LoggedIn, OidcError>> + Send;
+    /// Redeems `refresh_token` for a new ID token and verifies it.
+    fn refresh(
+        &self,
+        refresh_token: Secret,
+    ) -> impl Future<Output = Result<LoggedIn, RefreshFailure>> + Send;
 }
 
 pub(crate) struct Oidc {
@@ -180,7 +215,9 @@ impl Oidc {
             .map_err(|e| OidcError::Config(e.to_string()))?;
         // Following redirects from the token endpoint would forward the client secret. The
         // timeouts stop a stalled provider from hanging startup or piling up callbacks.
+        // The gateway trusts the bundled roots only; native roots are compiled in for the client.
         let http = reqwest::ClientBuilder::new()
+            .tls_built_in_native_certs(false)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .timeout(HTTP_TIMEOUT)
@@ -240,7 +277,7 @@ impl Authenticator for Oidc {
         }
     }
 
-    async fn complete(&self, code: String, pending: PendingLogin) -> Result<Identity, OidcError> {
+    async fn complete(&self, code: String, pending: PendingLogin) -> Result<LoggedIn, OidcError> {
         let response = self
             .client
             .exchange_code(AuthorizationCode::new(code))
@@ -249,19 +286,65 @@ impl Authenticator for Oidc {
             .request_async(&self.http)
             .await
             .map_err(|e| OidcError::Exchange(Box::new(e)))?;
-        let id_token = response.id_token().ok_or(OidcError::NoIdToken)?;
         // Checks the signature, issuer, audience, expiry and nonce.
-        let claims = id_token.claims(&self.client.id_token_verifier(), &pending.nonce)?;
+        self.logged_in(&response, &pending.nonce)
+    }
+
+    async fn refresh(&self, refresh_token: Secret) -> Result<LoggedIn, RefreshFailure> {
+        let token = RefreshToken::new(refresh_token.0);
+        let response = self
+            .client
+            .exchange_refresh_token(&token)
+            .map_err(|e| RefreshFailure::Rejected(OidcError::Config(e.to_string())))?
+            .request_async(&self.http)
+            .await
+            .map_err(classify)?;
+        // A refreshed ID token may repeat the login's nonce or carry none (OIDC Core 12.2);
+        // the signature, issuer, audience and expiry are still checked.
+        let any_nonce = |_: Option<&Nonce>| Ok(());
+        self.logged_in(&response, any_nonce)
+            .map_err(RefreshFailure::Rejected)
+    }
+}
+
+impl Oidc {
+    /// Verifies the response's ID token and reads the username and refresh token from it.
+    fn logged_in(
+        &self,
+        response: &TokenResp,
+        nonce: impl openidconnect::NonceVerifier,
+    ) -> Result<LoggedIn, OidcError> {
+        let id_token = response.id_token().ok_or(OidcError::NoIdToken)?;
+        let claims = id_token.claims(&self.client.id_token_verifier(), nonce)?;
         let username = username(claims, &self.username_claim)?;
         let expires_at = SystemTime::from(claims.expiration());
         if expires_at <= SystemTime::now() {
             return Err(OidcError::Expired);
         }
         debug!(%username, "ID token verified");
-        Ok(Identity {
-            username,
-            expires_at,
+        Ok(LoggedIn {
+            identity: Identity {
+                username,
+                expires_at,
+            },
+            refresh_token: response.refresh_token().map(|t| Secret(t.secret().clone())),
         })
+    }
+}
+
+/// A provider's error response is a refusal; failing to reach it, or to parse its answer (e.g.
+/// a 5xx error page), may be temporary.
+fn classify<RE, T>(e: RequestTokenError<RE, T>) -> RefreshFailure
+where
+    RE: std::error::Error + Send + Sync + 'static,
+    T: openidconnect::ErrorResponse + Send + Sync + 'static,
+{
+    let rejected = matches!(e, RequestTokenError::ServerResponse(_));
+    let e = OidcError::Exchange(Box::new(e));
+    if rejected {
+        RefreshFailure::Rejected(e)
+    } else {
+        RefreshFailure::Unreachable(e)
     }
 }
 
@@ -302,6 +385,21 @@ mod tests {
             .unwrap()
             .extend(json.as_object().unwrap().clone());
         serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn refresh_errors_split_refusals_from_outages() {
+        type E = RequestTokenError<std::io::Error, StandardErrorResponse<CoreErrorResponseType>>;
+        let refused: E = RequestTokenError::ServerResponse(StandardErrorResponse::new(
+            CoreErrorResponseType::InvalidGrant,
+            None,
+            None,
+        ));
+        assert!(matches!(classify(refused), RefreshFailure::Rejected(_)));
+        let down: E = RequestTokenError::Request(std::io::Error::other("connection refused"));
+        assert!(matches!(classify(down), RefreshFailure::Unreachable(_)));
+        let garbled: E = RequestTokenError::Other("502 Bad Gateway".into());
+        assert!(matches!(classify(garbled), RefreshFailure::Unreachable(_)));
     }
 
     #[test]

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end test: brings up the compose stack, probes allowed and denied paths through the
-# gateway, logs in through the portal (including silent re-authentication from Dex's SSO session,
-# and the fallback to Dex's form without one), then stops the gateway and checks its rules are gone
-# (fail-open).
+# gateway, logs in through the portal (refreshing the session, re-authenticating silently from
+# Dex's SSO session, and falling back to Dex's form without one), logs in with `drawbridge client`
+# and its (stubbed) user service, then stops the gateway and checks its rules are gone
+# (fail-open). Finally it restarts the gateway without refresh tokens and in permissive mode.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -122,8 +123,8 @@ log_has() {
 }
 
 # Gateway log lines that would mean a session was not simply extended. Nothing in the run replaces
-# a session, so "replaced" has no positive check; the other two do.
-NOT_EXTENDED='session (expired|provisioned|replaced)'
+# a session, so "replaced" has no positive check; the others do.
+NOT_EXTENDED='session (expired|provisioned|replaced|ended)'
 
 # The session's expiry (Unix seconds) as the portal reports it to client-user's browser.
 expiry() {
@@ -133,6 +134,83 @@ expiry() {
 
 session_cookie() {
     dc exec -T client-user awk '/drawbridge_session/ {print $7}' /tmp/jar
+}
+
+# page_refresh <service> [unmarked]: what the portal page's timer does, a POST to
+# /api/session/refresh with the browser's cookies; prints the HTTP status. "unmarked" leaves out
+# the X-Drawbridge header a cross-site request couldn't send. The body is left in /tmp/refresh.
+page_refresh() {
+    local header=(-H "X-Drawbridge: 1")
+    [[ ${2:-} == unmarked ]] && header=()
+    dc exec -T "$1" curl -sk -b /tmp/jar -c /tmp/jar -X POST "${header[@]}" -o /tmp/refresh \
+        -w "%{http_code}" "$PORTAL/api/session/refresh"
+}
+
+# `drawbridge client` runs as the unprivileged `user` of client-user, with systemctl-stub standing
+# in for its user service manager.
+AS_USER=(-u user -e HOME=/home/user -e XDG_RUNTIME_DIR=/run/user/1000
+    -e DRAWBRIDGE_SYSTEMCTL=systemctl-stub)
+cli() { dc exec -T "${AS_USER[@]}" client-user drawbridge client "$@"; }
+stub() { dc exec -T "${AS_USER[@]}" client-user systemctl-stub --user "$@"; }
+unit_state() { stub show drawbridge-client.service | sed -n 's/^ActiveState=//p'; }
+service_log() { dc exec -T client-user cat /run/user/1000/stub/service.log 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g'; }
+service_running() { dc exec -T client-user pgrep -u user -f 'drawbridge client service' >/dev/null; }
+evidence() { sed 's/^/      | /'; } # indents command output printed as evidence
+
+# start_bg <name> <command...>: runs <command> as `user` in client-user in the background, its
+# output in /tmp/<name>.out and its exit status, once done, in /tmp/<name>.status.
+start_bg() {
+    local name=$1
+    shift
+    dc exec -T client-user rm -f "/tmp/$name.out" "/tmp/$name.status"
+    dc exec -d "${AS_USER[@]}" client-user sh -c \
+        "$* >/tmp/$name.out 2>&1; echo \$? >/tmp/$name.status"
+}
+
+bg_status() { dc exec -T client-user cat "/tmp/$1.status" 2>/dev/null || echo running; }
+
+wait_bg() { # wait_bg <name>: waits up to 15s for it to finish; prints its exit status
+    for _ in $(seq 60); do
+        [[ $(bg_status "$1") != running ]] && break
+        sleep 0.25
+    done
+    bg_status "$1"
+}
+
+# login_url <command...>: waits up to 10s for <command> to print the portal's command-line login
+# URL; prints it.
+login_url() {
+    local url
+    for _ in $(seq 40); do
+        url=$("$@" 2>/dev/null | grep -o "$PORTAL/login?cli_port=[^ ]*" | head -n1) || true
+        [[ -n $url ]] && break
+        sleep 0.25
+    done
+    echo "$url"
+}
+
+# drive_login <url>: what the user does in the browser the service opened: follows <url> to Dex's
+# form and submits alice's password; prints "<status> <final url>", which should be the service's
+# loopback listener.
+drive_login() {
+    local form
+    form=$(dc exec -T client-user curl -sk -L -c /tmp/jar -b /tmp/jar -o /dev/null \
+        -w "%{url_effective}" "$1")
+    dc exec -T client-user curl -sk -L -c /tmp/jar -b /tmp/jar -o /dev/null \
+        -w "%{http_code} %{url_effective}" \
+        --data-urlencode login=alice@example.com --data-urlencode password=password "$form"
+}
+
+# The loopback URL drive_login should end on.
+LOOPBACK='^200 http://127\.0\.0\.1:[0-9]+/\?code=[0-9a-f]{64}&state=[A-Za-z0-9_-]+$'
+matches() { if [[ $1 =~ $2 ]]; then echo yes; else echo "no ($1)"; fi; }
+
+# wait_for_portal: after a gateway restart, until the portal answers.
+wait_for_portal() {
+    for _ in $(seq 40); do
+        dc exec -T client-user curl -sk -o /dev/null "$PORTAL/" && break
+        sleep 0.25
+    done
 }
 
 # Dispatch rules in the gateway's sessions chain.
@@ -269,7 +347,25 @@ exp1=$(expiry)
 cookie1=$(session_cookie)
 sleep 3   # expiries have whole-second resolution
 
-# With an SSO session, Dex answers prompt=none itself: no form, nothing submitted.
+# The page's timer refreshes through the gateway, which holds Dex's refresh token.
+report 403 "$(page_refresh client-user unmarked)" "a refresh without the request header is refused"
+tr=$(now_ts)
+report 200 "$(page_refresh client-user)" "the page refreshes alice's session"
+sleep 1
+tr1=$(now_ts)
+expr=$(expiry)
+got="not later"
+((expr > exp1)) && got=later
+report later "$got" "the refresh extends the session"
+report "$cookie1" "$(session_cookie)" "the refresh keeps the session cookie"
+log_has present gateway "$tr" "$tr1" 'session extended.*via="?refresh' "gateway logs the refresh"
+log_has absent  gateway "$tr" "$tr1" "$NOT_EXTENDED" "gateway neither deprovisions nor re-provisions"
+log_has absent  dex "$tr" "$tr1" "login successful|re-authenticated from session" \
+    "Dex sees no login for the refresh"
+sleep 2
+
+# The page's fallback when a session has no refresh token (see "browser without refresh tokens"
+# below): with an SSO session, Dex answers prompt=none itself: no form, nothing submitted.
 t0=$(now_ts)
 read -r status url <<<"$(silent_login client-user)"
 sleep 1
@@ -279,7 +375,7 @@ report no "$(hops_include client-user /auth/local/login)" \
     "silent re-authentication shows no login form"
 exp2=$(expiry)
 got="not later"
-((exp2 > exp1)) && got=later
+((exp2 > expr)) && got=later
 report later "$got" "silent re-authentication extends the session"
 report "$cookie1" "$(session_cookie)" "silent re-authentication keeps the session cookie"
 log_has present gateway "$t0" "$t1" "session extended" "gateway logs the extension"
@@ -319,8 +415,93 @@ report 0 "$(session_rules)" "expired session removed"
 log_has present gateway "$t3" "$(now_ts)" "session expired" \
     "gateway deprovisions at the final expiry"
 
+
+echo "== client CLI"
+# The user service logs in through the browser and refreshes the session until it is stopped.
+report 0 "$(cli init --portal-url "$PORTAL" --ca-cert /etc/drawbridge/ca.crt --no-browser \
+    >/dev/null; echo $?)" "client init succeeds"
+unit=$(dc exec -T client-user cat /home/user/.config/systemd/user/drawbridge-client.service)
+evidence <<<"$unit"
+report yes "$(grep -q '^Type=notify$' <<<"$unit" && grep -q 'client service$' <<<"$unit" &&
+    echo yes || echo no)" "the unit runs the service as Type=notify"
+report yes "$(dc exec -T client-user grep -q 'daemon-reload' /home/user/systemctl.log &&
+    echo yes || echo no)" "client init reloads the user manager"
+tcp closed client-user $SERVER 8081
+forget_provider client-user
+
+start_bg cli-login drawbridge client login
+url=$(login_url dc exec -T client-user cat /tmp/cli-login.out)
+report yes "$(matches "$url" "^$PORTAL/login\?cli_port=[0-9]+&cli_challenge=[A-Za-z0-9_-]{43}&cli_state=[A-Za-z0-9_-]+$")" \
+    "client login prints the login URL"
+report running "$(bg_status cli-login)" "client login waits for the browser login"
+report activating "$(unit_state)" "the service is starting"
+tl=$(now_ts)
+report yes "$(matches "$(drive_login "$url")" "$LOOPBACK")" \
+    "the browser login lands on the service's loopback listener"
+L=$(date +%s)
+report 0 "$(wait_bg cli-login)" "client login returns once logged in"
+report active "$(unit_state)" "the service is active"
+echo "      client login output:"
+dc exec -T client-user cat /tmp/cli-login.out | evidence
+report yes "$(dc exec -T client-user grep -q '^Logged in as alice@example.com' /tmp/cli-login.out &&
+    echo yes || echo no)" "client login reports the logged-in user"
+log_has present gateway "$tl" "$(now_ts)" "session provisioned" "gateway provisions the CLI session"
+tcp open   client-user $SERVER 8081
+flow_start client-user $SERVER 8082
+flow alive client-user "connection opened during the CLI session"
+
+# The ID token expires at about L+30; the service refreshes at about L+24 and again at L+48,
+# with the refresh token Dex rotated the first time.
+wait_until $((L + 33))
+tcp open   client-user $SERVER 8081    # past the first token's expiry
+flow alive client-user "connection survives the service's refresh"
+t4=$(now_ts)
+log_has present gateway "$tl" "$t4" 'session extended.*via="?refresh' "gateway logs the service's refresh"
+log_has absent  gateway "$((L + 1))" "$t4" "$NOT_EXTENDED" "gateway neither deprovisions nor re-provisions"
+log_has absent  dex "$((L + 1))" "$t4" "login successful|re-authenticated from session" \
+    "Dex sees no login for the refresh"
+wait_until $((L + 57))
+tcp open   client-user $SERVER 8081    # past the first refresh's expiry
+report 2 "$(logs_between gateway "$tl" "$(now_ts)" | grep -cE 'session extended.*via="?refresh')" \
+    "the service refreshes twice, with the rotated refresh token"
+echo "      service log:"
+service_log | evidence || true
+
+tq=$(now_ts)
+status=0
+out=$(cli logout) || status=$?
+report 0 "$status" "client logout succeeds"
+evidence <<<"$out"
+tcp closed client-user $SERVER 8081    # the session still had about 20s to run
+flow dead  client-user "logout cuts the connection"
+report 0 "$(session_rules)" "logout removes the session"
+sleep 1
+log_has present gateway "$tq" "$(now_ts)" "session ended" "gateway ends the session at logout"
+log_has absent  gateway "$tq" "$(now_ts)" "session expired" "the session did not just expire"
+report yes "$(service_log | grep -q 'session ended at the gateway' && echo yes || echo no)" \
+    "the service ends the session as it stops"
+report inactive "$(unit_state)" "the service is stopped"
+got=gone
+service_running && got=running
+report gone "$got" "no service process is left"
+
+# Plain systemctl works the same: start blocks until logged in, stop logs out.
+forget_provider client-user
+start_bg stub-start systemctl-stub --user start drawbridge-client.service
+url=$(login_url stub show drawbridge-client.service)
+report yes "$(matches "$(drive_login "$url")" "$LOOPBACK")" \
+    "systemctl start: the browser login lands on the loopback listener"
+report 0 "$(wait_bg stub-start)" "systemctl start returns once logged in"
+tcp open   client-user $SERVER 8081
+tq=$(now_ts)
+stub stop drawbridge-client.service || true
+tcp closed client-user $SERVER 8081
+sleep 1
+log_has present gateway "$tq" "$(now_ts)" "session ended" "systemctl stop ends the session"
+
 echo "== second instance"
-refused "another drawbridge instance holds" "second instance refuses to start" drawbridge run
+refused "another drawbridge instance holds" "second instance refuses to start" \
+    drawbridge server run
 
 echo "== gateway stopped"
 stop_gateway
@@ -338,8 +519,61 @@ tcp open   client-user   $SERVER6 8081
 flow_start client-user $SERVER 8082
 flow alive client-user "new connection to the echo service"
 
+echo "== browser without refresh tokens"
+# Without offline_access Dex issues no refresh tokens: the page's refresh gets 409 and falls back
+# to re-authenticating silently, and the client service can't keep its session.
+# Logging to the container's output (PID 1's), where `dc logs` and log_has see it.
+dc exec -d gateway sh -c \
+    'DRAWBRIDGE_OIDC_SCOPES=profile,email exec drawbridge server run >/proc/1/fd/1 2>&1'
+wait_for_portal
+forget_provider client-user
+report 200 "$(login client-user alice@example.com)" "alice logs in"
+report 409 "$(page_refresh client-user)" "the refresh is refused"
+report yes "$(dc exec -T client-user grep -q refresh_unavailable /tmp/refresh && echo yes ||
+    echo no)" "the gateway says the session can't be refreshed"
+t5=$(now_ts)
+read -r status url <<<"$(silent_login client-user)"
+sleep 1
+report "200 $PORTAL/" "$status $url" "the page's fallback re-authenticates silently"
+log_has present gateway "$t5" "$(now_ts)" 'session extended.*via="?login' \
+    "gateway extends the session through the fallback"
+log_has present dex "$t5" "$(now_ts)" "re-authenticated from session" "Dex logs in from its SSO session"
+
+# The service shares alice's session from this address, which has no refresh token. It keeps
+# the session until it expires, so logging out still ends it.
+forget_provider client-user
+start_bg cli-login drawbridge client login
+url=$(login_url dc exec -T client-user cat /tmp/cli-login.out)
+report yes "$(matches "$(drive_login "$url")" "$LOOPBACK")" "the service logs in"
+L=$(date +%s)
+report 0 "$(wait_bg cli-login)" "client login returns once logged in"
+wait_until $((L + 26))   # the service tried to refresh at about L+24; the session ends at L+30
+report yes "$(service_log | grep -q 'cannot refresh this session' && echo yes || echo no)" \
+    "the service says the session can't be refreshed"
+report active "$(unit_state)" "the service holds the session until it expires"
+tcp open   client-user $SERVER 8081
+tq=$(now_ts)
+cli logout >/dev/null || true
+tcp closed client-user $SERVER 8081   # the session had a few seconds left
+sleep 1
+log_has present gateway "$tq" "$(now_ts)" "session ended" "logout still ends the session"
+
+# Left alone, it fails at the expiry, and nothing restarts it.
+forget_provider client-user
+start_bg cli-login drawbridge client login
+url=$(login_url dc exec -T client-user cat /tmp/cli-login.out)
+report yes "$(matches "$(drive_login "$url")" "$LOOPBACK")" "the service logs in again"
+L=$(date +%s)
+report 0 "$(wait_bg cli-login)" "client login returns once logged in"
+wait_until $((L + 33))
+report failed "$(unit_state)" "the service fails once the session expires"
+report yes "$(service_log | grep -qx 'exited 1' && echo yes || echo no)" \
+    "the service exits with a failure, and nothing restarts it"
+tcp closed client-user $SERVER 8081
+stop_gateway
+
 echo "== permissive mode"
-dc exec -d gateway env DRAWBRIDGE_PERMISSIVE=true drawbridge run
+dc exec -d gateway env DRAWBRIDGE_PERMISSIVE=true drawbridge server run
 for _ in $(seq 40); do
     dc exec -T gateway nft list table inet drawbridge >/dev/null 2>&1 && break
     sleep 0.25
@@ -361,9 +595,9 @@ stop_gateway
 
 echo "== misconfiguration"
 refused "not found" "unknown external interface refuses to start" \
-    drawbridge run --external-iface nope0
+    drawbridge server run --external-iface nope0
 refused "is not https" "http issuer refuses to start without opt-in" \
-    env DRAWBRIDGE_OIDC_ALLOW_INSECURE_HTTP=false drawbridge run
+    env DRAWBRIDGE_OIDC_ALLOW_INSECURE_HTTP=false drawbridge server run
 if dc exec -T gateway nft list table inet drawbridge >/dev/null 2>&1; then
     report absent present "no table after refused start"
 else

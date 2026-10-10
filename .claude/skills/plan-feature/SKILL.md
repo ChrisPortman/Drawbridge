@@ -124,7 +124,7 @@ The approved plan is the contract. Work from it, not from memory of the issue.
    API, and `ruleset.rs` kept pure.
 4. **Stay inside the agreed scope.** If you hit something the plan didn't anticipate (a conflicting
    invariant, a needed design change, scope growth), stop and ask the user. Don't silently deviate.
-5. **Safety.** Never run `drawbridge run` or `teardown` on the host. Use `unshare -n`, a network
+5. **Safety.** Never run `drawbridge server run` or `teardown` on the host. Use `unshare -n`, a network
    namespace, or the e2e containers for anything that touches the kernel.
 6. **Verify** with the commands from the plan: `cargo fmt`, `cargo clippy --all-targets` (warning-free),
    `cargo test`, and, when the plan calls for them, the kernel test and `./e2e/run.sh`. Fix failures

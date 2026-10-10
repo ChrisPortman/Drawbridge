@@ -13,7 +13,7 @@ Read `AGENTS.md` and `docs/` first. They define the design invariants you are ch
 ## Ground rules
 
 - **Read-only.** Never edit, create or delete files. Never commit. Never run anything that changes
-  firewall state on the host (`drawbridge run`/`teardown`, `nft add|delete|flush`, `iptables`).
+  firewall state on the host (`drawbridge server run`/`teardown`, `nft add|delete|flush`, `iptables`).
   - Inspection commands are fine: `cargo tree`, `cargo metadata`, `cargo audit`, `cargo deny`,
     `git log`/`diff`/`grep`, `nft list` inside containers.
   - If a tool isn't installed, say so and fall back to manual review. Don't install anything without
