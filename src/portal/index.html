@@ -23,10 +23,11 @@
 </main>
 <script>
 "use strict";
-// Re-authenticate silently once this fraction of the remaining lifetime has passed, but not
-// more often than MIN_DELAY_S, so a provider returning short-lived tokens can't cause a loop.
-const REAUTH_FRACTION = 0.8;
+// Refresh once this fraction of the remaining lifetime has passed, but not more often than
+// MIN_DELAY_S, so a provider returning short-lived tokens can't cause a loop.
+const REFRESH_FRACTION = 0.8;
 const MIN_DELAY_S = 5;
+const RETRY_S = 5;
 let expiresAtMs = 0; // in this browser's clock, derived from the server's
 
 function showRemaining() {
@@ -35,11 +36,7 @@ function showRemaining() {
     s >= 60 ? Math.floor(s / 60) + "m " + (s % 60) + "s left" : s + "s left";
 }
 
-async function load() {
-  const r = await fetch("/api/session", { cache: "no-store" });
-  if (r.status === 401) { location.replace("/login"); return; }
-  if (!r.ok) { setTimeout(load, 5000); return; }
-  const s = await r.json();
+function show(s) {
   document.getElementById("user").textContent = s.username;
   const list = document.getElementById("access");
   list.replaceChildren(...s.access.map(a => {
@@ -50,12 +47,36 @@ async function load() {
   const remaining = s.expires_at - s.server_now;
   expiresAtMs = Date.now() + remaining * 1000;
   showRemaining();
-  const delay = Math.max(remaining * REAUTH_FRACTION, MIN_DELAY_S);
-  setTimeout(() => location.replace("/login?silent=1"), delay * 1000);
+  setTimeout(refresh, Math.max(remaining * REFRESH_FRACTION, MIN_DELAY_S) * 1000);
+}
+
+// Extends the session with the gateway's refresh token. When the session has none (409), falls
+// back to re-authenticating silently from the provider's own session.
+async function refresh() {
+  let r;
+  try {
+    r = await fetch("/api/session/refresh", {
+      method: "POST", headers: { "X-Drawbridge": "1" }, cache: "no-store",
+    });
+  } catch {
+    setTimeout(refresh, RETRY_S * 1000);
+    return;
+  }
+  if (r.ok) { show(await r.json()); return; }
+  if (r.status === 401) { location.replace("/login"); return; }
+  if (r.status === 409) { location.replace("/login?silent=1"); return; }
+  setTimeout(refresh, RETRY_S * 1000);
+}
+
+async function load() {
+  const r = await fetch("/api/session", { cache: "no-store" });
+  if (r.status === 401) { location.replace("/login"); return; }
+  if (!r.ok) { setTimeout(load, RETRY_S * 1000); return; }
+  show(await r.json());
 }
 
 setInterval(showRemaining, 1000);
-load().catch(() => setTimeout(load, 5000));
+load().catch(() => setTimeout(load, RETRY_S * 1000));
 </script>
 </body>
 </html>

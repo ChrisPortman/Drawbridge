@@ -44,7 +44,8 @@ services:
       DRAWBRIDGE_OIDC_CLIENT_SECRET: e2e-secret
       # Dex issues no preferred_username; its email is verified.
       DRAWBRIDGE_OIDC_USERNAME_CLAIM: email
-      DRAWBRIDGE_OIDC_SCOPES: profile,email
+      # offline_access: refresh tokens, which extend sessions (run.sh restarts without it once).
+      DRAWBRIDGE_OIDC_SCOPES: profile,email,offline_access
     volumes:
       - ./policy.yaml:/etc/drawbridge/policy.yaml:ro
     networks:

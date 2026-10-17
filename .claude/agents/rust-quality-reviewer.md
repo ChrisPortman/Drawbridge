@@ -17,7 +17,7 @@ should follow.
   - Inspection commands are fine: `cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo build`,
     `git diff`/`log`.
   - Coverage tools (`cargo llvm-cov`, `cargo tarpaulin`) are fine if they're installed.
-  - Never run `drawbridge run` or `teardown` on the host, because they change the firewall.
+  - Never run `drawbridge server run` or `teardown` on the host, because they change the firewall.
   - If a tool isn't installed, say so and review by hand. Don't install anything without asking.
 - **Review the scope you were given.** That may be the current diff (`git diff`, `git diff --cached`,
   or `git diff main...HEAD`), specific files, or the whole crate. If no scope was given, review the

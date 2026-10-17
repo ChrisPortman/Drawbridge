@@ -20,6 +20,8 @@ RUN mkdir -p /etc/drawbridge \
  && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
       -subj /CN=172.30.0.2 -addext subjectAltName=IP:172.30.0.2 \
       -keyout /etc/drawbridge/portal.key -out /etc/drawbridge/portal.crt 2>/dev/null
+# An unprivileged account for the client CLI and its (stubbed) user service.
+RUN useradd -m -u 1000 user
 COPY --from=build /usr/local/bin/drawbridge /usr/local/bin/
-COPY e2e/entrypoint.sh /usr/local/bin/
+COPY e2e/entrypoint.sh e2e/systemctl-stub /usr/local/bin/
 ENTRYPOINT ["entrypoint.sh"]

@@ -36,13 +36,15 @@ gateway)
     pin_neighbour fd00:30::12 02:00:00:30:00:12 wg0
     listen 2222 2223
     # Keep the container alive after the gateway exits so tests can inspect the aftermath.
-    drawbridge run || echo "drawbridge exited with $?"
+    drawbridge server run || echo "drawbridge exited with $?"
     exec sleep infinity
     ;;
 client)
     ip route add 10.10.0.0/24 via 172.30.0.2
     ip -6 route add fd00:10::/64 via fd00:30::2
     pin_neighbour fd00:30::2 02:00:00:30:00:02 eth0
+    # The runtime directory systemd would give `user` (uid 1000), for `drawbridge client`.
+    install -d -o user -m 700 /run/user/1000
     listen 7000
     touch /tmp/ready
     exec sleep infinity
