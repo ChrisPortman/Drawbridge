@@ -254,3 +254,17 @@ The docs are sparse, so read the source in `~/.cargo/registry/src/*/rustables-0.
     `/proc/1/fd/1` when `log_has` must see it.
   - The external Docker network stands in for WireGuard. It has pinned IPv6 neighbour entries,
     because Drawbridge (correctly) drops neighbour discovery on the external interface.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues for `ChrisPortman/Drawbridge`, managed with the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The default label names: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` at the root, with ADRs in `docs/decisions/`. See `docs/agents/domain.md`.
