@@ -24,7 +24,7 @@ use tokio::task::JoinSet;
 use crate::firewall::ruleset::Mode;
 use crate::policy::{Allow, Policy, Proto};
 use crate::session::SessionView;
-use droplog::{Drop, DropLog};
+use droplog::{Denial, DenyReason, DropLog};
 use sni::ClientHello;
 
 /// How long a client has to send its ClientHello, and the proxy to connect upstream.
@@ -226,7 +226,7 @@ impl Proxy {
         let mut buf = Vec::with_capacity(1024);
         let hello = tokio::time::timeout(self.timeout, read_hello(&mut client, &mut buf)).await;
         let (host, reason) = match hello {
-            Err(_) => (None, Some("timeout")),
+            Err(_) => (None, Some(DenyReason::Timeout)),
             Ok(Err(_)) | Ok(Ok(None)) => return,
             // Anything that doesn't open with a TLS handshake record is taken for HTTP.
             Ok(Ok(Some(_))) if buf.first() != Some(&sni::CONTENT_HANDSHAKE) => {
@@ -234,10 +234,10 @@ impl Proxy {
             }
             Ok(Ok(Some(hello))) => match hello {
                 ClientHello::Sni(host) => (Some(host), None),
-                ClientHello::NoSni => (None, Some("no-sni")),
-                ClientHello::Ech => (None, Some("ech")),
-                ClientHello::NotTls => (None, Some("not-tls")),
-                ClientHello::Malformed | ClientHello::NeedMore => (None, Some("malformed")),
+                ClientHello::NoSni => (None, Some(DenyReason::NoSni)),
+                ClientHello::Ech => (None, Some(DenyReason::Ech)),
+                ClientHello::NotTls => (None, Some(DenyReason::NotTls)),
+                ClientHello::Malformed | ClientHello::NeedMore => (None, Some(DenyReason::Malformed)),
             },
         };
 
@@ -254,10 +254,10 @@ impl Proxy {
             .grant()
         });
         if grant.is_none() {
-            self.log.record(Drop {
+            self.log.record(Denial {
                 src: peer.ip(),
                 dst,
-                proto: "https",
+                proto: Proto::Https,
                 host,
                 path: None,
                 reason,

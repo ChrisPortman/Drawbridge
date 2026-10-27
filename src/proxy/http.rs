@@ -25,7 +25,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
-use super::droplog::Drop;
+use super::droplog::{Denial, DenyReason};
 use super::{Grant, Proxy, Verdict};
 use crate::firewall::ruleset::Mode;
 use crate::policy::Proto;
@@ -52,7 +52,7 @@ pub(super) async fn serve(
         Ok(Ok(false)) => {
             proxy
                 .log
-                .record(drop_line(peer, dst, None, None, Some("h2c")));
+                .record(drop_line(peer, dst, None, None, Some(DenyReason::H2c)));
             if proxy.mode == Mode::Enforcing {
                 return super::reset(client);
             }
@@ -68,7 +68,7 @@ pub(super) async fn serve(
         Err(_) => {
             proxy
                 .log
-                .record(drop_line(peer, dst, None, None, Some("timeout")));
+                .record(drop_line(peer, dst, None, None, Some(DenyReason::Timeout)));
             return super::reset(client);
         }
     }
@@ -118,11 +118,11 @@ pub(super) async fn serve(
                 }
                 Err(e) => {
                 let reason = if e.is_timeout() {
-                    "timeout"
+                    DenyReason::Timeout
                 } else if e.is_parse_too_large() {
-                    "oversized"
+                    DenyReason::Oversized
                 } else {
-                    "malformed"
+                    DenyReason::Malformed
                 };
                 tracing::debug!("proxy: HTTP from {peer} failed: {e}");
                 if e.is_timeout() || e.is_parse_too_large() {
@@ -194,12 +194,12 @@ fn drop_line(
     dst: SocketAddr,
     host: Option<String>,
     path: Option<String>,
-    reason: Option<&'static str>,
-) -> Drop {
-    Drop {
+    reason: Option<DenyReason>,
+) -> Denial {
+    Denial {
         src: src.ip(),
         dst,
-        proto: "http",
+        proto: Proto::Http,
         host,
         path,
         reason,
@@ -236,7 +236,7 @@ impl Conn {
             .map_or("/", |p| p.as_str())
             .to_owned();
         let verdict = match &host {
-            _ if req.method() == Method::CONNECT => Err("connect"),
+            _ if req.method() == Method::CONNECT => Err(DenyReason::Connect),
             Err(reason) => Err(*reason),
             Ok(host) => {
                 let view = self.proxy.sessions.borrow().clone();
@@ -285,7 +285,7 @@ impl Conn {
         resp
     }
 
-    fn log(&self, host: Option<String>, path: Option<String>, reason: Option<&'static str>) {
+    fn log(&self, host: Option<String>, path: Option<String>, reason: Option<DenyReason>) {
         self.proxy
             .log
             .record(drop_line(self.peer, self.dst, host, path, reason));
@@ -360,11 +360,11 @@ impl Conn {
 /// The host a request is for: its absolute-form authority (without userinfo) or its Host header.
 /// A request that names two hosts (two Host headers, or an authority that disagrees with the
 /// Host header) is `ambiguous-host`: upstreams differ on which one wins.
-fn request_host(req: &Request<Incoming>) -> Result<String, &'static str> {
+fn request_host(req: &Request<Incoming>) -> Result<String, DenyReason> {
     let mut headers = req.headers().get_all(HOST).iter();
     let header = match (headers.next(), headers.next()) {
-        (_, Some(_)) => return Err("ambiguous-host"),
-        (Some(v), None) => Some(v.to_str().map_err(|_| "no-host")?),
+        (_, Some(_)) => return Err(DenyReason::AmbiguousHost),
+        (Some(v), None) => Some(v.to_str().map_err(|_| DenyReason::NoHost)?),
         (None, None) => None,
     };
     let authority = req
@@ -372,9 +372,9 @@ fn request_host(req: &Request<Incoming>) -> Result<String, &'static str> {
         .authority()
         .map(|a| a.as_str().rsplit('@').next().unwrap_or_default());
     match (authority, header) {
-        (Some(a), Some(h)) if !a.eq_ignore_ascii_case(h) => Err("ambiguous-host"),
+        (Some(a), Some(h)) if !a.eq_ignore_ascii_case(h) => Err(DenyReason::AmbiguousHost),
         (Some(host), _) | (None, Some(host)) => Ok(host.to_owned()),
-        (None, None) => Err("no-host"),
+        (None, None) => Err(DenyReason::NoHost),
     }
 }
 
@@ -407,7 +407,7 @@ struct Io {
     upgraded: bool,
 }
 
-impl std::ops::Drop for Io {
+impl Drop for Io {
     fn drop(&mut self) {
         if self.reset.load(Ordering::SeqCst)
             && let Err(e) = self.stream.set_zero_linger()
