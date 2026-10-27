@@ -4,9 +4,6 @@
 //! Each document is one `nft -j -f` transaction. A kernel loaded from [`apply`] lists the same
 //! ruleset as `tests/data/example.kernel.nft`.
 
-// The nft runner that sends these documents lands separately (issue #21).
-#![allow(dead_code)]
-
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};

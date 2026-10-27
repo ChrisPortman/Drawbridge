@@ -19,8 +19,8 @@ async fn main() -> ExitCode {
     let result = match &cli.command {
         Command::Server { command } => match command {
             ServerCommand::Run(args) => cli::run(args).await,
-            ServerCommand::Check(args) => cli::check(args),
-            ServerCommand::Teardown(args) => cli::teardown(args),
+            ServerCommand::Check(args) => cli::check(args).await,
+            ServerCommand::Teardown(args) => cli::teardown(args).await,
         },
         Command::Client { command } => match command {
             ClientCommand::Init(args) => cli::init(args),

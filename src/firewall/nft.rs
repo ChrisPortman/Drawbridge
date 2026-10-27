@@ -56,7 +56,7 @@ pub(crate) fn parse_version(output: &str) -> Option<NftVersion> {
 
 /// Why running `nft` failed. `stderr` is nft's own output, trimmed but otherwise verbatim.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum NftError {
+pub enum NftError {
     #[error(
         "nft not found at {}: install nftables (>= {MIN_VERSION}) or point --nft-path at it",
         path.display()
@@ -206,7 +206,7 @@ impl Nft {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -291,7 +291,7 @@ mod tests {
     }
 
     /// A fake `nft` in a fresh temp directory.
-    fn fake_nft(name: &str, script: &str) -> PathBuf {
+    pub(crate) fn fake_nft(name: &str, script: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("drawbridge-nft-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

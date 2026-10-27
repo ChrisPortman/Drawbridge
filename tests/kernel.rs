@@ -9,11 +9,12 @@
 //!     docker run --rm --cap-add NET_ADMIN -v "$PWD/target/debug/deps/kernel-<hash>:/t:ro" \
 //!         --entrypoint /t drawbridge-e2e --ignored
 
-use std::process::Command;
-use std::sync::Mutex;
+use std::io::Write;
+use std::process::{Command, Stdio};
+use tokio::sync::Mutex;
 
 use drawbridge::firewall::{
-    self,
+    Firewall,
     ruleset::{
         FILTER_CHAIN, LOG_SETS, Mode, Ruleset, SESSION_FLOWS_CHAIN, SESSIONS_CHAIN, SessionRules,
         TABLE,
@@ -29,8 +30,13 @@ const CHAINS: usize = 7;
 /// the log chains 2 gotos and a log and a miss rule per set.
 const FIXED_RULES: usize = 2 * 3 + 2 + 2 * LOG_SETS.len();
 
+/// The `nft` the tests drive, as the gateway would.
+fn firewall() -> Firewall {
+    Firewall::new("/usr/sbin/nft")
+}
+
 /// The tests share one kernel table, so they must not run concurrently.
-static KERNEL: Mutex<()> = Mutex::new(());
+static KERNEL: Mutex<()> = Mutex::const_new(());
 
 fn nft_json(args: &[&str]) -> Option<serde_json::Value> {
     let out = Command::new("nft")
@@ -78,16 +84,17 @@ fn nft_list_normalized() -> String {
     lines.join("\n") + "\n"
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs CAP_NET_ADMIN; run inside `sudo unshare -n`"]
-fn apply_and_teardown() {
-    let _guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+async fn apply_and_teardown() {
+    let _guard = KERNEL.lock().await;
+    let fw = firewall();
     let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
     let ruleset = Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()]).unwrap();
 
     // Applying twice must replace, not duplicate, the table.
-    firewall::apply(&ruleset).unwrap();
-    firewall::apply(&ruleset).unwrap();
+    fw.apply(&ruleset).await.unwrap();
+    fw.apply(&ruleset).await.unwrap();
 
     let listing = nft_json(&["list", "table", "inet", TABLE]).expect("table exists");
     assert_eq!(count(&listing, "chain"), CHAINS);
@@ -98,23 +105,21 @@ fn apply_and_teardown() {
         FIXED_RULES + 3 + ruleset.rules.len() + 1
     );
     assert!(nft_json(&["list", "chain", "inet", TABLE, FILTER_CHAIN]).is_some());
-    // What the kernel holds must match the reviewed golden listing, so the netlink encoding
+    // What the kernel holds must match the reviewed golden listing, so the JSON encoding
     // can't drift from what `check` renders.
     assert_eq!(
         nft_list_normalized(),
         include_str!("data/example.kernel.nft")
     );
 
-    assert!(firewall::teardown().unwrap());
+    fw.teardown().await.unwrap();
     assert!(nft_json(&["list", "table", "inet", TABLE]).is_none());
-    assert!(
-        !firewall::teardown().unwrap(),
-        "second teardown sees no table"
-    );
+    // Teardown is idempotent: a missing table is success.
+    fw.teardown().await.unwrap();
 }
 
 /// 50 clients x 10 dests x 10 ports = 5000 rules: enough acks to overflow a default-sized
-/// netlink receive buffer if the batch send doesn't account for them.
+/// netlink receive buffer; nft must cope with a batch this size.
 fn large_policy() -> Policy {
     let clients = (0..50u8)
         .map(|c| Client {
@@ -139,54 +144,60 @@ fn large_policy() -> Policy {
     }
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs CAP_NET_ADMIN; run inside `sudo unshare -n`"]
-fn apply_large_policy() {
-    let _guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+async fn apply_large_policy() {
+    let _guard = KERNEL.lock().await;
+    let fw = firewall();
     let ruleset = Ruleset::from_policy(&large_policy(), "wg0", &[]).unwrap();
     assert_eq!(ruleset.rules.len(), 5000);
 
-    firewall::apply(&ruleset).unwrap();
+    fw.apply(&ruleset).await.unwrap();
     let listing = nft_json(&["list", "table", "inet", TABLE]).expect("table exists");
     assert_eq!(
         count(&listing, "rule"),
         FIXED_RULES + 2 + ruleset.rules.len() + 1
     );
 
-    assert!(firewall::teardown().unwrap());
+    fw.teardown().await.unwrap();
 }
 
 fn session(policy: &Policy, id: u32, ip: &str) -> SessionRules {
     SessionRules::for_user(policy, id, "alice", ip.parse().unwrap()).unwrap()
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs CAP_NET_ADMIN; run inside `sudo unshare -n`"]
-fn add_and_remove_sessions() {
-    let _guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+async fn add_and_remove_sessions() {
+    let _guard = KERNEL.lock().await;
+    let fw = firewall();
     let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
     let mut ruleset = Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()]).unwrap();
-    firewall::apply(&ruleset).unwrap();
+    fw.apply(&ruleset).await.unwrap();
 
     let s1 = session(&policy, 1, "192.168.60.7");
     let s2 = session(&policy, 2, "fd00:60::7");
     let s3 = session(&policy, 3, "192.168.60.8");
-    firewall::update_sessions(&[s1.clone(), s2.clone()], &[], &[s1.clone(), s2.clone()]).unwrap();
+    fw.update_sessions(&[s1.clone(), s2.clone()], &[], &[s1.clone(), s2.clone()])
+        .await
+        .unwrap();
     // Replacing a session (2 -> 3) and keeping another happens in one batch.
     let live = [s1.clone(), s3.clone()];
-    firewall::update_sessions(std::slice::from_ref(&s3), &[2], &live).unwrap();
+    fw.update_sessions(std::slice::from_ref(&s3), &[2], &live)
+        .await
+        .unwrap();
     let incremental = nft_list_normalized();
     assert_eq!(incremental, include_str!("data/sessions.kernel.nft"));
 
     // A full rebuild with the same sessions holds the same rules.
     ruleset.sessions = live.to_vec();
-    firewall::apply(&ruleset).unwrap();
+    fw.apply(&ruleset).await.unwrap();
     let rebuilt = nft_json(&["list", "table", "inet", TABLE]).unwrap();
     assert_eq!(count(&rebuilt, "chain"), CHAINS + 2);
 
     // Removing every session leaves empty dispatch and session_flows chains, so every marked
     // connection falls through to the default action, and no session chains.
-    firewall::update_sessions(&[], &[1, 3], &[]).unwrap();
+    fw.update_sessions(&[], &[1, 3], &[]).await.unwrap();
     let listing = nft_json(&["list", "chain", "inet", TABLE, SESSIONS_CHAIN]).unwrap();
     assert_eq!(count(&listing, "rule"), 0);
     let listing = nft_json(&["list", "chain", "inet", TABLE, SESSION_FLOWS_CHAIN]).unwrap();
@@ -199,15 +210,18 @@ fn add_and_remove_sessions() {
         CHAINS
     );
 
-    assert!(firewall::teardown().unwrap());
+    fw.teardown().await.unwrap();
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs CAP_NET_ADMIN; run inside `sudo unshare -n`"]
-fn session_churn() {
-    let _guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+async fn session_churn() {
+    let _guard = KERNEL.lock().await;
+    let fw = firewall();
     let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
-    firewall::apply(&Ruleset::from_policy(&policy, "wg0", &[]).unwrap()).unwrap();
+    fw.apply(&Ruleset::from_policy(&policy, "wg0", &[]).unwrap())
+        .await
+        .unwrap();
 
     let mut live = Vec::new();
     for id in 1..=200u32 {
@@ -217,7 +231,7 @@ fn session_churn() {
             &format!("192.168.{}.{}", 60 + id / 250, id % 250 + 1),
         );
         live.push(s.clone());
-        firewall::update_sessions(&[s], &[], &live).unwrap();
+        fw.update_sessions(&[s], &[], &live).await.unwrap();
     }
     let listing = nft_json(&["list", "chain", "inet", TABLE, SESSIONS_CHAIN]).unwrap();
     assert_eq!(count(&listing, "rule"), 200);
@@ -226,35 +240,69 @@ fn session_churn() {
 
     while let Some(s) = live.pop() {
         if live.len() % 2 == 0 {
-            firewall::update_sessions(&[], &[s.id], &live).unwrap();
+            fw.update_sessions(&[], &[s.id], &live).await.unwrap();
         } else {
             // Removing via a replacement exercises add and delete together.
             let replacement = session(&policy, s.id + 1000, "192.168.99.1");
             let mut next = live.clone();
             next.push(replacement.clone());
-            firewall::update_sessions(std::slice::from_ref(&replacement), &[s.id], &next).unwrap();
-            firewall::update_sessions(&[], &[replacement.id], &live).unwrap();
+            fw.update_sessions(std::slice::from_ref(&replacement), &[s.id], &next)
+                .await
+                .unwrap();
+            fw.update_sessions(&[], &[replacement.id], &live)
+                .await
+                .unwrap();
         }
     }
     let listing = nft_json(&["list", "table", "inet", TABLE]).unwrap();
     assert_eq!(count(&listing, "chain"), CHAINS);
 
-    assert!(firewall::teardown().unwrap());
+    fw.teardown().await.unwrap();
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs CAP_NET_ADMIN; run inside `sudo unshare -n`"]
-fn permissive_accepts_and_logs_would_drop() {
-    let _guard = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+async fn permissive_accepts_and_logs_would_drop() {
+    let _guard = KERNEL.lock().await;
+    let fw = firewall();
     let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
     let mut ruleset = Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()]).unwrap();
     ruleset.mode = Mode::Permissive;
-    firewall::apply(&ruleset).unwrap();
+    fw.apply(&ruleset).await.unwrap();
 
     // Exactly the enforcing listing, but for the default action and the log prefix.
     let expected = include_str!("data/example.kernel.nft")
         .replace("\"wg0\" counter drop", "\"wg0\" counter accept")
         .replace("\"drawbridge drop: \"", "\"drawbridge would-drop: \"");
     assert_eq!(nft_list_normalized(), expected);
-    assert!(firewall::teardown().unwrap());
+    fw.teardown().await.unwrap();
+}
+
+/// The reviewed JSON golden loads into the kernel as the reviewed listing, so the two goldens
+/// can't drift apart.
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN; run inside `sudo unshare -n`"]
+async fn example_json_loads_as_kernel_golden() {
+    let _guard = KERNEL.lock().await;
+    // Through stdin, so the test binary runs without the source tree (e.g. in the e2e image).
+    let mut child = Command::new("nft")
+        .args(["-j", "-f", "-"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("nft binary");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(include_bytes!("data/example.json"))
+        .unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "nft -j -f example.json failed"
+    );
+    assert_eq!(
+        nft_list_normalized(),
+        include_str!("data/example.kernel.nft")
+    );
+    firewall().teardown().await.unwrap();
 }

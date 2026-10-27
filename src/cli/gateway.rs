@@ -10,8 +10,8 @@ use anyhow::{Context, bail};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
 
-use super::{LockArgs, PolicyArgs, PortalArgs, RunArgs};
-use crate::firewall;
+use super::{CheckArgs, LockArgs, NftArgs, PolicyArgs, PortalArgs, RunArgs, TeardownArgs};
+use crate::firewall::Firewall;
 use crate::firewall::ruleset::{Mode, Ruleset, TABLE};
 use crate::policy::Policy;
 use crate::portal::{OidcConfig, PortalConfig, Prepared, Servers};
@@ -81,8 +81,28 @@ fn lock(args: &LockArgs) -> anyhow::Result<File> {
     }
 }
 
-pub fn check(args: &PolicyArgs) -> anyhow::Result<()> {
-    print!("{}", load(args)?.1);
+/// Checks `nft --version`, or with `--nft-skip-version-check` only logs it.
+async fn firewall(args: &NftArgs) -> anyhow::Result<Firewall> {
+    let firewall = Firewall::new(&args.nft_path);
+    if args.nft_skip_version_check {
+        match firewall.version_output().await {
+            Ok(raw) => {
+                warn!(nft = %args.nft_path.display(), version = raw, "nft version check skipped")
+            }
+            Err(e) => {
+                warn!(nft = %args.nft_path.display(), error = %e, "nft version check skipped")
+            }
+        }
+    } else {
+        firewall.check_version().await.context("checking nft")?;
+    }
+    Ok(firewall)
+}
+
+pub async fn check(args: &CheckArgs) -> anyhow::Result<()> {
+    let (_, ruleset) = load(&args.policy)?;
+    firewall(&args.nft).await?;
+    print!("{ruleset}");
     Ok(())
 }
 
@@ -99,6 +119,13 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
     let iface_index = nix::net::if_::if_nametoindex(iface.as_str())
         .with_context(|| format!("external interface {iface:?} not found"))?;
 
+    // Fail on a missing nft or capability before any network side effects.
+    let firewall = firewall(&args.nft).await?;
+    firewall
+        .probe()
+        .await
+        .context("checking that nft can change the ruleset")?;
+
     // Set up before touching nftables, so a misconfiguration can't leave the table provisioned.
     let prepared = if listen.is_empty() {
         None
@@ -113,7 +140,10 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
     // The apply batch is atomic: if it fails, the previous state (including any table left by an
     // earlier run) is still in place, so tearing down here could only remove enforcement.
     // Nothing after it may return early: every exit must go through the teardown below.
-    firewall::apply(&ruleset).context("provisioning access")?;
+    firewall
+        .apply(&ruleset)
+        .await
+        .context("provisioning access")?;
     info!(
         table = TABLE,
         iface = %iface,
@@ -132,6 +162,7 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
         let (sessions, task) = session::spawn(SessionTable::new(
             Arc::new(policy),
             Kernel {
+                firewall: firewall.clone(),
                 base: ruleset.clone(),
             },
             args.portal.session_max_ttl,
@@ -171,17 +202,16 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
         let _ = task.await;
     }
 
-    firewall::teardown().context("deprovisioning access")?;
+    firewall.teardown().await.context("deprovisioning access")?;
     info!(table = TABLE, "access deprovisioned");
     failure.map_or(Ok(()), Err)
 }
 
-pub fn teardown(args: &LockArgs) -> anyhow::Result<()> {
-    let _lock = lock(args)?;
-    if firewall::teardown().context("removing table")? {
-        info!(table = TABLE, "table removed");
-    } else {
-        info!(table = TABLE, "table not present");
-    }
+pub async fn teardown(args: &TeardownArgs) -> anyhow::Result<()> {
+    let _lock = lock(&args.lock)?;
+    let firewall = firewall(&args.nft).await?;
+    // The batch is idempotent: it succeeds whether or not the table exists.
+    firewall.teardown().await.context("removing table")?;
+    info!(table = TABLE, "table removed");
     Ok(())
 }
