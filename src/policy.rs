@@ -140,16 +140,27 @@ impl HostPattern {
 
     /// Whether a request target `path` is allowed: the query is dropped, then the pattern's path
     /// must be a whole-segment prefix (`/a/b` matches `/a/b/c`, not `/a/bc`). No path allows all.
-    pub fn matches_path(&self, path: &str) -> bool {
+    ///
+    /// Anything an upstream might normalise differently from this byte-wise prefix match never
+    /// matches: dot segments (plain, percent-encoded or hidden behind `;` parameters), a
+    /// backslash, a fragment, and an encoded `/`, `\`, `%`, `?` or `#`.
+    pub(crate) fn matches_path(&self, path: &str) -> bool {
+        const AMBIGUOUS: [&str; 6] = ["\\", "%2f", "%5c", "%25", "%3f", "%23"];
         let Some(prefix) = &self.path else {
             return true;
         };
+        if path.contains('#') {
+            return false;
+        }
         let path = path.split_once('?').map_or(path, |(p, _)| p);
-        // The upstream may resolve dot segments (even percent-encoded) or treat a backslash as a
-        // separator, climbing out of the prefix after it matched here.
-        let climbs = path.split('/').any(|segment| {
-            let segment = segment.to_ascii_lowercase().replace("%2e", ".");
-            segment == "." || segment == ".." || segment.contains('\\')
+        let lower = path.to_ascii_lowercase();
+        if AMBIGUOUS.iter().any(|a| lower.contains(a)) {
+            return false;
+        }
+        let climbs = lower.split('/').any(|segment| {
+            let name = segment.split(';').next().unwrap_or_default();
+            let name = name.replace("%2e", ".");
+            name == "." || name == ".."
         });
         if climbs {
             return false;
@@ -157,6 +168,30 @@ impl HostPattern {
         let prefix = format!("{}/", prefix.trim_end_matches('/'));
         format!("{path}/").starts_with(&prefix)
     }
+}
+
+/// Checks a pattern's path: `/`-separated segments of unreserved and sub-delimiter characters
+/// (no `;`, `%`, `?`, `#` or `\`), none empty (no `//`), `.` or `..`. A trailing `/` is allowed.
+fn validate_pattern_path(s: &str, path: &str) -> Result<(), String> {
+    let body = path.strip_prefix('/').unwrap_or(path);
+    let body = body.strip_suffix('/').unwrap_or(body);
+    if body.is_empty() {
+        return Ok(());
+    }
+    for segment in body.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(format!(
+                "host {s:?} has an empty, \".\" or \"..\" path segment"
+            ));
+        }
+        if let Some(c) = segment
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || "-._~!$&'()*+,=:@".contains(*c)))
+        {
+            return Err(format!("host {s:?} has an invalid path character {c:?}"));
+        }
+    }
+    Ok(())
 }
 
 impl TryFrom<String> for HostPattern {
@@ -177,6 +212,9 @@ impl std::str::FromStr for HostPattern {
         };
         if host.is_empty() {
             return Err(format!("host {s:?} is empty"));
+        }
+        if let Some(path) = &path {
+            validate_pattern_path(s, path)?;
         }
         if host.contains(':') {
             return Err(format!("host {s:?} may not have a port"));
@@ -708,6 +746,14 @@ mod tests {
             ("\"*a.com\"", "wildcard"),
             ("\"*.*.com\"", "wildcard"),
             ("\"a.com?x\"", "invalid character"),
+            ("\"a.com/a/../b\"", "path"),
+            ("\"a.com/a/./b\"", "path"),
+            ("\"a.com/a//b\"", "path"),
+            ("\"a.com/a?x\"", "path"),
+            ("\"a.com/a#x\"", "path"),
+            ("\"a.com/a%2fb\"", "path"),
+            ("\"a.com/a\\\\b\"", "path"),
+            ("\"a.com/a;x\"", "path"),
         ] {
             let e = err(&host_rule("http", &format!("\n        hosts: [{host}]")));
             assert!(e.contains(expected), "{host}: {e}");
@@ -778,6 +824,26 @@ mod tests {
             assert!(!p.matches_path(path), "{path}");
         }
         assert!(p.matches_path("/a/b/..x/c"));
+        assert!(p.matches_path("/a/b/c;v=1"));
+        // Path parameters are not stripped before the prefix match, so this one is conservative.
+        assert!(!p.matches_path("/a/b;v=1/c"));
+        assert!(p.matches_path("/a/b/c%20d"));
+        // Encodings an upstream may decode into a separator, a dot segment or a query/fragment
+        // delimiter, and `;` path parameters hiding a dot segment, never match.
+        for path in [
+            "/a/b/..;/c",
+            "/a/b/.;x/c",
+            "/a/b/%2e%2e%2fc",
+            "/a/b/%2E%2E%2Fc",
+            "/a/b/..%5cc",
+            "/a/b/%252e%252e/c",
+            "/a/b%3f/x",
+            "/a/b%23x",
+            "/a/b#x",
+            "/a/b/c#/../d",
+        ] {
+            assert!(!p.matches_path(path), "{path}");
+        }
         let any = pattern("a.com");
         for path in ["/", "/anything", "/x?y"] {
             assert!(any.matches_path(path), "{path}");
