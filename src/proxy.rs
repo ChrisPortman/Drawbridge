@@ -138,7 +138,7 @@ impl Verdict {
     fn grant(self) -> Option<Grant> {
         match self {
             Verdict::Allow(grant) => Some(grant),
-            _ => None,
+            Verdict::PathDenied | Verdict::Deny => None,
         }
     }
 }
@@ -267,10 +267,13 @@ impl Proxy {
                 return Verdict::Allow(Grant::Client);
             }
         }
-        if let Some((id, rules)) = view.get(&src)
-            && allows(rules)
+        if let Some(session) = view.get(&src)
+            && allows(&session.host_rules)
         {
-            return Verdict::Allow(Grant::Session { ip: src, id: *id });
+            return Verdict::Allow(Grant::Session {
+                ip: src,
+                id: session.id,
+            });
         }
         if path_denied {
             Verdict::PathDenied
@@ -484,7 +487,7 @@ async fn session_gone(
 ) {
     while sessions.changed().await.is_ok() {
         if let Some((ip, id)) = granted()
-            && sessions.borrow_and_update().get(&ip).map(|(i, _)| *i) != Some(id)
+            && sessions.borrow_and_update().get(&ip).map(|s| s.id) != Some(id)
         {
             return;
         }
@@ -502,7 +505,7 @@ fn reset(stream: TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::idle_view;
+    use crate::session::{SessionGrant, idle_view};
 
     const SRC: &str = "10.0.0.5";
 
@@ -594,7 +597,13 @@ clients:
         let ip: IpAddr = SRC.parse().unwrap();
         let mut view = SessionView::new();
         assert_eq!(auth(&proxy, &view, "198.51.100.1:443", "c.test"), None);
-        view.insert(ip, (7, rules.clone()));
+        view.insert(
+            ip,
+            SessionGrant {
+                id: 7,
+                host_rules: rules.clone(),
+            },
+        );
         assert_eq!(
             auth(&proxy, &view, "198.51.100.1:443", "c.test"),
             Some(Grant::Session { ip, id: 7 })
@@ -603,7 +612,13 @@ clients:
             auth(&proxy, &view, "192.0.2.1:443", "a.test"),
             Some(Grant::Client)
         );
-        view.insert(ip, (8, rules));
+        view.insert(
+            ip,
+            SessionGrant {
+                id: 8,
+                host_rules: rules,
+            },
+        );
         assert_eq!(
             auth(&proxy, &view, "198.51.100.1:443", "c.test"),
             Some(Grant::Session { ip, id: 8 })
@@ -685,7 +700,11 @@ clients:
         let (tx, rx) = watch::channel(Arc::new(SessionView::new()));
         let yaml = if session {
             let mut view = SessionView::new();
-            view.insert("127.0.0.1".parse().unwrap(), (5, allow(&rule)));
+            let grant = SessionGrant {
+                id: 5,
+                host_rules: allow(&rule),
+            };
+            view.insert("127.0.0.1".parse().unwrap(), grant);
             tx.send_replace(Arc::new(view));
             String::from("clients: []\n")
         } else {
@@ -851,7 +870,7 @@ clients:
             let mut view = (**v).clone();
             view.get_mut(&"127.0.0.1".parse::<IpAddr>().unwrap())
                 .unwrap()
-                .0 = 6;
+                .id = 6;
             *v = Arc::new(view);
         });
         assert_reset(&mut client).await;

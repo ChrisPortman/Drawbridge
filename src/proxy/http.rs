@@ -120,18 +120,18 @@ pub(super) async fn serve(
                     tracing::debug!("proxy: closing idle HTTP connection from {peer}");
                 }
                 Err(e) => {
-                let reason = if e.is_timeout() {
-                    DenyReason::Timeout
-                } else if e.is_parse_too_large() {
-                    DenyReason::Oversized
-                } else {
-                    DenyReason::Malformed
-                };
-                tracing::debug!("proxy: HTTP from {peer} failed: {e}");
-                if e.is_timeout() || e.is_parse_too_large() {
-                    proxy.log.record(drop_line(peer, dst, None, None, Some(reason)));
-                }
-                conn.reset.store(true, Ordering::SeqCst);
+                    tracing::debug!("proxy: HTTP from {peer} failed: {e}");
+                    let reason = if e.is_timeout() {
+                        Some(DenyReason::Timeout)
+                    } else if e.is_parse_too_large() {
+                        Some(DenyReason::Oversized)
+                    } else {
+                        None
+                    };
+                    if reason.is_some() {
+                        proxy.log.record(drop_line(peer, dst, None, None, reason));
+                    }
+                    conn.reset.store(true, Ordering::SeqCst);
                 }
                 Ok(()) => {}
             }
