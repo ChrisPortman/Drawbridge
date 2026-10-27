@@ -23,10 +23,10 @@ use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
 use super::ruleset::{
     BASE_CHAIN_PRIORITY, BASE_CHAINS, DROP_LOG_CHAIN, DROP_LOG_PORTS_CHAIN, FILTER_CHAIN, Family,
     KeyField, LOG_BURST, LOG_RATE, LOG_SET_SIZE, LOG_SETS, LOG_WINDOW, LogSet, Mode, NAT_CHAIN,
-    PORT_PROTOS, PROXY_REDIRECT_CHAIN, RedirectSpec, RuleSpec, Ruleset, SESSION_FLOWS_CHAIN,
-    SESSIONS_CHAIN, SessionRules, TABLE, session_chain,
+    PORT_PROTOS, PROXY_REDIRECT_CHAIN, RedirectSpec, RuleProto, RuleSpec, Ruleset,
+    SESSION_FLOWS_CHAIN, SESSIONS_CHAIN, SessionRules, TABLE, session_chain,
 };
-use crate::policy::{PortSpec, Proto};
+use crate::policy::PortSpec;
 
 /// The `dstnat` priority of the nat chain, as a number: nft 0.9.3's JSON takes no names.
 const NAT_CHAIN_PRIORITY: i32 = -100;
@@ -426,24 +426,23 @@ fn allow_rule(spec: &RuleSpec) -> Vec<Statement<'static>> {
         match_eq(addr_field(spec.src.ip(), "daddr"), network(spec.dst)),
     ];
     match (spec.proto, spec.ports) {
-        (Proto::Tcp | Proto::Udp, Some(p)) => {
+        (RuleProto::Tcp | RuleProto::Udp, Some(p)) => {
             rule.push(match_eq(
                 payload(&spec.proto.to_string(), "dport"),
                 ports(p),
             ));
         }
-        (Proto::Icmp, _) if !spec.src.is_ipv4() => {
+        (RuleProto::Icmp, _) if !spec.src.is_ipv4() => {
             rule.push(match_eq(
                 meta(MetaKey::L4proto),
                 Expression::Number(IPPROTO_ICMPV6),
             ));
         }
-        (Proto::Tcp | Proto::Udp | Proto::Icmp, _) => {
+        (RuleProto::Tcp | RuleProto::Udp | RuleProto::Icmp, _) => {
             let proto = Expression::Number(l4proto(spec.proto));
             rule.push(match_eq(meta(MetaKey::L4proto), proto));
         }
-        (Proto::Any, _) => {}
-        (Proto::Http | Proto::Https, _) => unreachable!("host rules are not expanded"),
+        (RuleProto::Any, _) => {}
     }
     if let Some(mark) = spec.mark {
         rule.push(set_mark(mark));
@@ -476,13 +475,12 @@ fn ports(p: PortSpec) -> Expression<'static> {
 }
 
 /// The IPv4 protocol number of `proto` (IPv6 ICMP rules use [`IPPROTO_ICMPV6`]).
-fn l4proto(proto: Proto) -> u32 {
+fn l4proto(proto: RuleProto) -> u32 {
     match proto {
-        Proto::Tcp => IPPROTO_TCP,
-        Proto::Udp => IPPROTO_UDP,
-        Proto::Icmp => IPPROTO_ICMP,
-        Proto::Any => unreachable!("`any` matches every protocol"),
-        Proto::Http | Proto::Https => unreachable!("host rules are not expanded"),
+        RuleProto::Tcp => IPPROTO_TCP,
+        RuleProto::Udp => IPPROTO_UDP,
+        RuleProto::Icmp => IPPROTO_ICMP,
+        RuleProto::Any => unreachable!("`any` matches every protocol"),
     }
 }
 

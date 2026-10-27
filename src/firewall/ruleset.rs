@@ -40,7 +40,7 @@ pub(crate) const DROP_LOG_CHAIN: &str = "drop_log";
 /// Regular chain logging TCP and UDP, reached by `goto` from [`DROP_LOG_CHAIN`].
 pub(crate) const DROP_LOG_PORTS_CHAIN: &str = "drop_log_ports";
 /// The protocols [`DROP_LOG_CHAIN`] sends to [`DROP_LOG_PORTS_CHAIN`].
-pub(crate) const PORT_PROTOS: [Proto; 2] = [Proto::Tcp, Proto::Udp];
+pub(crate) const PORT_PROTOS: [RuleProto; 2] = [RuleProto::Tcp, RuleProto::Udp];
 /// How long a logged key stays in its set, suppressing further log lines for it.
 pub(crate) const LOG_WINDOW: Duration = Duration::from_secs(10);
 /// Most keys each log set holds. Once full, new keys go unlogged (but still reach the default
@@ -316,12 +316,48 @@ impl SessionRules {
     }
 }
 
+/// The protocols an accept rule matches: a policy [`Proto`] other than the host rules' `http`
+/// and `https`, which become redirects to the proxy instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleProto {
+    Tcp,
+    Udp,
+    Icmp,
+    Any,
+}
+
+impl TryFrom<Proto> for RuleProto {
+    /// The host-rule protocol, which has no accept rule.
+    type Error = Proto;
+
+    fn try_from(proto: Proto) -> Result<Self, Proto> {
+        match proto {
+            Proto::Tcp => Ok(RuleProto::Tcp),
+            Proto::Udp => Ok(RuleProto::Udp),
+            Proto::Icmp => Ok(RuleProto::Icmp),
+            Proto::Any => Ok(RuleProto::Any),
+            Proto::Http | Proto::Https => Err(proto),
+        }
+    }
+}
+
+impl fmt::Display for RuleProto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            RuleProto::Tcp => "tcp",
+            RuleProto::Udp => "udp",
+            RuleProto::Icmp => "icmp",
+            RuleProto::Any => "any",
+        })
+    }
+}
+
 /// One accept rule: traffic from `src` to `dst` matching `proto` and optional destination ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuleSpec {
     pub src: IpNetwork,
     pub dst: IpNetwork,
-    pub proto: Proto,
+    pub proto: RuleProto,
     pub ports: Option<PortSpec>,
     /// `ct mark` to tag accepted connections with (session rules only).
     pub mark: Option<u32>,
@@ -331,7 +367,7 @@ impl RuleSpec {
     /// What the rule lets through, for people rather than nft: `10.0.1.0/24 tcp/443`.
     pub(crate) fn describe(&self) -> String {
         match (self.proto, self.ports) {
-            (Proto::Any, _) => format!("{} any", self.dst),
+            (RuleProto::Any, _) => format!("{} any", self.dst),
             (proto, Some(ports)) => format!("{} {proto}/{ports}", self.dst),
             (proto, None) => format!("{} {proto}", self.dst),
         }
@@ -406,7 +442,7 @@ fn expand(
     allow: &Allow,
     dests: impl Iterator<Item = IpNetwork>,
 ) {
-    if allow.is_host_rule() {
+    let Ok(proto) = RuleProto::try_from(allow.proto) else {
         let ports = allow.effective_ports();
         for dest in dests {
             let dst = normalize(dest);
@@ -418,12 +454,12 @@ fn expand(
             }));
         }
         return;
-    }
+    };
     for dest in dests {
         let base = RuleSpec {
             src,
             dst: normalize(dest),
-            proto: allow.proto,
+            proto,
             ports: None,
             mark: None,
         };
@@ -460,12 +496,13 @@ impl fmt::Display for RuleSpec {
         let family = family(self.src.ip());
         write!(f, "{family} saddr {} {family} daddr {}", self.src, self.dst)?;
         match (self.proto, self.ports) {
-            (Proto::Tcp | Proto::Udp, Some(ports)) => write!(f, " {} dport {ports}", self.proto)?,
-            (Proto::Tcp | Proto::Udp, None) => write!(f, " meta l4proto {}", self.proto)?,
-            (Proto::Icmp, _) if self.src.is_ipv4() => write!(f, " meta l4proto icmp")?,
-            (Proto::Icmp, _) => write!(f, " meta l4proto ipv6-icmp")?,
-            (Proto::Any, _) => {}
-            (Proto::Http | Proto::Https, _) => unreachable!("host rules are not expanded"),
+            (RuleProto::Tcp | RuleProto::Udp, Some(ports)) => {
+                write!(f, " {} dport {ports}", self.proto)?;
+            }
+            (RuleProto::Tcp | RuleProto::Udp, None) => write!(f, " meta l4proto {}", self.proto)?,
+            (RuleProto::Icmp, _) if self.src.is_ipv4() => write!(f, " meta l4proto icmp")?,
+            (RuleProto::Icmp, _) => write!(f, " meta l4proto ipv6-icmp")?,
+            (RuleProto::Any, _) => {}
         }
         if let Some(mark) = self.mark {
             write!(f, " ct mark set {mark:#010x}")?;
@@ -755,18 +792,21 @@ mod tests {
         };
         let https = Some(PortSpec { lo: 443, hi: 443 });
         let range = Some(PortSpec { lo: 8000, hi: 8080 });
-        assert_eq!(rule(Proto::Tcp, https).describe(), "10.0.1.0/24 tcp/443");
         assert_eq!(
-            rule(Proto::Udp, range).describe(),
+            rule(RuleProto::Tcp, https).describe(),
+            "10.0.1.0/24 tcp/443"
+        );
+        assert_eq!(
+            rule(RuleProto::Udp, range).describe(),
             "10.0.1.0/24 udp/8000-8080"
         );
-        assert_eq!(rule(Proto::Udp, None).describe(), "10.0.1.0/24 udp");
-        assert_eq!(rule(Proto::Icmp, None).describe(), "10.0.1.0/24 icmp");
-        assert_eq!(rule(Proto::Any, None).describe(), "10.0.1.0/24 any");
+        assert_eq!(rule(RuleProto::Udp, None).describe(), "10.0.1.0/24 udp");
+        assert_eq!(rule(RuleProto::Icmp, None).describe(), "10.0.1.0/24 icmp");
+        assert_eq!(rule(RuleProto::Any, None).describe(), "10.0.1.0/24 any");
         let v6 = RuleSpec {
             src: "fd00:60::7/128".parse().unwrap(),
             dst: "fd00:10::/64".parse().unwrap(),
-            ..rule(Proto::Tcp, https)
+            ..rule(RuleProto::Tcp, https)
         };
         assert_eq!(v6.describe(), "fd00:10::/64 tcp/443");
     }
