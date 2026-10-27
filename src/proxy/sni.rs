@@ -8,7 +8,7 @@
 /// The most input the parser looks at. A ClientHello not complete within it is malformed.
 pub(crate) const MAX_INPUT: usize = 16 * 1024;
 
-const CONTENT_HANDSHAKE: u8 = 0x16;
+pub(super) const CONTENT_HANDSHAKE: u8 = 0x16;
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
 const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_ENCRYPTED_CLIENT_HELLO: u16 = 0xfe0d;
