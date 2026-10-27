@@ -346,13 +346,17 @@ impl Ruleset {
     }
 }
 
-/// Appends one rule per dest × port spec of `allow`, from `src`.
+/// Appends one rule per dest × port spec of `allow`, from `src`. Host rules (`http`, `https`)
+/// generate nothing yet, so they allow nothing.
 fn expand(
     rules: &mut Vec<RuleSpec>,
     src: IpNetwork,
     allow: &Allow,
     dests: impl Iterator<Item = IpNetwork>,
 ) {
+    if matches!(allow.proto, Proto::Http | Proto::Https) {
+        return;
+    }
     for dest in dests {
         let base = RuleSpec {
             src,
@@ -399,6 +403,7 @@ impl fmt::Display for RuleSpec {
             (Proto::Icmp, _) if self.src.is_ipv4() => write!(f, " meta l4proto icmp")?,
             (Proto::Icmp, _) => write!(f, " meta l4proto ipv6-icmp")?,
             (Proto::Any, _) => {}
+            (Proto::Http | Proto::Https, _) => unreachable!("host rules are not expanded"),
         }
         if let Some(mark) = self.mark {
             write!(f, " ct mark set {mark:#010x}")?;
@@ -604,6 +609,7 @@ mod tests {
                     dest: vec![],
                     proto: Proto::Tcp,
                     ports: vec![],
+                    hosts: vec![],
                 }],
             }],
         };

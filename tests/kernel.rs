@@ -135,6 +135,7 @@ fn large_policy() -> Policy {
                         hi: 1000 + p,
                     })
                     .collect(),
+                hosts: vec![],
             }],
         })
         .collect();
