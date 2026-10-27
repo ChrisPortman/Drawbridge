@@ -22,14 +22,13 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{Notify, watch};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use super::droplog::{Denial, DenyReason};
 use super::{Grant, Proxy, Verdict};
 use crate::firewall::ruleset::Mode;
 use crate::policy::Proto;
-use crate::session::SessionView;
 
 /// The largest request head the proxy accepts (hyper's buffer limit).
 const MAX_HEAD: usize = 16 * 1024;
@@ -57,11 +56,11 @@ pub(super) async fn serve(
                 return super::reset(client);
             }
             // Permissive: pass h2c through untouched.
-            return match TcpStream::connect(dst).await {
-                Ok(upstream) => {
+            return match proxy.connect_upstream(peer, dst).await {
+                Some(upstream) => {
                     super::splice(client, upstream, &head, None, proxy.sessions.clone()).await;
                 }
-                Err(_) => super::reset(client),
+                None => super::reset(client),
             };
         }
         Ok(Err(_)) => return,
@@ -110,7 +109,8 @@ pub(super) async fn serve(
         .serve_connection(TokioIo::new(io), service)
         .with_upgrades();
     let mut served = Box::pin(served);
-    let ended = session_ended(&conn, proxy.sessions.clone());
+    let mut sessions = proxy.sessions.clone();
+    let ended = super::session_gone(&mut sessions, || *conn.session.lock().unwrap());
     tokio::select! {
         res = &mut served => {
             match res {
@@ -147,7 +147,7 @@ pub(super) async fn serve(
 
     let upgraded = conn.upgraded.lock().unwrap().take();
     if let Some(task) = upgraded {
-        let ended = session_ended(&conn, proxy.sessions.clone());
+        let ended = super::session_gone(&mut sessions, || *conn.session.lock().unwrap());
         tokio::select! {
             () = task => {}
             () = ended => conn.reset.store(true, Ordering::SeqCst),
@@ -171,21 +171,6 @@ async fn read_preface(client: &mut TcpStream, head: &mut Vec<u8>) -> io::Result<
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
         head.extend_from_slice(&chunk[..read]);
-    }
-}
-
-/// Resolves once a session that allowed a request on `conn` is gone from the view.
-async fn session_ended(conn: &Conn, mut sessions: watch::Receiver<Arc<SessionView>>) {
-    loop {
-        if sessions.changed().await.is_err() {
-            return std::future::pending().await;
-        }
-        let granted = *conn.session.lock().unwrap();
-        if let Some((ip, id)) = granted
-            && sessions.borrow_and_update().get(&ip).map(|(i, _)| *i) != Some(id)
-        {
-            return;
-        }
     }
 }
 
@@ -364,17 +349,7 @@ impl Conn {
     async fn connect(&self) -> Option<SendRequest<Incoming>> {
         let peer = self.peer;
         let dst = self.dst;
-        let stream = match tokio::time::timeout(self.proxy.timeout, TcpStream::connect(dst)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
-                tracing::debug!("proxy: connecting {peer} to {dst} failed: {e}");
-                return None;
-            }
-            Err(_) => {
-                tracing::debug!("proxy: connecting {peer} to {dst} timed out");
-                return None;
-            }
-        };
+        let stream = self.proxy.connect_upstream(peer, dst).await?;
         let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .ok()?;
@@ -945,7 +920,7 @@ mod tests {
         h.sessions
             .take()
             .unwrap()
-            .send_replace(Arc::new(SessionView::new()));
+            .send_replace(Arc::new(crate::session::SessionView::new()));
         assert_reset(&mut client).await;
     }
 }

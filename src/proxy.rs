@@ -367,18 +367,25 @@ impl Proxy {
             }
         }
 
-        let upstream = match tokio::time::timeout(self.timeout, TcpStream::connect(dst)).await {
-            Ok(Ok(upstream)) => upstream,
+        let Some(upstream) = self.connect_upstream(peer, dst).await else {
+            return reset(client);
+        };
+        splice(client, upstream, &buf, grant, sessions).await;
+    }
+
+    /// Connects to `dst` for `peer` within the timeout; failures are logged at debug.
+    async fn connect_upstream(&self, peer: SocketAddr, dst: SocketAddr) -> Option<TcpStream> {
+        match tokio::time::timeout(self.timeout, TcpStream::connect(dst)).await {
+            Ok(Ok(upstream)) => Some(upstream),
             Ok(Err(e)) => {
                 tracing::debug!("proxy: connecting {peer} to {dst} failed: {e}");
-                return reset(client);
+                None
             }
             Err(_) => {
                 tracing::debug!("proxy: connecting {peer} to {dst} timed out");
-                return reset(client);
+                None
             }
-        };
-        splice(client, upstream, &buf, grant, sessions).await;
+        }
     }
 }
 
@@ -459,24 +466,33 @@ async fn splice(
         let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
         return;
     };
-    let session_ended = async {
-        loop {
-            if sessions.changed().await.is_err() {
-                return;
-            }
-            if sessions.borrow_and_update().get(&ip).map(|(i, _)| *i) != Some(id) {
-                return;
-            }
-        }
-    };
     tokio::select! {
         _ = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {}
-        () = session_ended => {
+        () = session_gone(&mut sessions, || Some((ip, id))) => {
             tracing::debug!("proxy: session {id} on {ip} ended; closing its connection");
             reset(upstream);
             reset(client);
         }
     }
+}
+
+/// Resolves once the session `granted` names (when it names one) is no longer in the view:
+/// ended, or replaced by another session on its IP. `granted` is read again at each change.
+///
+/// If the session manager drops its sender (it has stopped, at shutdown), this never resolves:
+/// the proxy is aborted next, which closes every connection anyway.
+async fn session_gone(
+    sessions: &mut watch::Receiver<Arc<SessionView>>,
+    granted: impl Fn() -> Option<(IpAddr, u32)>,
+) {
+    while sessions.changed().await.is_ok() {
+        if let Some((ip, id)) = granted()
+            && sessions.borrow_and_update().get(&ip).map(|(i, _)| *i) != Some(id)
+        {
+            return;
+        }
+    }
+    std::future::pending().await
 }
 
 /// Closes `stream` with a TCP RST.
