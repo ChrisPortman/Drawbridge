@@ -1,7 +1,7 @@
 //! Authenticated sessions: which user is logged in from which source IP, until when, and keeping
 //! the firewall's per-session chains in step.
 //!
-//! [`SessionTable`] is the synchronous state machine; [`spawn`] runs it in a task that serialises
+//! [`SessionTable`] is the state machine; [`spawn`] runs it in a task that serialises
 //! every change and removes sessions as their tokens expire.
 
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
 use crate::firewall::ruleset::{RuleSpec, Ruleset, SessionRules};
-use crate::firewall::{self, FirewallError};
+use crate::firewall::{Firewall, FirewallError};
 use crate::policy::Policy;
 use crate::portal::Secret;
 
@@ -75,36 +75,40 @@ pub(crate) enum RefreshOutcome {
 
 /// Applies session changes to the firewall. [`Kernel`] is the real one.
 pub(crate) trait Enforcer: Send + 'static {
-    /// Incremental change; see [`firewall::update_sessions`].
+    /// Incremental change; see [`Firewall::update_sessions`].
     fn update(
         &mut self,
         added: &[SessionRules],
         removed: &[u32],
         live: &[SessionRules],
-    ) -> Result<(), FirewallError>;
+    ) -> impl Future<Output = Result<(), FirewallError>> + Send;
     /// Atomically rebuilds the whole table with exactly the `live` sessions.
-    fn rebuild(&mut self, live: &[SessionRules]) -> Result<(), FirewallError>;
+    fn rebuild(
+        &mut self,
+        live: &[SessionRules],
+    ) -> impl Future<Output = Result<(), FirewallError>> + Send;
 }
 
 /// Enforces through the kernel, rebuilding from the static `base` ruleset.
 pub(crate) struct Kernel {
+    pub(crate) firewall: Firewall,
     pub(crate) base: Ruleset,
 }
 
 impl Enforcer for Kernel {
-    fn update(
+    async fn update(
         &mut self,
         added: &[SessionRules],
         removed: &[u32],
         live: &[SessionRules],
     ) -> Result<(), FirewallError> {
-        firewall::update_sessions(added, removed, live)
+        self.firewall.update_sessions(added, removed, live).await
     }
 
-    fn rebuild(&mut self, live: &[SessionRules]) -> Result<(), FirewallError> {
+    async fn rebuild(&mut self, live: &[SessionRules]) -> Result<(), FirewallError> {
         let mut ruleset = self.base.clone();
         ruleset.sessions = live.to_vec();
-        firewall::apply(&ruleset)
+        self.firewall.apply(&ruleset).await
     }
 }
 
@@ -114,7 +118,7 @@ pub(crate) struct NoopEnforcer;
 
 #[cfg(test)]
 impl Enforcer for NoopEnforcer {
-    fn update(
+    async fn update(
         &mut self,
         _: &[SessionRules],
         _: &[u32],
@@ -123,7 +127,7 @@ impl Enforcer for NoopEnforcer {
         Ok(())
     }
 
-    fn rebuild(&mut self, _: &[SessionRules]) -> Result<(), FirewallError> {
+    async fn rebuild(&mut self, _: &[SessionRules]) -> Result<(), FirewallError> {
         Ok(())
     }
 }
@@ -191,7 +195,7 @@ impl<E: Enforcer> SessionTable<E> {
     ///
     /// A login matching the session already held by `ip` extends it and keeps its token, so
     /// several browsers on one host can share it. A different user from `ip` replaces it.
-    pub(crate) fn login(
+    pub(crate) async fn login(
         &mut self,
         ip: IpAddr,
         username: &str,
@@ -232,7 +236,7 @@ impl<E: Enforcer> SessionTable<E> {
         let added = [session.rules.clone()];
         let replaced = self.by_ip.insert(ip, session);
         let removed: Vec<u32> = replaced.iter().map(|s| s.rules.id).collect();
-        if let Err(e) = self.sync(&added, &removed) {
+        if let Err(e) = self.sync(&added, &removed).await {
             // Only what was in force before is kept: either the kernel rejected the change and
             // still enforces it, or the retry timer rebuilds to it.
             let new = self.by_ip.remove(&ip);
@@ -338,7 +342,7 @@ impl<E: Enforcer> SessionTable<E> {
     }
 
     /// Ends the session `token` names at once. Returns whether there was one.
-    pub(crate) fn logout(&mut self, token: &str, ip: IpAddr, now: SystemTime) -> bool {
+    pub(crate) async fn logout(&mut self, token: &str, ip: IpAddr, now: SystemTime) -> bool {
         if self.live_session(token, ip, now).is_none() {
             return false;
         }
@@ -346,14 +350,14 @@ impl<E: Enforcer> SessionTable<E> {
         info!(%ip, username = s.username, "session ended");
         // Like an expiry, the session is gone from the state either way; a failed update leaves
         // the table dirty and the retry timer removes it from the kernel.
-        if let Err(e) = self.sync(&[], &[s.rules.id]) {
+        if let Err(e) = self.sync(&[], &[s.rules.id]).await {
             error!(error = %format!("{e:#}"), "failed to deprovision ended session; will retry");
         }
         true
     }
 
     /// Removes every session expired by `now`.
-    pub(crate) fn expire(&mut self, now: SystemTime) {
+    pub(crate) async fn expire(&mut self, now: SystemTime) {
         let expired: Vec<IpAddr> = self
             .by_ip
             .iter()
@@ -369,15 +373,15 @@ impl<E: Enforcer> SessionTable<E> {
             info!(%ip, username = s.username, "session expired");
             removed.push(s.rules.id);
         }
-        if let Err(e) = self.sync(&[], &removed) {
+        if let Err(e) = self.sync(&[], &removed).await {
             error!(error = %format!("{e:#}"), "failed to deprovision expired sessions; will retry");
         }
     }
 
     /// Retries a rebuild after an earlier failure. Returns whether the kernel is now in sync.
-    pub(crate) fn retry(&mut self) -> bool {
+    pub(crate) async fn retry(&mut self) -> bool {
         if self.dirty {
-            match self.enforcer.rebuild(&self.live()) {
+            match self.enforcer.rebuild(&self.live()).await {
                 Ok(()) => {
                     info!("firewall resynchronised");
                     self.dirty = false;
@@ -418,15 +422,15 @@ impl<E: Enforcer> SessionTable<E> {
 
     /// Brings the kernel in line with `by_ip`, which already reflects `added` and `removed`.
     /// Falls back to a full rebuild; if that fails too, leaves the table marked dirty.
-    fn sync(&mut self, added: &[SessionRules], removed: &[u32]) -> Result<(), FirewallError> {
+    async fn sync(&mut self, added: &[SessionRules], removed: &[u32]) -> Result<(), FirewallError> {
         let live = self.live();
         if !self.dirty {
-            match self.enforcer.update(added, removed, &live) {
+            match self.enforcer.update(added, removed, &live).await {
                 Ok(()) => return Ok(()),
                 Err(e) => warn!(error = %format!("{e:#}"), "session update failed; rebuilding"),
             }
         }
-        match self.enforcer.rebuild(&live) {
+        match self.enforcer.rebuild(&live).await {
             Ok(()) => {
                 self.dirty = false;
                 Ok(())
@@ -609,12 +613,10 @@ async fn run<E: Enforcer>(mut table: SessionTable<E>, mut rx: mpsc::Receiver<Com
             .unwrap_or(Duration::from_secs(3600));
         tokio::select! {
             cmd = rx.recv() => match cmd {
-                // Netlink calls block briefly (up to the ack timeout); keep them off the
-                // runtime's other worker threads.
                 Some(Command::Login { ip, username, expires_at, refresh, reply }) => {
-                    let result = tokio::task::block_in_place(|| {
-                        table.login(ip, &username, expires_at, refresh, SystemTime::now())
-                    });
+                    let result = table
+                        .login(ip, &username, expires_at, refresh, SystemTime::now())
+                        .await;
                     let _ = reply.send(result);
                 }
                 Some(Command::Status { token, ip, reply }) => {
@@ -628,17 +630,15 @@ async fn run<E: Enforcer>(mut table: SessionTable<E>, mut rx: mpsc::Receiver<Com
                     let _ = reply.send(table.finish_refresh(&token, ip, lease, outcome, now));
                 }
                 Some(Command::Logout { token, ip, reply }) => {
-                    let ended = tokio::task::block_in_place(|| {
-                        table.logout(&token, ip, SystemTime::now())
-                    });
+                    let ended = table.logout(&token, ip, SystemTime::now()).await;
                     let _ = reply.send(ended);
                 }
                 None => break,
             },
-            () = tokio::time::sleep(wait) => tokio::task::block_in_place(|| {
-                table.expire(SystemTime::now());
-                table.retry();
-            }),
+            () = tokio::time::sleep(wait) => {
+                table.expire(SystemTime::now()).await;
+                table.retry().await;
+            }
         }
     }
 }
@@ -656,7 +656,7 @@ mod tests {
     }
 
     impl Enforcer for Fake {
-        fn update(
+        async fn update(
             &mut self,
             added: &[SessionRules],
             removed: &[u32],
@@ -669,16 +669,22 @@ mod tests {
                 ids(live)
             ));
             if self.fail_update {
-                return Err(crate::firewall::NetlinkError::Timeout.into());
+                return Err(crate::firewall::NftError::Timeout {
+                    after: Duration::ZERO,
+                }
+                .into());
             }
             Ok(())
         }
 
-        fn rebuild(&mut self, live: &[SessionRules]) -> Result<(), FirewallError> {
+        async fn rebuild(&mut self, live: &[SessionRules]) -> Result<(), FirewallError> {
             let ids: Vec<_> = live.iter().map(|r| r.id).collect();
             self.calls.push(format!("rebuild ={ids:?}"));
             if self.fail_rebuild {
-                return Err(crate::firewall::NetlinkError::Timeout.into());
+                return Err(crate::firewall::NftError::Timeout {
+                    after: Duration::ZERO,
+                }
+                .into());
             }
             Ok(())
         }
@@ -701,10 +707,13 @@ mod tests {
         s.parse().unwrap()
     }
 
-    #[test]
-    fn login_provisions_and_reports_status() {
+    #[tokio::test]
+    async fn login_provisions_and_reports_status() {
         let mut t = table();
-        let token = t.login(ip(IP), "alice", at(200), None, at(100)).unwrap();
+        let token = t
+            .login(ip(IP), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
         assert_eq!(t.enforcer.calls, ["update +[1] -[] =[1]"]);
         let info = t.status(&token, ip(IP), at(150)).unwrap();
         assert_eq!(info.username, "alice");
@@ -712,27 +721,36 @@ mod tests {
         assert_eq!(info.access, ["10.0.1.0/24 tcp/22", "10.0.1.0/24 tcp/443"]);
     }
 
-    #[test]
-    fn status_requires_matching_token_ip_and_time() {
+    #[tokio::test]
+    async fn status_requires_matching_token_ip_and_time() {
         let mut t = table();
-        let token = t.login(ip(IP), "alice", at(200), None, at(100)).unwrap();
+        let token = t
+            .login(ip(IP), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
         assert!(t.status("wrong", ip(IP), at(150)).is_none());
         assert!(t.status(&token, ip("192.168.60.8"), at(150)).is_none());
         assert!(t.status(&token, ip(IP), at(200)).is_none());
     }
 
-    #[test]
-    fn relogin_extends_without_touching_the_firewall() {
+    #[tokio::test]
+    async fn relogin_extends_without_touching_the_firewall() {
         let mut t = table();
-        let token = t.login(ip(IP), "alice", at(200), None, at(100)).unwrap();
-        let again = t.login(ip(IP), "alice", at(300), None, at(180)).unwrap();
+        let token = t
+            .login(ip(IP), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
+        let again = t
+            .login(ip(IP), "alice", at(300), None, at(180))
+            .await
+            .unwrap();
         assert_eq!(token, again);
         assert_eq!(t.enforcer.calls.len(), 1);
         assert_eq!(t.status(&token, ip(IP), at(250)).unwrap().expires_at, 300);
     }
 
-    #[test]
-    fn other_user_replaces_session_atomically() {
+    #[tokio::test]
+    async fn other_user_replaces_session_atomically() {
         let mut t = table();
         let mut policy = (*t.policy).clone();
         policy.users.push(crate::policy::User {
@@ -740,95 +758,117 @@ mod tests {
             allow: policy.users[0].allow.clone(),
         });
         t.policy = Arc::new(policy);
-        let alice = t.login(ip(IP), "alice", at(200), None, at(100)).unwrap();
-        let bob = t.login(ip(IP), "bob", at(200), None, at(110)).unwrap();
+        let alice = t
+            .login(ip(IP), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
+        let bob = t
+            .login(ip(IP), "bob", at(200), None, at(110))
+            .await
+            .unwrap();
         assert_ne!(alice, bob);
         assert_eq!(t.enforcer.calls[1], "update +[2] -[1] =[2]");
         assert!(t.status(&alice, ip(IP), at(120)).is_none());
     }
 
-    #[test]
-    fn unknown_user_and_expired_login_are_refused() {
+    #[tokio::test]
+    async fn unknown_user_and_expired_login_are_refused() {
         let mut t = table();
         assert!(matches!(
-            t.login(ip(IP), "mallory", at(200), None, at(100)),
+            t.login(ip(IP), "mallory", at(200), None, at(100)).await,
             Err(SessionError::NoPolicy(_))
         ));
         assert!(matches!(
-            t.login(ip(IP), "alice", at(100), None, at(100)),
+            t.login(ip(IP), "alice", at(100), None, at(100)).await,
             Err(SessionError::Expired)
         ));
         assert!(t.enforcer.calls.is_empty());
     }
 
-    #[test]
-    fn expires_in_deadline_order() {
+    #[tokio::test]
+    async fn expires_in_deadline_order() {
         let mut t = table();
-        t.login(ip(IP), "alice", at(200), None, at(100)).unwrap();
+        t.login(ip(IP), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
         t.login(ip("fd00:60::7"), "alice", at(300), None, at(100))
+            .await
             .unwrap();
         assert_eq!(t.next_wakeup(at(150)), Some(Duration::from_secs(50)));
-        t.expire(at(250));
+        t.expire(at(250)).await;
         assert_eq!(t.enforcer.calls.last().unwrap(), "update +[] -[1] =[2]");
         assert_eq!(t.next_wakeup(at(250)), Some(Duration::from_secs(50)));
-        t.expire(at(300));
+        t.expire(at(300)).await;
         assert_eq!(t.enforcer.calls.last().unwrap(), "update +[] -[2] =[]");
         assert_eq!(t.next_wakeup(at(300)), None);
     }
 
-    #[test]
-    fn failed_update_falls_back_to_rebuild() {
+    #[tokio::test]
+    async fn failed_update_falls_back_to_rebuild() {
         let mut t = table();
         t.enforcer.fail_update = true;
-        t.login(ip(IP), "alice", at(200), None, at(100)).unwrap();
+        t.login(ip(IP), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
         assert_eq!(t.enforcer.calls, ["update +[1] -[] =[1]", "rebuild =[1]"]);
     }
 
-    #[test]
-    fn failed_rebuild_rolls_back_and_retries() {
+    #[tokio::test]
+    async fn failed_rebuild_rolls_back_and_retries() {
         let mut t = table();
         t.enforcer.fail_update = true;
         t.enforcer.fail_rebuild = true;
         assert!(matches!(
-            t.login(ip(IP), "alice", at(200), None, at(100)),
+            t.login(ip(IP), "alice", at(200), None, at(100)).await,
             Err(SessionError::Firewall(_))
         ));
         assert_eq!(t.next_wakeup(at(100)), Some(RETRY_INTERVAL));
-        assert!(!t.retry());
+        assert!(!t.retry().await);
         t.enforcer.fail_rebuild = false;
-        assert!(t.retry());
+        assert!(t.retry().await);
         // The rebuild restores the state before the failed login: no sessions.
         assert_eq!(t.enforcer.calls.last().unwrap(), "rebuild =[]");
         assert_eq!(t.next_wakeup(at(100)), None);
     }
 
-    #[test]
-    fn dirty_table_skips_incremental_updates() {
+    #[tokio::test]
+    async fn dirty_table_skips_incremental_updates() {
         let mut t = table();
         t.dirty = true;
-        t.login(ip(IP), "alice", at(200), None, at(100)).unwrap();
+        t.login(ip(IP), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
         assert_eq!(t.enforcer.calls, ["rebuild =[1]"]);
         assert!(!t.dirty);
     }
 
-    #[test]
-    fn max_ttl_caps_logins_and_extensions() {
+    #[tokio::test]
+    async fn max_ttl_caps_logins_and_extensions() {
         let mut t = table();
         t.max_ttl = Duration::from_secs(60);
-        let token = t.login(ip(IP), "alice", at(1000), None, at(100)).unwrap();
+        let token = t
+            .login(ip(IP), "alice", at(1000), None, at(100))
+            .await
+            .unwrap();
         assert_eq!(t.status(&token, ip(IP), at(110)).unwrap().expires_at, 160);
-        t.login(ip(IP), "alice", at(1000), None, at(150)).unwrap();
+        t.login(ip(IP), "alice", at(1000), None, at(150))
+            .await
+            .unwrap();
         assert_eq!(t.status(&token, ip(IP), at(155)).unwrap().expires_at, 210);
         // A token expiring sooner than the cap still wins.
-        t.login(ip(IP), "alice", at(220), None, at(200)).unwrap();
+        t.login(ip(IP), "alice", at(220), None, at(200))
+            .await
+            .unwrap();
         assert_eq!(t.status(&token, ip(IP), at(205)).unwrap().expires_at, 220);
     }
 
-    #[test]
-    fn ids_skip_zero_and_live_sessions() {
+    #[tokio::test]
+    async fn ids_skip_zero_and_live_sessions() {
         let mut t = table();
         t.next_id = u32::MAX;
-        t.login(ip(IP), "alice", at(200), None, at(100)).unwrap();
+        t.login(ip(IP), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
         // The counter wraps, skipping 0.
         assert_eq!(t.allocate_id(), 1);
         // u32::MAX is still held by alice's session, so it is skipped too.
@@ -836,8 +876,8 @@ mod tests {
         assert_eq!(t.allocate_id(), 1);
     }
 
-    #[test]
-    fn tokens_are_unique_hex() {
+    #[tokio::test]
+    async fn tokens_are_unique_hex() {
         let a = new_token();
         assert_eq!(a.len(), 64);
         assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -856,11 +896,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn refresh_extends_and_rotates_the_refresh_token() {
+    #[tokio::test]
+    async fn refresh_extends_and_rotates_the_refresh_token() {
         let mut t = table();
         let token = t
             .login(ip(IP), "alice", at(200), rt("rt-1"), at(100))
+            .await
             .unwrap();
         let lease = t.begin_refresh(&token, ip(IP), at(180)).unwrap();
         assert_eq!(lease.refresh_token.expose(), "rt-1");
@@ -891,12 +932,13 @@ mod tests {
         assert_eq!(t.enforcer.calls.len(), 1);
     }
 
-    #[test]
-    fn refresh_is_capped_by_max_ttl() {
+    #[tokio::test]
+    async fn refresh_is_capped_by_max_ttl() {
         let mut t = table();
         t.max_ttl = Duration::from_secs(60);
         let token = t
             .login(ip(IP), "alice", at(1000), rt("rt"), at(100))
+            .await
             .unwrap();
         let lease = t.begin_refresh(&token, ip(IP), at(150)).unwrap();
         let info = t
@@ -911,11 +953,12 @@ mod tests {
         assert_eq!(info.expires_at, 210);
     }
 
-    #[test]
-    fn refresh_as_another_user_disables_refresh() {
+    #[tokio::test]
+    async fn refresh_as_another_user_disables_refresh() {
         let mut t = table();
         let token = t
             .login(ip(IP), "alice", at(200), rt("rt"), at(100))
+            .await
             .unwrap();
         let lease = t.begin_refresh(&token, ip(IP), at(150)).unwrap();
         assert_eq!(
@@ -936,11 +979,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejected_refresh_drops_the_token_and_unreachable_keeps_it() {
+    #[tokio::test]
+    async fn rejected_refresh_drops_the_token_and_unreachable_keeps_it() {
         let mut t = table();
         let token = t
             .login(ip(IP), "alice", at(200), rt("rt"), at(100))
+            .await
             .unwrap();
         let lease = t.begin_refresh(&token, ip(IP), at(150)).unwrap();
         assert_eq!(
@@ -966,10 +1010,13 @@ mod tests {
         assert!(t.status(&token, ip(IP), at(199)).is_some());
     }
 
-    #[test]
-    fn begin_refresh_checks_session_token_and_lease() {
+    #[tokio::test]
+    async fn begin_refresh_checks_session_token_and_lease() {
         let mut t = table();
-        let none = t.login(ip(IP), "alice", at(200), None, at(100)).unwrap();
+        let none = t
+            .login(ip(IP), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
         assert_eq!(
             t.begin_refresh(&none, ip(IP), at(150)).unwrap_err(),
             RefreshError::Unavailable
@@ -977,6 +1024,7 @@ mod tests {
         let other = "fd00:60::7";
         let token = t
             .login(ip(other), "alice", at(200), rt("rt"), at(100))
+            .await
             .unwrap();
         for (tok, from, now) in [
             ("wrong", other, 150),
@@ -1010,14 +1058,16 @@ mod tests {
         assert_eq!(info.expires_at, 200);
     }
 
-    #[test]
-    fn relogin_supersedes_a_refresh_in_flight() {
+    #[tokio::test]
+    async fn relogin_supersedes_a_refresh_in_flight() {
         let mut t = table();
         let token = t
             .login(ip(IP), "alice", at(200), rt("rt-1"), at(100))
+            .await
             .unwrap();
         let lease = t.begin_refresh(&token, ip(IP), at(150)).unwrap();
         t.login(ip(IP), "alice", at(250), rt("login"), at(151))
+            .await
             .unwrap();
         let info = t
             .finish_refresh(
@@ -1037,13 +1087,15 @@ mod tests {
             "login"
         );
         // A re-login without a refresh token keeps the one held.
-        t.login(ip(IP), "alice", at(260), None, at(154)).unwrap();
+        t.login(ip(IP), "alice", at(260), None, at(154))
+            .await
+            .unwrap();
         let held = t.by_ip[&ip(IP)].refresh.as_ref().map(Secret::expose);
         assert_eq!(held, Some("login"));
     }
 
-    #[test]
-    fn refresh_after_logout_or_replacement_is_discarded() {
+    #[tokio::test]
+    async fn refresh_after_logout_or_replacement_is_discarded() {
         let mut t = table();
         let mut policy = (*t.policy).clone();
         policy.users.push(crate::policy::User {
@@ -1053,10 +1105,12 @@ mod tests {
         t.policy = Arc::new(policy);
         let alice = t
             .login(ip(IP), "alice", at(200), rt("rt"), at(100))
+            .await
             .unwrap();
         let lease = t.begin_refresh(&alice, ip(IP), at(150)).unwrap();
         let bob = t
             .login(ip(IP), "bob", at(200), rt("rt-bob"), at(151))
+            .await
             .unwrap();
         assert_eq!(
             t.finish_refresh(
@@ -1069,45 +1123,52 @@ mod tests {
             Err(RefreshError::NoSession)
         );
         let lease = t.begin_refresh(&bob, ip(IP), at(153)).unwrap();
-        assert!(t.logout(&bob, ip(IP), at(154)));
+        assert!(t.logout(&bob, ip(IP), at(154)).await);
         assert_eq!(
             t.finish_refresh(&bob, ip(IP), lease.id, refreshed("bob", 400, None), at(155)),
             Err(RefreshError::NoSession)
         );
     }
 
-    #[test]
-    fn logout_removes_the_session_through_an_update() {
+    #[tokio::test]
+    async fn logout_removes_the_session_through_an_update() {
         let mut t = table();
-        let token = t.login(ip(IP), "alice", at(200), None, at(100)).unwrap();
-        assert!(!t.logout("wrong", ip(IP), at(150)));
-        assert!(!t.logout(&token, ip("192.168.60.8"), at(150)));
+        let token = t
+            .login(ip(IP), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
+        assert!(!t.logout("wrong", ip(IP), at(150)).await);
+        assert!(!t.logout(&token, ip("192.168.60.8"), at(150)).await);
         assert_eq!(t.enforcer.calls.len(), 1);
-        assert!(t.logout(&token, ip(IP), at(150)));
+        assert!(t.logout(&token, ip(IP), at(150)).await);
         assert_eq!(t.enforcer.calls[1], "update +[] -[1] =[]");
         assert!(t.status(&token, ip(IP), at(150)).is_none());
         assert_eq!(t.next_wakeup(at(150)), None);
     }
 
-    #[test]
-    fn failed_logout_stays_removed_and_retries() {
+    #[tokio::test]
+    async fn failed_logout_stays_removed_and_retries() {
         let mut t = table();
-        let token = t.login(ip(IP), "alice", at(200), None, at(100)).unwrap();
+        let token = t
+            .login(ip(IP), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
         t.enforcer.fail_update = true;
         t.enforcer.fail_rebuild = true;
-        assert!(t.logout(&token, ip(IP), at(150)));
+        assert!(t.logout(&token, ip(IP), at(150)).await);
         assert!(t.status(&token, ip(IP), at(150)).is_none());
         assert_eq!(t.next_wakeup(at(150)), Some(RETRY_INTERVAL));
         t.enforcer.fail_rebuild = false;
-        assert!(t.retry());
+        assert!(t.retry().await);
         assert_eq!(t.enforcer.calls.last().unwrap(), "rebuild =[]");
     }
 
-    #[test]
-    fn refresh_to_an_expired_token_disables_refresh() {
+    #[tokio::test]
+    async fn refresh_to_an_expired_token_disables_refresh() {
         let mut t = table();
         let token = t
             .login(ip(IP), "alice", at(200), rt("rt"), at(100))
+            .await
             .unwrap();
         let lease = t.begin_refresh(&token, ip(IP), at(150)).unwrap();
         assert_eq!(
@@ -1123,11 +1184,12 @@ mod tests {
         assert_eq!(t.status(&token, ip(IP), at(150)).unwrap().expires_at, 200);
     }
 
-    #[test]
-    fn expired_sessions_neither_refresh_nor_log_out() {
+    #[tokio::test]
+    async fn expired_sessions_neither_refresh_nor_log_out() {
         let mut t = table();
         let token = t
             .login(ip(IP), "alice", at(200), rt("rt"), at(100))
+            .await
             .unwrap();
         let lease = t.begin_refresh(&token, ip(IP), at(190)).unwrap();
         // Past its expiry, before the expiry timer has removed it.
@@ -1141,6 +1203,6 @@ mod tests {
             ),
             Err(RefreshError::NoSession)
         );
-        assert!(!t.logout(&token, ip(IP), at(201)));
+        assert!(!t.logout(&token, ip(IP), at(201)).await);
     }
 }

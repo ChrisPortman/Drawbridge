@@ -298,7 +298,7 @@ got=fewer
 (($(default_counter drop) - dropped >= 3)) && got=all
 report all "$got" "every repeated datagram is dropped"
 report 1 "$(dc exec -T gateway nft list set inet drawbridge drop_seen4 |
-    grep -c '172.30.0.11 . 10.10.0.20 . [a-z0-9]* . 8080')" "the dropped key is remembered"
+    grep -c '172.30.0.11 . 10.10.0.20 . 17 . 8080')" "the dropped UDP key is remembered"
 # The ICMP probes above went to the IPv4 set without ports.
 got=no
 (($(nft_counter drop_log '@drop_seen4_proto limit') > 0)) && got=yes

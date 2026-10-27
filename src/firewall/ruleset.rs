@@ -138,7 +138,7 @@ impl LogSet {
         }
     }
 
-    /// The key's fields, in order. Both the nft rendering here and `nfraw`'s encoding follow it.
+    /// The key's fields, in order. Both the nft rendering here and `json`'s encoding follow it.
     pub(crate) fn key(self) -> &'static [KeyField] {
         use KeyField::*;
         if self.ports {

@@ -39,9 +39,9 @@ pub enum ServerCommand {
     /// Provision the policy, wait for SIGINT/SIGTERM, then deprovision it.
     Run(Box<RunArgs>),
     /// Validate the policy and print the ruleset that `run` would install.
-    Check(PolicyArgs),
+    Check(CheckArgs),
     /// Remove the gateway's nftables table, e.g. after a crash.
-    Teardown(LockArgs),
+    Teardown(TeardownArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -124,6 +124,50 @@ pub struct RunArgs {
     pub lock: LockArgs,
     #[command(flatten)]
     pub portal: PortalArgs,
+    #[command(flatten)]
+    pub nft: NftArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct CheckArgs {
+    #[command(flatten)]
+    pub policy: PolicyArgs,
+    #[command(flatten)]
+    pub nft: NftArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct TeardownArgs {
+    #[command(flatten)]
+    pub lock: LockArgs,
+    #[command(flatten)]
+    pub nft: NftArgs,
+}
+
+/// How to run `nft`.
+#[derive(Debug, Args)]
+pub struct NftArgs {
+    /// Absolute path of the `nft` binary (nftables >= 0.9.3). It is never looked up in `PATH`.
+    #[arg(
+        long,
+        env = "DRAWBRIDGE_NFT_PATH",
+        default_value = "/usr/sbin/nft",
+        value_parser = parse_absolute
+    )]
+    pub nft_path: PathBuf,
+    /// Don't check `nft --version`, e.g. if a newer nft prints it in a format Drawbridge can't
+    /// parse. A warning with the raw output is logged instead.
+    #[arg(long, env = "DRAWBRIDGE_NFT_SKIP_VERSION_CHECK")]
+    pub nft_skip_version_check: bool,
+}
+
+fn parse_absolute(s: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(s);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(format!("{s:?} is not an absolute path"))
+    }
 }
 
 #[derive(Debug, Args)]
@@ -290,6 +334,21 @@ mod tests {
             .to_string();
         let listed = |name: &str| help.lines().any(|l| l.trim_start().starts_with(name));
         assert!(listed("login") && !listed("service"), "{help}");
+    }
+
+    #[test]
+    fn nft_path_defaults_and_must_be_absolute() {
+        let Command::Server {
+            command: ServerCommand::Teardown(args),
+        } = parse("server teardown").unwrap().command
+        else {
+            panic!("not teardown");
+        };
+        assert_eq!(args.nft.nft_path, PathBuf::from("/usr/sbin/nft"));
+        assert!(!args.nft.nft_skip_version_check);
+        assert!(parse("server teardown --nft-path /opt/nft --nft-skip-version-check").is_ok());
+        let e = parse("server teardown --nft-path nft").unwrap_err();
+        assert!(e.to_string().contains("not an absolute path"), "{e}");
     }
 
     #[test]
