@@ -161,9 +161,10 @@ async fn apply_large_policy() {
 
     fw.apply(&ruleset).await.unwrap();
     let listing = nft_json(&["list", "table", "inet", TABLE]).expect("table exists");
+    // No proxy port, so no nat chain and no jump to proxy_redirect.
     assert_eq!(
         count(&listing, "rule"),
-        FIXED_RULES + 2 + ruleset.rules.len() + 1
+        FIXED_RULES - 1 + 2 + ruleset.rules.len() + 1
     );
 
     fw.teardown().await.unwrap();
