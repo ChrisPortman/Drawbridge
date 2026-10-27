@@ -247,7 +247,9 @@ pub enum RulesetError {
     InterfaceName(String),
     #[error("portal listen address {0} must be a specific address, not unspecified")]
     PortalAddr(SocketAddr),
-    #[error("the policy has host rules (http, https), which need --proxy-port")]
+    #[error(
+        "the policy has host rules (http, https), which need --proxy-port (DRAWBRIDGE_PROXY_PORT)"
+    )]
     ProxyPortRequired,
     #[error("invalid policy")]
     Policy(#[from] PolicyError),
@@ -574,21 +576,22 @@ impl fmt::Display for Ruleset {
             writeln!(f, "\t\tiifname \"{iface}\" counter {}", self.mode.verdict())?;
             writeln!(f, "\t}}")?;
         }
-        writeln!(f, "\tchain {NAT_CHAIN} {{")?;
-        writeln!(
-            f,
-            "\t\ttype nat hook {NAT_CHAIN} priority dstnat; policy accept;"
-        )?;
-        writeln!(f, "\t\tiifname \"{iface}\" jump {PROXY_REDIRECT_CHAIN}")?;
-        writeln!(f, "\t}}")?;
-        writeln!(f, "\tchain {PROXY_REDIRECT_CHAIN} {{")?;
+        // Without a proxy port there are no nat chains, so kernels without nat still work.
         if let Some(port) = self.proxy_port {
+            writeln!(f, "\tchain {NAT_CHAIN} {{")?;
+            writeln!(
+                f,
+                "\t\ttype nat hook {NAT_CHAIN} priority dstnat; policy accept;"
+            )?;
+            writeln!(f, "\t\tiifname \"{iface}\" jump {PROXY_REDIRECT_CHAIN}")?;
+            writeln!(f, "\t}}")?;
+            writeln!(f, "\tchain {PROXY_REDIRECT_CHAIN} {{")?;
             let session_redirects = self.sessions.iter().flat_map(|s| &s.redirects);
             for redirect in self.redirects.iter().chain(session_redirects) {
                 writeln!(f, "\t\t{}", RedirectRule(redirect, port))?;
             }
+            writeln!(f, "\t}}")?;
         }
-        writeln!(f, "\t}}")?;
         writeln!(f, "\tchain {FILTER_CHAIN} {{")?;
         writeln!(f, "\t\tct mark != 0x00000000 goto {SESSION_FLOWS_CHAIN}")?;
         writeln!(f, "\t\tct state established,related accept")?;
@@ -1072,7 +1075,8 @@ users:
             .unwrap()
             .to_string();
         assert!(!text.contains("ct status dnat"), "{text}");
-        assert!(text.contains("\tchain proxy_redirect {\n\t}\n"), "{text}");
+        assert!(!text.contains("proxy_redirect"), "{text}");
+        assert!(!text.contains("type nat"), "{text}");
     }
 
     #[test]

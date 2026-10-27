@@ -78,8 +78,14 @@ pub(crate) fn update_sessions(
     for session in added {
         session_chain_cmds(&mut cmds, session);
     }
-    for name in [SESSIONS_CHAIN, SESSION_FLOWS_CHAIN, PROXY_REDIRECT_CHAIN] {
+    for name in [SESSIONS_CHAIN, SESSION_FLOWS_CHAIN] {
         cmds.push(NfCmd::Flush(FlushObject::Chain(chain(name))));
+    }
+    // Without a proxy port, apply installed no nat chains.
+    if base.proxy_port.is_some() {
+        cmds.push(NfCmd::Flush(FlushObject::Chain(chain(
+            PROXY_REDIRECT_CHAIN,
+        ))));
     }
     live_session_cmds(&mut cmds, live);
     redirect_cmds(&mut cmds, base, live);
@@ -182,8 +188,12 @@ fn apply_cmds(ruleset: &Ruleset) -> Vec<NfCmd<'static>> {
 }
 
 /// The nat `prerouting` base chain (at dstnat priority, -100) sending the external interface's
-/// traffic to `proxy_redirect`, and that chain with the client and session redirects.
+/// traffic to `proxy_redirect`, and that chain with the client and session redirects. Nothing
+/// without a proxy port, so kernels without nat support still run policies without host rules.
 fn nat(ruleset: &Ruleset) -> Vec<NfCmd<'static>> {
+    if ruleset.proxy_port.is_none() {
+        return Vec::new();
+    }
     let mut cmds = vec![
         add_chain(chain(PROXY_REDIRECT_CHAIN)),
         add_chain(Chain {
@@ -861,5 +871,18 @@ mod tests {
         assert!(full.iter().any(is_nat));
         let kept: Vec<_> = full.into_iter().filter(|c| !is_nat(c)).collect();
         assert_eq!(kept, reduced);
+    }
+
+    #[test]
+    fn no_proxy_port_emits_no_nat_chains() {
+        let ruleset = Ruleset::from_policy(&Policy::default(), "wg0", &[], None).unwrap();
+        let mentions_nat = |doc: &Nftables| {
+            let text = serde_json::to_string(doc).unwrap();
+            text.contains("prerouting") || text.contains("proxy_redirect")
+        };
+        assert!(!mentions_nat(&apply(&ruleset)));
+        assert!(!mentions_nat(&apply_without_drop_log(&ruleset)));
+        assert!(!mentions_nat(&update_sessions(&ruleset, &[], &[], &[])));
+        assert!(!to_value(&apply(&ruleset)).to_string().contains("ct status"));
     }
 }

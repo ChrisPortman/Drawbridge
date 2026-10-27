@@ -15,6 +15,7 @@ use crate::firewall::Firewall;
 use crate::firewall::ruleset::{Mode, Ruleset, TABLE};
 use crate::policy::Policy;
 use crate::portal::{OidcConfig, PortalConfig, Prepared, Servers};
+use crate::proxy::{self, ProxyConfig};
 use crate::session::{self, Kernel, SessionTable};
 
 /// How long open portal connections get to finish at shutdown.
@@ -130,6 +131,12 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
     } else {
         Some(Prepared::new(portal_config(&args.portal, listen)?).await?)
     };
+    let proxy_listener = match ruleset.proxy_port {
+        None => None,
+        Some(port) => {
+            Some(proxy::bind(port).with_context(|| format!("binding the proxy on port {port}"))?)
+        }
+    };
 
     // Install handlers before touching nftables so a signal during apply still reaches teardown.
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
@@ -148,6 +155,7 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
         iface_index,
         rules = ruleset.rules.len(),
         mode = ?ruleset.mode,
+        proxy_port = ruleset.proxy_port,
         "access provisioned"
     );
     if ruleset.mode == Mode::Permissive {
@@ -157,10 +165,11 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
     let mut servers = Servers::default();
     let mut sessions_task = None;
     // Live sessions for the host-rule proxy; constant and empty without a portal.
-    let mut _session_view = session::idle_view();
+    let mut session_view = session::idle_view();
+    let policy = Arc::new(policy);
     if let Some(portal) = prepared {
         let (sessions, view, task) = session::spawn(SessionTable::new(
-            Arc::new(policy),
+            policy.clone(),
             Kernel {
                 firewall: firewall.clone(),
                 base: ruleset.clone(),
@@ -168,11 +177,21 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
             args.portal.session_max_ttl,
         ));
         sessions_task = Some(task);
-        _session_view = view;
+        session_view = view;
         servers = portal.serve(sessions);
     }
+    let mut proxy_task = proxy_listener.map(|listener| {
+        let config = ProxyConfig::new(&policy, session_view, ruleset.mode, listener);
+        tokio::spawn(config.run())
+    });
 
     // A dead portal or session manager can't be recovered from; shut down (fail-open) and report.
+    let proxy_exited = async {
+        match proxy_task.as_mut() {
+            Some(task) => task.await,
+            None => std::future::pending().await,
+        }
+    };
     let sessions_exited = async {
         match sessions_task.as_mut() {
             Some(task) => task.await,
@@ -191,12 +210,24 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
                 Err(e) => anyhow::Error::new(e).context("session manager panicked"),
             })
         }
+        exited = proxy_exited => {
+            proxy_task = None;
+            Some(match exited {
+                Ok(()) => anyhow::anyhow!("proxy stopped"),
+                Err(e) => anyhow::Error::new(e).context("proxy panicked"),
+            })
+        }
     };
     if let Some(e) = &failure {
         error!("{e:#}");
     }
 
     servers.shutdown(PORTAL_DRAIN).await;
+    // Aborting the proxy also drops the connections it serves.
+    if let Some(task) = proxy_task {
+        task.abort();
+        let _ = task.await;
+    }
     // The session manager must be gone before teardown, or a rebuild could recreate the table.
     if let Some(task) = sessions_task {
         task.abort();
@@ -215,4 +246,35 @@ pub async fn teardown(args: &TeardownArgs) -> anyhow::Result<()> {
     firewall.teardown().await.context("removing table")?;
     info!(table = TABLE, "table removed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn args(proxy_port: Option<u16>) -> PolicyArgs {
+        PolicyArgs {
+            policy: PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/policy.yaml")),
+            external_iface: "wg0".into(),
+            portal_listen: vec!["192.168.50.1:8443".parse().unwrap()],
+            proxy_port,
+            permissive: false,
+        }
+    }
+
+    #[test]
+    fn host_rules_without_proxy_port_name_the_flag() {
+        let err = load(&args(None)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--proxy-port"), "{msg}");
+        assert!(msg.contains("DRAWBRIDGE_PROXY_PORT"), "{msg}");
+    }
+
+    #[test]
+    fn host_rules_with_proxy_port_load() {
+        let (_, ruleset) = load(&args(Some(3128))).unwrap();
+        assert_eq!(ruleset.proxy_port, Some(3128));
+    }
 }

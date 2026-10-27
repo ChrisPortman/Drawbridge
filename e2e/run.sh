@@ -269,6 +269,13 @@ SERVER=10.10.0.20
 SERVER6=fd00:10::20
 GATEWAY=172.30.0.2
 
+echo "== transparent proxy"
+# Host-rule traffic is checked by #19; this shows the proxy's lifecycle with --proxy-port set.
+report yes "$(dc exec -T gateway ss -Hltn 'sport = :3128' | grep -q . && echo yes || echo no)" \
+    "proxy listening on :3128"
+report yes "$(dc exec -T gateway nft list chain inet drawbridge prerouting >/dev/null 2>&1 \
+    && echo yes || echo no)" "nat prerouting chain installed"
+
 echo "== gateway running: IPv4"
 tcp open   client-allowed $SERVER 8080
 tcp open   client-allowed $SERVER 9000

@@ -31,7 +31,6 @@ use sni::ClientHello;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Binds the proxy's dual-stack listener on `[::]:<port>` (`IPV6_V6ONLY=0`).
-#[allow(dead_code)]
 pub(crate) fn bind(port: u16) -> io::Result<TcpListener> {
     let socket = TcpSocket::new_v6()?;
     setsockopt(&socket, sockopt::Ipv6V6Only, &false)?;
@@ -40,15 +39,12 @@ pub(crate) fn bind(port: u16) -> io::Result<TcpListener> {
     socket.listen(1024)
 }
 
-// Not wired in yet: the gateway runs it from #18.
 /// Everything the proxy needs; [`ProxyConfig::run`] serves it.
-#[allow(dead_code)]
 pub(crate) struct ProxyConfig {
     proxy: Proxy,
     listener: TcpListener,
 }
 
-#[allow(dead_code)]
 impl ProxyConfig {
     /// `listener` comes from [`bind`]; `sessions` from the session manager (or
     /// [`crate::session::idle_view`] without a portal).
@@ -89,7 +85,6 @@ impl ProxyConfig {
 }
 
 /// The destination the client aimed at before nftables redirected it, if it was redirected.
-#[allow(dead_code)]
 fn original_dst(stream: &TcpStream, peer: SocketAddr) -> Option<SocketAddr> {
     let fd = stream.as_fd();
     if canonical(peer).is_ipv4() {
@@ -552,7 +547,12 @@ clients:
         proto: &str,
         hosts: &str,
     ) -> Harness {
-        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // SO_REUSEPORT lets a test hold the port once the listener is gone (see
+        // `upstream_failure_is_reset`).
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.set_reuseport(true).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let upstream = socket.listen(16).unwrap();
         let port = upstream.local_addr().unwrap().port();
         let rule = format!(
             "      - {{ dest: [127.0.0.1/32], proto: {proto}, ports: [{port}], hosts: [{hosts}] }}\n"
@@ -661,6 +661,11 @@ clients:
     async fn upstream_failure_is_reset() {
         let h = harness(Mode::Enforcing, false).await;
         let mut client = h.connect().await;
+        // Keep the port bound but not listening, so connecting to it is refused. A freed port
+        // could be taken by a parallel test, or by the proxy's own connect as its source port.
+        let hold = TcpSocket::new_v4().unwrap();
+        hold.set_reuseport(true).unwrap();
+        hold.bind(h.upstream.local_addr().unwrap()).unwrap();
         drop(h.upstream);
         send_hello(&mut client, Some("ok.test")).await;
         assert_reset(&mut client).await;
