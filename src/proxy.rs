@@ -5,6 +5,7 @@
 //! session host rule allows it, and either splices it to that destination or resets it.
 
 mod droplog;
+mod http;
 pub(crate) mod sni;
 
 use std::io;
@@ -108,6 +109,24 @@ fn canonical(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
+/// What the host rules say about a connection or request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Allow(Grant),
+    /// A rule allows the host, but none allows the path (HTTP only).
+    PathDenied,
+    Deny,
+}
+
+impl Verdict {
+    fn grant(self) -> Option<Grant> {
+        match self {
+            Verdict::Allow(grant) => Some(grant),
+            _ => None,
+        }
+    }
+}
+
 /// Why a host rule allows a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Grant {
@@ -146,9 +165,9 @@ impl Proxy {
         }
     }
 
-    /// Whether `src` may reach `dst` with `proto` for `host`: the union of the client rules
-    /// whose CIDR contains `src` and the rules of `src`'s live session in `view`. Client rules
-    /// win, because they don't end with a session.
+    /// Whether `src` may reach `dst` with `proto` for `host` (and, for HTTP, `path`): the union
+    /// of the client rules whose CIDR contains `src` and the rules of `src`'s live session in
+    /// `view`. Client rules win, because they don't end with a session.
     fn authorise(
         &self,
         view: &SessionView,
@@ -156,20 +175,33 @@ impl Proxy {
         dst: SocketAddr,
         proto: Proto,
         host: &str,
-    ) -> Option<Grant> {
+        path: Option<&str>,
+    ) -> Verdict {
         let src = src.to_canonical();
         let dst = canonical(dst);
-        let allows = |rules: &[Allow]| rules.iter().any(|r| rule_allows(r, dst, proto, host));
-        if self
-            .clients
-            .iter()
-            .any(|(cidr, rules)| cidr.contains(src) && allows(rules))
-        {
-            return Some(Grant::Client);
+        let mut path_denied = false;
+        let mut allows = |rules: &[Allow]| match rules_allow(rules, dst, proto, host, path) {
+            Some(true) => true,
+            Some(false) => {
+                path_denied = true;
+                false
+            }
+            None => false,
+        };
+        for (cidr, rules) in &self.clients {
+            if cidr.contains(src) && allows(rules) {
+                return Verdict::Allow(Grant::Client);
+            }
         }
-        match view.get(&src) {
-            Some((id, rules)) if allows(rules) => Some(Grant::Session { ip: src, id: *id }),
-            _ => None,
+        if let Some((id, rules)) = view.get(&src)
+            && allows(rules)
+        {
+            return Verdict::Allow(Grant::Session { ip: src, id: *id });
+        }
+        if path_denied {
+            Verdict::PathDenied
+        } else {
+            Verdict::Deny
         }
     }
 
@@ -195,6 +227,10 @@ impl Proxy {
         let (host, reason) = match hello {
             Err(_) => (None, Some("timeout")),
             Ok(Err(_)) | Ok(Ok(None)) => return,
+            // Anything that doesn't open with a TLS handshake record is taken for HTTP.
+            Ok(Ok(Some(_))) if buf.first() != Some(&sni::CONTENT_HANDSHAKE) => {
+                return http::serve(self, client, peer, dst, buf).await;
+            }
             Ok(Ok(Some(hello))) => match hello {
                 ClientHello::Sni(host) => (Some(host), None),
                 ClientHello::NoSni => (None, Some("no-sni")),
@@ -212,7 +248,9 @@ impl Proxy {
                 dst,
                 Proto::Https,
                 h,
+                None,
             )
+            .grant()
         });
         if grant.is_none() {
             self.log.record(Drop {
@@ -247,14 +285,32 @@ fn is_host_rule(allow: &Allow) -> bool {
     matches!(allow.proto, Proto::Http | Proto::Https)
 }
 
-fn rule_allows(rule: &Allow, dst: SocketAddr, proto: Proto, host: &str) -> bool {
-    rule.proto == proto
-        && rule.dest.iter().any(|d| d.contains(dst.ip()))
-        && rule
-            .effective_ports()
-            .iter()
-            .any(|p| (p.lo..=p.hi).contains(&dst.port()))
-        && rule.hosts.iter().any(|h| h.matches_host(host))
+/// `None` if no rule in `rules` allows `host` at `dst`; otherwise whether one also allows `path`
+/// (always, when `path` is `None`).
+fn rules_allow(
+    rules: &[Allow],
+    dst: SocketAddr,
+    proto: Proto,
+    host: &str,
+    path: Option<&str>,
+) -> Option<bool> {
+    let mut host_allowed = false;
+    let covering = rules.iter().filter(|r| {
+        r.proto == proto
+            && r.dest.iter().any(|d| d.contains(dst.ip()))
+            && r.effective_ports()
+                .iter()
+                .any(|p| (p.lo..=p.hi).contains(&dst.port()))
+    });
+    for pattern in covering.flat_map(|r| &r.hosts) {
+        if pattern.matches_host(host) {
+            if path.is_none_or(|p| pattern.matches_path(p)) {
+                return Some(true);
+            }
+            host_allowed = true;
+        }
+    }
+    host_allowed.then_some(false)
 }
 
 /// Reads into `buf` until the ClientHello parser has a verdict. `None` if the client closed
@@ -351,13 +407,16 @@ clients:
 ";
 
     fn auth(proxy: &Proxy, view: &SessionView, dst: &str, host: &str) -> Option<Grant> {
-        proxy.authorise(
-            view,
-            SRC.parse().unwrap(),
-            dst.parse().unwrap(),
-            Proto::Https,
-            host,
-        )
+        proxy
+            .authorise(
+                view,
+                SRC.parse().unwrap(),
+                dst.parse().unwrap(),
+                Proto::Https,
+                host,
+                None,
+            )
+            .grant()
     }
 
     #[test]
@@ -379,21 +438,27 @@ clients:
         // An IP rule for the same dest and port doesn't allow a host.
         assert_eq!(auth(&proxy, &view, "192.0.2.3:443", "a.test"), None);
         // Another source, and a v4-mapped one.
-        let other = proxy.authorise(
-            &view,
-            "10.0.1.5".parse().unwrap(),
-            "192.0.2.1:443".parse().unwrap(),
-            Proto::Https,
-            "a.test",
-        );
+        let other = proxy
+            .authorise(
+                &view,
+                "10.0.1.5".parse().unwrap(),
+                "192.0.2.1:443".parse().unwrap(),
+                Proto::Https,
+                "a.test",
+                None,
+            )
+            .grant();
         assert_eq!(other, None);
-        let mapped = proxy.authorise(
-            &view,
-            "::ffff:10.0.0.5".parse().unwrap(),
-            "[::ffff:192.0.2.1]:443".parse().unwrap(),
-            Proto::Https,
-            "a.test",
-        );
+        let mapped = proxy
+            .authorise(
+                &view,
+                "::ffff:10.0.0.5".parse().unwrap(),
+                "[::ffff:192.0.2.1]:443".parse().unwrap(),
+                Proto::Https,
+                "a.test",
+                None,
+            )
+            .grant();
         assert_eq!(mapped, Some(Grant::Client));
     }
 
@@ -435,24 +500,62 @@ clients:
         );
     }
 
+    #[test]
+    fn http_rules_check_the_path() {
+        let proxy = Proxy::new(
+            &policy(
+                "clients:\n  - cidr: 10.0.0.0/24\n    allow:\n      - { dest: [192.0.2.1/32], proto: http, hosts: [a.test/pub, b.test] }\n",
+            ),
+            idle_view(),
+            Mode::Enforcing,
+        );
+        let view = SessionView::new();
+        let check = |host: &str, path: &str| {
+            proxy.authorise(
+                &view,
+                SRC.parse().unwrap(),
+                "192.0.2.1:80".parse().unwrap(),
+                Proto::Http,
+                host,
+                Some(path),
+            )
+        };
+        assert_eq!(check("a.test", "/pub/x"), Verdict::Allow(Grant::Client));
+        assert_eq!(check("b.test", "/anything"), Verdict::Allow(Grant::Client));
+        assert_eq!(check("a.test", "/private"), Verdict::PathDenied);
+        assert_eq!(check("c.test", "/pub"), Verdict::Deny);
+    }
+
     // Flows over loopback: the test plays nftables by handing `handle` the upstream listener's
     // address as the original destination.
 
-    struct Harness {
+    pub(super) struct Harness {
         proxy: Arc<Proxy>,
-        upstream: TcpListener,
-        sessions: Option<watch::Sender<Arc<SessionView>>>,
+        pub(super) upstream: TcpListener,
+        pub(super) sessions: Option<watch::Sender<Arc<SessionView>>>,
     }
 
     async fn harness(mode: Mode, session: bool) -> Harness {
-        // SO_REUSEPORT lets a test hold the port once the listener is gone (see `upstream_failure_is_reset`).
+        harness_for(mode, session, "https", "ok.test").await
+    }
+
+    /// A proxy whose client (or, with `session`, session) rule allows `proto` to `hosts` on the
+    /// upstream listener.
+    pub(super) async fn harness_for(
+        mode: Mode,
+        session: bool,
+        proto: &str,
+        hosts: &str,
+    ) -> Harness {
+        // SO_REUSEPORT lets a test hold the port once the listener is gone (see
+        // `upstream_failure_is_reset`).
         let socket = TcpSocket::new_v4().unwrap();
         socket.set_reuseport(true).unwrap();
         socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let upstream = socket.listen(16).unwrap();
         let port = upstream.local_addr().unwrap().port();
         let rule = format!(
-            "      - {{ dest: [127.0.0.1/32], proto: https, ports: [{port}], hosts: [ok.test] }}\n"
+            "      - {{ dest: [127.0.0.1/32], proto: {proto}, ports: [{port}], hosts: [{hosts}] }}\n"
         );
         let (tx, rx) = watch::channel(Arc::new(SessionView::new()));
         let yaml = if session {
@@ -474,7 +577,7 @@ clients:
 
     impl Harness {
         /// Connects a client through the proxy to the upstream listener.
-        async fn connect(&self) -> TcpStream {
+        pub(super) async fn connect(&self) -> TcpStream {
             let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = TcpStream::connect(front.local_addr().unwrap())
                 .await
@@ -487,7 +590,7 @@ clients:
         }
     }
 
-    async fn assert_reset(client: &mut TcpStream) {
+    pub(super) async fn assert_reset(client: &mut TcpStream) {
         let mut buf = [0; 16];
         let err = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
             .await
