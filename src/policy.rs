@@ -145,6 +145,15 @@ impl HostPattern {
             return true;
         };
         let path = path.split_once('?').map_or(path, |(p, _)| p);
+        // The upstream may resolve dot segments (even percent-encoded) or treat a backslash as a
+        // separator, climbing out of the prefix after it matched here.
+        let climbs = path.split('/').any(|segment| {
+            let segment = segment.to_ascii_lowercase().replace("%2e", ".");
+            segment == "." || segment == ".." || segment.contains('\\')
+        });
+        if climbs {
+            return false;
+        }
         let prefix = format!("{}/", prefix.trim_end_matches('/'));
         format!("{path}/").starts_with(&prefix)
     }
@@ -756,6 +765,19 @@ mod tests {
         for path in ["/a/bc", "/a", "/", "/a/bc?/a/b/", "/x/a/b"] {
             assert!(!p.matches_path(path), "{path}");
         }
+        // Dot segments (plain or percent-encoded) and backslashes could climb out of the prefix
+        // at the upstream, so they never match.
+        for path in [
+            "/a/b/../c",
+            "/a/b/..",
+            "/a/b/%2e%2E/c",
+            "/a/b/.%2e",
+            "/a/b/./c",
+            "/a/b/..\\c",
+        ] {
+            assert!(!p.matches_path(path), "{path}");
+        }
+        assert!(p.matches_path("/a/b/..x/c"));
         let any = pattern("a.com");
         for path in ["/", "/anything", "/x?y"] {
             assert!(any.matches_path(path), "{path}");

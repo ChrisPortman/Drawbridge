@@ -75,12 +75,14 @@ pub(super) async fn serve(
 
     let reset = Arc::new(AtomicBool::new(false));
     let answering = Arc::new(AtomicBool::new(false));
+    let idle = Arc::new(AtomicBool::new(false));
     let io = Io {
         head,
         pos: 0,
         stream: client,
         reset: reset.clone(),
         answering: answering.clone(),
+        idle: idle.clone(),
         upgraded: false,
     };
     let conn = Arc::new(Conn {
@@ -108,7 +110,13 @@ pub(super) async fn serve(
     let ended = session_ended(&conn, proxy.sessions.clone());
     tokio::select! {
         res = &mut served => {
-            if let Err(e) = res {
+            match res {
+                // hyper's header timeout also runs between requests: an idle keep-alive
+                // connection did nothing wrong, so it just closes.
+                Err(e) if e.is_timeout() && idle.load(Ordering::SeqCst) => {
+                    tracing::debug!("proxy: closing idle HTTP connection from {peer}");
+                }
+                Err(e) => {
                 let reason = if e.is_timeout() {
                     "timeout"
                 } else if e.is_parse_too_large() {
@@ -121,6 +129,8 @@ pub(super) async fn serve(
                     proxy.log.record(drop_line(peer, dst, None, None, Some(reason)));
                 }
                 conn.reset.store(true, Ordering::SeqCst);
+                }
+                Ok(()) => {}
             }
         }
         () = conn.denied.notified() => {}
@@ -219,24 +229,16 @@ impl Conn {
         self: Arc<Self>,
         req: Request<Incoming>,
     ) -> Result<Response<Body>, Infallible> {
-        // An absolute-form authority overrides the Host header, as hyper and upstreams read it.
-        let host = match req.uri().authority() {
-            Some(a) => Some(a.as_str().rsplit('@').next().unwrap_or_default().to_owned()),
-            None => req
-                .headers()
-                .get(HOST)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned),
-        };
+        let host = request_host(&req);
         let path = req
             .uri()
             .path_and_query()
             .map_or("/", |p| p.as_str())
             .to_owned();
-        let verdict = match host.as_deref() {
+        let verdict = match &host {
             _ if req.method() == Method::CONNECT => Err("connect"),
-            None => Err("no-host"),
-            Some(host) => {
+            Err(reason) => Err(*reason),
+            Ok(host) => {
                 let view = self.proxy.sessions.borrow().clone();
                 Ok(self.proxy.authorise(
                     &view,
@@ -249,6 +251,7 @@ impl Conn {
             }
         };
         let enforcing = self.proxy.mode == Mode::Enforcing;
+        let host = host.ok();
         match verdict {
             Ok(Verdict::Allow(grant)) => {
                 if let Grant::Session { ip, id } = grant {
@@ -354,6 +357,27 @@ impl Conn {
     }
 }
 
+/// The host a request is for: its absolute-form authority (without userinfo) or its Host header.
+/// A request that names two hosts (two Host headers, or an authority that disagrees with the
+/// Host header) is `ambiguous-host`: upstreams differ on which one wins.
+fn request_host(req: &Request<Incoming>) -> Result<String, &'static str> {
+    let mut headers = req.headers().get_all(HOST).iter();
+    let header = match (headers.next(), headers.next()) {
+        (_, Some(_)) => return Err("ambiguous-host"),
+        (Some(v), None) => Some(v.to_str().map_err(|_| "no-host")?),
+        (None, None) => None,
+    };
+    let authority = req
+        .uri()
+        .authority()
+        .map(|a| a.as_str().rsplit('@').next().unwrap_or_default());
+    match (authority, header) {
+        (Some(a), Some(h)) if !a.eq_ignore_ascii_case(h) => Err("ambiguous-host"),
+        (Some(host), _) | (None, Some(host)) => Ok(host.to_owned()),
+        (None, None) => Err("no-host"),
+    }
+}
+
 /// `404 Not Found`, closing the connection if the request asked to.
 fn not_found(req: &Request<Incoming>) -> Response<Body> {
     let mut resp = Response::new(Empty::new().map_err(|e| match e {}).boxed());
@@ -376,6 +400,9 @@ struct Io {
     stream: TcpStream,
     reset: Arc<AtomicBool>,
     answering: Arc<AtomicBool>,
+    /// Set when a response head goes out, cleared when the client sends more: whether the
+    /// connection is waiting for a next request that hasn't started.
+    idle: Arc<AtomicBool>,
     /// Whether a `101 Switching Protocols` went out.
     upgraded: bool,
 }
@@ -402,7 +429,12 @@ impl AsyncRead for Io {
             self.pos += n;
             return Poll::Ready(Ok(()));
         }
-        Pin::new(&mut self.stream).poll_read(cx, buf)
+        let filled = buf.filled().len();
+        let polled = Pin::new(&mut self.stream).poll_read(cx, buf);
+        if buf.filled().len() > filled {
+            self.idle.store(false, Ordering::SeqCst);
+        }
+        polled
     }
 }
 
@@ -422,6 +454,7 @@ impl AsyncWrite for Io {
                 return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
             }
             self.upgraded = buf[8..].starts_with(b" 101 ");
+            self.idle.store(true, Ordering::SeqCst);
         }
         Pin::new(&mut self.stream).poll_write(cx, buf)
     }
@@ -549,6 +582,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_idle_keep_alive_connection_is_closed_without_a_reset() {
+        // hyper's header timeout also runs while waiting for the next request; an idle client
+        // did nothing wrong, so it gets a FIN, not a RST.
+        let h = http(Mode::Enforcing).await;
+        let mut client = h.connect().await;
+        client
+            .write_all(b"GET /private HTTP/1.1\r\nhost: ok.test\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_response(&mut client).await.starts_with("HTTP/1.1 404"));
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest))
+            .await
+            .expect("not closed in time")
+            .expect("closed with a reset");
+        assert!(rest.is_empty());
+    }
+
+    #[tokio::test]
     async fn denied_path_with_connection_close_closes() {
         let h = http(Mode::Enforcing).await;
         let mut client = h.connect().await;
@@ -597,6 +649,19 @@ mod tests {
         let mut client = h.connect().await;
         client.write_all(req).await.unwrap();
         assert_reset(&mut client).await;
+    }
+
+    #[tokio::test]
+    async fn a_second_host_header_is_reset() {
+        // Upstreams disagree on which of two Host headers wins.
+        assert_request_reset(b"GET /pub HTTP/1.1\r\nhost: ok.test\r\nhost: nope.test\r\n\r\n")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn an_authority_that_differs_from_the_host_header_is_reset() {
+        // An upstream that ignores the absolute form would route by the Host header.
+        assert_request_reset(b"GET http://ok.test/pub HTTP/1.1\r\nhost: nope.test\r\n\r\n").await;
     }
 
     #[tokio::test]
