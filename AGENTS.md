@@ -37,10 +37,10 @@ behaviour and are background; where an open issue conflicts with one, the issue 
 | `src/cli/client.rs` | `client` implementations: `init` writes `client.yaml` and the user unit; `login`/`logout` only start/stop it through `systemctl --user`; `service` (what the unit runs) logs in through the loopback handoff, refreshes, and ends the session on SIGTERM. |
 | `src/cli/client/*.rs` | `unit` (pure: unit file, XDG paths, `systemctl show` parsing, timing), `notify` (`sd_notify`), `api` (the service's portal client), `loopback` (the 127.0.0.1 listener). |
 | `src/policy.rs` | Serde YAML schema (`clients`, `users`), `Policy::load`/`parse`/`validate`. Shared by every other module. |
-| `src/firewall.rs` | `Ruleset` → `rustables` batch; `apply` / `update_sessions` / `teardown`. Builds what touches the kernel. |
+| `src/firewall.rs` | `Firewall` handle on the `nft` binary: async `apply` / `update_sessions` / `teardown` / `check_version` / `probe`; `FirewallError` (wraps `NftError`, plus `DropLog`, `UnsupportedVersion`, `UnparseableVersion`). |
 | `src/firewall/ruleset.rs` | Pure `Policy` → `Ruleset` IR, including portal rules, `SessionRules`, `Mode` and the drop log's `LogSet`s; `Display` renders nft-style text (used by `check`). |
-| `src/firewall/netlink.rs` | Sends finalized batches with buffers sized to the batch, and parses the kernel's acks. |
-| `src/firewall/nfraw.rs` | Hand-encoded nf_tables messages for the drop log's sets and rules (which rustables can't express), spliced into the rustables batch. |
+| `src/firewall/json.rs` | Pure `Ruleset` / `SessionRules` → `nft -j` documents (`nftables` crate serde types): the apply, session update and teardown batches. |
+| `src/firewall/nft.rs` | Runs `nft` (`-j -f -`, `-c` dry runs, `--version`) with a 30s timeout; version parsing (floor 0.9.3) and stderr → `NftError` classification. |
 | `src/session.rs` | `SessionTable` state machine (login, extend, refresh leases, logout, expire, rebuild on failure) behind an `Enforcer` trait; `spawn` runs it as the single task that changes sessions. |
 | `src/portal.rs` | `Prepared` (TLS, OIDC discovery, listener binds) and `Servers` (serve, graceful shutdown); Axum router: `/`, `/login`, `/callback`, `/api/session` (GET, DELETE), `/api/session/refresh`, `/api/cli/token`; cookies, the bounded pending-login and CLI-grant stores, security headers. Re-exports `OidcConfig` and `Secret` from `oidc`, and the wire types from `api`. |
 | `src/portal/api.rs` | JSON API types and constants shared by the portal and the client service. |
@@ -48,11 +48,11 @@ behaviour and are background; where an open issue conflicts with one, the issue 
 | `src/portal/*.html` | Confirmation page (inline JS refreshes, falling back to silent re-auth) and message template, embedded with `include_str!`. |
 | `examples/policy.yaml` | Example policy, used by unit tests. |
 | `tests/data/example.nft` | Golden `check` output for the example policy. |
+| `tests/data/example.json` | Golden `json::apply` document for the example policy. |
 | `tests/data/example.kernel.nft` | Golden `nft list` output (counters stripped) after applying the example policy. |
 | `tests/data/sessions.kernel.nft` | Golden `nft list` output after adding and replacing sessions incrementally. |
 | `tests/data/portal-test.{crt,key}` | Self-signed (not CA) certificate for 127.0.0.1; the client's certificate-check tests serve it. Test-only. |
-| `tests/data/drop_log.netlink.hex` | What `nft --debug=mnl` sends for the drop log's sets and rules; `nfraw` must match it byte for byte. |
-| `tests/kernel.rs` | `#[ignore]`d tests against a real kernel (needs CAP_NET_ADMIN): example golden, permissive mode, 5,000-rule policy, session add/replace/remove golden, 200-session churn. |
+| `tests/kernel.rs` | `#[ignore]`d tests against a real kernel (needs CAP_NET_ADMIN and `nft`): example golden, `example.json` loaded with `nft`, permissive mode, 5,000-rule policy, session add/replace/remove golden, 200-session churn. |
 | `e2e/` | Docker Compose end-to-end stack (`run.sh`, `compose.yaml`, `Dockerfile`, `policy.yaml`, `dex.yaml`, `systemctl-stub`). |
 
 ## Commands
@@ -111,9 +111,9 @@ Keep these unless the user changes them:
     followed by a miss rule `<key> != @set counter` that counts new keys the limit or a full set
     kept out of the log. The inverted lookup is needed because a dynset `add` of an existing key
     still matches. Logging can lose lines, never verdicts, because the default action is a
-    separate rule. The sets and the whole contents of both log chains are built by `nfraw`, not
-    rustables. A kernel rejection of those messages is reported as `FirewallError::DropLog`,
-    naming the logging modules.
+    separate rule. When the kernel rejects an apply, `Firewall::apply` retries it as an `nft -c`
+    dry run without the drop log; if that passes, the error is `FirewallError::DropLog`, naming
+    the logging modules. Session updates skip that check.
   - Session ids are nonzero `u32`s that start at a random value each run, so connections marked by
     a previous run can't match a new session.
   - A session change is one batch: add new session chains, flush `sessions` and `session_flows`
@@ -130,15 +130,15 @@ Keep these unless the user changes them:
   unauthenticated users can log in. The OIDC provider is *not* exempt: allow it with a normal
   `clients` rule.
 - **Apply is atomic.** One batch does add table, delete table, then rebuilds everything. A restart
-  therefore replaces leftover state. A batch the kernel rejects changes nothing. After a timeout or
-  lost acks (`NetlinkError::Timeout` / `AcksLost`), the batch may already be live. Either way `run`
+  therefore replaces leftover state. A batch the kernel rejects changes nothing. After `nft` times
+  out and is killed (`NftError::Timeout`), the batch may already be live. Either way `run`
   must not tear down after a failed apply: at worst that leaves the new rules enforcing.
 - **One instance at a time.** `run` and `teardown` hold an exclusive lock on `--lock-file`
   (`DRAWBRIDGE_LOCK_FILE`, default `/run/drawbridge.lock`); `check` takes none.
 - **The external interface must exist at startup.** `run` refuses to start otherwise, because rules
   for a misnamed interface match nothing. Names are limited to 1–15 characters from
   `[A-Za-z0-9_.-]`.
-- **Shutdown is fail-open.** It deletes the table. `teardown` reports a missing table as success.
+- **Shutdown is fail-open.** It deletes the table. Teardown is one add-table, delete-table batch, so it succeeds whether or not the table exists (and can't tell which).
 - **Permissive mode** (`--permissive`, `DRAWBRIDGE_PERMISSIVE`) changes only the default action
   and the log prefix. Sessions, the portal and the drop log work as in enforcing mode, so it shows
   exactly what enforcing would drop. `run` warns at startup when it is on. Connections it lets
@@ -191,29 +191,25 @@ Keep these unless the user changes them:
   their signatures name). Everything else is `pub(crate)`. Callers outside a top-level module use
   its re-exports or its `pub` child modules (only `firewall::ruleset`), not its private children.
 - If you change rule generation or rendering, update `tests/data/example.nft`,
-  `tests/data/example.kernel.nft` and the e2e checks to match.
+  `tests/data/example.json`, `tests/data/example.kernel.nft` and the e2e checks to match.
 
-## rustables notes (v0.9)
+## nft notes
 
-The docs are sparse, so read the source in `~/.cargo/registry/src/*/rustables-0.9.0/src/`. Known quirks:
+Drawbridge drives nftables only through the `nft` binary (nftables >= 0.9.3), feeding it JSON built
+with the `nftables` crate's types. ADR `docs/decisions/0003-replace-rustables-with-nftables.md`
+records why.
 
-- **Don't use `Batch::send`.** It uses default socket buffers. Batches over roughly 220 rules then
-  fail: either with `EMSGSIZE` before the send, or with `ENOBUFS` *after* the kernel has committed
-  them. Build with rustables, then send `batch.finalize()` through `netlink::send_batch`.
-- Its own netlink errors (`QueryError::NetlinkError`) report errno as a positive value. Our
-  `NetlinkError::Kernel` stores the positive errno too.
-- `Rule::established()` matches only ESTABLISHED. Use `firewall::established_or_related` instead.
-- There is no port-range helper. Ranges are a transport `Payload` followed by `Cmp Gte` and
-  `Cmp Lte`, with big-endian bytes.
-- `Rule::icmp()` is IPv4-only. ICMPv6 needs `Meta L4Proto` plus `IPPROTO_ICMPV6`.
-- It has no `dynset` or `limit` expression, names only the four 128-bit registers (so it can't
-  build concatenated keys), and its raw-expression type can't be built outside the crate. Sets
-  have no `NFTA_SET_DESC` (size) either. That's why `nfraw` exists. To change what it encodes,
-  write the nft equivalent, capture it with `nft --debug=mnl` (e.g. in the e2e image with
-  `--cap-add NET_ADMIN`), update `tests/data/drop_log.netlink.hex` and match it.
-- The build runs bindgen, so libclang must be installed (`libclang-dev` in the Docker builder).
-- rustables is licensed **GPL-3.0-or-later**. Drawbridge's own source is `MIT OR Apache-2.0`
-  (`LICENSE-MIT`, `LICENSE-APACHE`); the GPL reaches only distributed binaries, through rustables.
+- `--nft-path` (default `/usr/sbin/nft`) must be absolute; nft is never looked up in `PATH`.
+  Every `server` command, `check` included, runs the version check unless
+  `--nft-skip-version-check` is set, so `cargo run -- server check` needs nft installed.
+- `CAP_NET_ADMIN` must survive the exec: root, or systemd `AmbientCapabilities=CAP_NET_ADMIN`.
+  File capabilities on `drawbridge` alone don't reach `nft`; that's unsupported.
+- Keep the JSON within what 0.9.3 parses. Log sets carry `flags: timeout` only: nft adds
+  `dynamic` itself from the rule's `add @set`, and 0.9.3 rejects it in JSON.
+- nft 0.9.3 lists those sets without a `flags dynamic,timeout` line, so the `*.kernel.nft`
+  goldens assume a newer nft (the e2e image's).
+- Licensing: Drawbridge is `MIT OR Apache-2.0` (`LICENSE-MIT`, `LICENSE-APACHE`), and so is the
+  `nftables` crate. rustables, the one GPL dependency, is gone; nft runs as a separate program.
 
 ## Conventions
 

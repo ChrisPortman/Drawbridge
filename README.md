@@ -151,13 +151,19 @@ This section covers deploying, configuring and operating a Drawbridge gateway. I
 - A dedicated, statically addressed client interface, e.g. WireGuard `wg0`.
 - IP forwarding enabled if clients reach networks behind the gateway
   (`net.ipv4.ip_forward=1`, `net.ipv6.conf.all.forwarding=1`).
-- `CAP_NET_ADMIN` for Drawbridge. Add `CAP_NET_BIND_SERVICE` if the portal listens on a port
-  below 1024.
+- `nft`, from nftables 0.9.3 or newer, at `/usr/sbin/nft` or the absolute path given with
+  `--nft-path` (`DRAWBRIDGE_NFT_PATH`); it is never looked up in `PATH`. Every `server` command
+  checks `nft --version` first, including `check`. If a newer nft prints its version in a form
+  Drawbridge can't parse, `--nft-skip-version-check` (`DRAWBRIDGE_NFT_SKIP_VERSION_CHECK`) logs it
+  instead.
+- `CAP_NET_ADMIN`, in a form that survives the exec of `nft`: run as root, or under systemd with
+  `AmbientCapabilities=CAP_NET_ADMIN` (as in the unit below). File capabilities on the
+  `drawbridge` binary alone are not supported, because they don't pass to `nft`. Add
+  `CAP_NET_BIND_SERVICE` if the portal listens on a port below 1024.
 - The kernel modules for the [dropped-traffic log](#dropped-traffic-log): `nft_log`,
   `nf_log_syslog` (`nf_log_ipv4` and `nf_log_ipv6` before Linux 5.12) and `nft_limit`. Distribution
   kernels load them on demand. On hosts that disable module loading, load them at boot, or `run`
   fails with "the kernel rejected the drop log".
-- Optionally, the `nft` command-line tool, to inspect what Drawbridge installed.
 
 **For user logins (the portal)**
 
@@ -170,9 +176,9 @@ The gateway's commands are under `drawbridge server`:
 
 | Command | Purpose |
 |---|---|
-| `drawbridge server check` | Validate a policy and print the ruleset `run` would install. It needs no privileges and doesn't touch the kernel. |
+| `drawbridge server check` | Validate a policy and print the ruleset `run` would install. It needs no privileges and doesn't touch the kernel, but runs the `nft` version check. |
 | `drawbridge server run` | Install the rules, serve the portal, and wait for SIGINT/SIGTERM; then remove the rules. |
-| `drawbridge server teardown` | Remove Drawbridge's nftables table, e.g. after a crash. A missing table counts as success. |
+| `drawbridge server teardown` | Remove Drawbridge's nftables table, e.g. after a crash. It succeeds whether or not the table exists. |
 
 `drawbridge client init`, `login` and `logout` are for users' machines; see
 [From the command line](#from-the-command-line-linux-with-systemd).
@@ -806,15 +812,11 @@ flowchart TD
 ### Build requirements
 
 - Rust 1.89 or newer.
-- libclang (`libclang-dev` on Debian/Ubuntu), used by the nftables bindings at build time.
-
-Drawbridge links [rustables](https://crates.io/crates/rustables), which is licensed
-GPL-3.0-or-later, so distributed binaries are subject to its terms (see [License](#license)).
 
 ### Installing
 
 ```sh
-sudo apt-get install -y build-essential libclang-dev    # Debian/Ubuntu build dependencies
+sudo apt-get install -y build-essential nftables    # Debian/Ubuntu: compiler, and nft to run
 cargo build --release
 sudo install -m 0755 target/release/drawbridge /usr/local/bin/drawbridge
 drawbridge --version
@@ -878,10 +880,6 @@ The Drawbridge source is licensed under either of
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
 
 at your option.
-
-Built binaries statically link [rustables](https://crates.io/crates/rustables), which is licensed
-GPL-3.0-or-later. A distributed `drawbridge` binary is therefore subject, as a whole, to the terms
-of GPL-3.0-or-later, including the obligation to provide its corresponding source.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
 the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
