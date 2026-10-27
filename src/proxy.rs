@@ -8,10 +8,11 @@ mod droplog;
 mod http;
 pub(crate) mod sni;
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ipnetwork::IpNetwork;
@@ -30,13 +31,28 @@ use sni::ClientHello;
 /// How long a client has to send its ClientHello, and the proxy to connect upstream.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The listener's accept backlog.
+const LISTEN_BACKLOG: u32 = 1024;
+
+/// How long to wait before accepting again after an accept failed (out of file descriptors,
+/// say), so a persistent failure doesn't spin.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+
+/// The most connections the proxy serves at once. Each takes two file descriptors (client and
+/// upstream), so the process's `LimitNOFILE` must leave room for them and the portal.
+const MAX_CONNECTIONS: usize = 4096;
+
+/// The most connections the proxy serves at once from one source address, so one client can't
+/// take every slot.
+const MAX_PER_SOURCE: usize = 256;
+
 /// Binds the proxy's dual-stack listener on `[::]:<port>` (`IPV6_V6ONLY=0`).
 pub(crate) fn bind(port: u16) -> io::Result<TcpListener> {
     let socket = TcpSocket::new_v6()?;
     setsockopt(&socket, sockopt::Ipv6V6Only, &false)?;
     socket.set_reuseaddr(true)?;
     socket.bind(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port))?;
-    socket.listen(1024)
+    socket.listen(LISTEN_BACKLOG)
 }
 
 /// Everything the proxy needs; [`ProxyConfig::run`] serves it.
@@ -71,11 +87,11 @@ impl ProxyConfig {
                     Ok((stream, peer)) => {
                         let orig = original_dst(&stream, peer);
                         let local = stream.local_addr().ok();
-                        conns.spawn(proxy.clone().handle(stream, peer, orig, local));
+                        conns.spawn(proxy.clone().admit(stream, peer, orig, local));
                     }
                     Err(e) => {
                         tracing::warn!("proxy accept failed: {e}");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        tokio::time::sleep(ACCEPT_RETRY).await;
                     }
                 },
                 Some(_) = conns.join_next() => {}
@@ -143,6 +159,63 @@ struct Proxy {
     mode: Mode,
     log: DropLog,
     timeout: Duration,
+    limits: Arc<Limits>,
+}
+
+/// Counts the connections the proxy serves, in total and per source address.
+struct Limits {
+    total: usize,
+    per_source: usize,
+    open: Mutex<(usize, HashMap<IpAddr, usize>)>,
+}
+
+/// One connection's slot in [`Limits`], released on drop.
+struct Slot {
+    limits: Arc<Limits>,
+    src: IpAddr,
+}
+
+impl Limits {
+    fn new(total: usize, per_source: usize) -> Self {
+        Limits {
+            total,
+            per_source,
+            open: Mutex::new((0, HashMap::new())),
+        }
+    }
+
+    /// A slot for a connection from `src`, or `None` when it would go over either limit.
+    fn acquire(limits: &Arc<Limits>, src: IpAddr) -> Option<Slot> {
+        let mut open = limits.open.lock().unwrap_or_else(|e| e.into_inner());
+        let (total, by_source) = &mut *open;
+        let from_src = by_source.entry(src).or_default();
+        if *total >= limits.total || *from_src >= limits.per_source {
+            if *from_src == 0 {
+                by_source.remove(&src);
+            }
+            return None;
+        }
+        *total += 1;
+        *from_src += 1;
+        Some(Slot {
+            limits: limits.clone(),
+            src,
+        })
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut open = self.limits.open.lock().unwrap_or_else(|e| e.into_inner());
+        let (total, by_source) = &mut *open;
+        *total -= 1;
+        if let Some(n) = by_source.get_mut(&self.src) {
+            *n -= 1;
+            if *n == 0 {
+                by_source.remove(&self.src);
+            }
+        }
+    }
 }
 
 impl Proxy {
@@ -162,6 +235,7 @@ impl Proxy {
             mode,
             log: DropLog::new(mode),
             timeout: TIMEOUT,
+            limits: Arc::new(Limits::new(MAX_CONNECTIONS, MAX_PER_SOURCE)),
         }
     }
 
@@ -203,6 +277,32 @@ impl Proxy {
         } else {
             Verdict::Deny
         }
+    }
+
+    /// Serves one accepted connection from `peer` if the connection limits allow it, and resets
+    /// it otherwise. Over the limit is enforced in permissive mode too: it protects the gateway.
+    async fn admit(
+        self: Arc<Self>,
+        client: TcpStream,
+        peer: SocketAddr,
+        orig: Option<SocketAddr>,
+        local: Option<SocketAddr>,
+    ) {
+        let src = peer.ip().to_canonical();
+        let Some(_slot) = Limits::acquire(&self.limits, src) else {
+            if let Some(dst) = orig {
+                self.log.record(Denial {
+                    src,
+                    dst: canonical(dst),
+                    proto: Proto::Tcp,
+                    host: None,
+                    path: None,
+                    reason: Some(DenyReason::Limit),
+                });
+            }
+            return reset(client);
+        };
+        self.handle(client, peer, orig, local).await;
     }
 
     /// Serves one accepted connection from `peer`.
@@ -597,7 +697,7 @@ clients:
             let (stream, peer) = front.accept().await.unwrap();
             let orig = self.upstream.local_addr().ok();
             let local = stream.local_addr().ok();
-            tokio::spawn(self.proxy.clone().handle(stream, peer, orig, local));
+            tokio::spawn(self.proxy.clone().admit(stream, peer, orig, local));
             client
         }
     }
@@ -737,6 +837,33 @@ clients:
             *v = Arc::new(view);
         });
         assert_reset(&mut client).await;
+    }
+
+    #[test]
+    fn limits_cap_connections_globally_and_per_source() {
+        let limits = Arc::new(Limits::new(3, 2));
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        let a1 = Limits::acquire(&limits, a).expect("first from a");
+        let _a2 = Limits::acquire(&limits, a).expect("second from a");
+        assert!(Limits::acquire(&limits, a).is_none(), "over a's limit");
+        let _b1 = Limits::acquire(&limits, b).expect("first from b");
+        assert!(Limits::acquire(&limits, b).is_none(), "over the global limit");
+        drop(a1);
+        assert!(Limits::acquire(&limits, b).is_some(), "a's slot freed");
+    }
+
+    #[tokio::test]
+    async fn over_the_source_limit_is_reset() {
+        let mut h = harness(Mode::Enforcing, false).await;
+        Arc::get_mut(&mut h.proxy).unwrap().limits = Arc::new(Limits::new(16, 1));
+        let mut first = h.connect().await;
+        send_hello(&mut first, Some("ok.test")).await;
+        let (_up, _) = h.upstream.accept().await.unwrap();
+        let mut second = h.connect().await;
+        assert_reset(&mut second).await;
+        // The first is still served.
+        drop(first);
     }
 
     #[tokio::test]
