@@ -182,6 +182,10 @@ pub struct PolicyArgs {
     /// 10.8.0.1:443). Setting this enables the portal; every client may connect to it.
     #[arg(long, env = "DRAWBRIDGE_PORTAL_LISTEN", value_delimiter = ',')]
     pub portal_listen: Vec<SocketAddr>,
+    /// TCP port of the transparent proxy that host rules (`http`, `https`) redirect to. Required
+    /// when the policy has host rules.
+    #[arg(long, env = "DRAWBRIDGE_PROXY_PORT")]
+    pub proxy_port: Option<u16>,
     /// Accept traffic the policy doesn't allow instead of dropping it, logging it as
     /// "drawbridge would-drop". For rolling out onto a gateway already carrying traffic: tune the
     /// policy until nothing you need is logged, then restart without this flag.
