@@ -214,8 +214,9 @@ impl Proxy {
         local: Option<SocketAddr>,
     ) {
         let peer = canonical(peer);
+        let local = local.map(canonical);
         let dst = match orig.map(canonical) {
-            Some(dst) if Some(dst) != local.map(canonical) => dst,
+            Some(dst) if !is_proxy_itself(dst, local) => dst,
             _ => {
                 tracing::debug!("proxy: {peer} has no original destination; resetting");
                 return reset(client);
@@ -279,6 +280,17 @@ impl Proxy {
         };
         splice(client, upstream, &buf, grant, sessions).await;
     }
+}
+
+/// Whether `dst` is the proxy's own listener: its accepted address, or any of the host's own
+/// addresses on its port (the listener is bound to all of them). Connecting there would loop.
+fn is_proxy_itself(dst: SocketAddr, local: Option<SocketAddr>) -> bool {
+    let Some(local) = local else {
+        return true;
+    };
+    // Only a local address can be bound (without IP_FREEBIND).
+    dst == local
+        || (dst.port() == local.port() && std::net::UdpSocket::bind((dst.ip(), 0)).is_ok())
 }
 
 fn is_host_rule(allow: &Allow) -> bool {
@@ -654,6 +666,27 @@ clients:
         let local = stream.local_addr().ok();
         // Aimed at the proxy itself.
         tokio::spawn(h.proxy.clone().handle(stream, peer, local, local));
+        assert_reset(&mut client).await;
+    }
+
+    #[tokio::test]
+    async fn another_local_address_on_the_proxy_port_is_reset() {
+        // A redirected flow aimed at one of the gateway's own addresses on the proxy's port
+        // would loop back into the proxy, even where a rule allows that address.
+        // Listening on every address, as the proxy does.
+        let front = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = front.local_addr().unwrap().port();
+        let rule = format!(
+            "      - {{ dest: [127.0.0.0/8], proto: https, ports: [{port}], hosts: [ok.test] }}\n"
+        );
+        let yaml = format!("clients:\n  - cidr: 127.0.0.0/8\n    allow:\n{rule}");
+        let proxy = Arc::new(Proxy::new(&policy(&yaml), idle_view(), Mode::Enforcing));
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (stream, peer) = front.accept().await.unwrap();
+        let local = stream.local_addr().ok();
+        let orig = Some(SocketAddr::new("127.0.0.2".parse().unwrap(), port));
+        tokio::spawn(proxy.handle(stream, peer, orig, local));
+        send_hello(&mut client, Some("ok.test")).await;
         assert_reset(&mut client).await;
     }
 
