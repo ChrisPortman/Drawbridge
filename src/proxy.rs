@@ -8,10 +8,11 @@ mod droplog;
 mod http;
 pub(crate) mod sni;
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ipnetwork::IpNetwork;
@@ -24,11 +25,26 @@ use tokio::task::JoinSet;
 use crate::firewall::ruleset::Mode;
 use crate::policy::{Allow, Policy, Proto};
 use crate::session::SessionView;
-use droplog::{Drop, DropLog};
+use droplog::{Denial, DenyReason, DropLog};
 use sni::ClientHello;
 
 /// How long a client has to send its ClientHello, and the proxy to connect upstream.
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The listener's accept backlog.
+const LISTEN_BACKLOG: u32 = 1024;
+
+/// How long to wait before accepting again after an accept failed (out of file descriptors,
+/// say), so a persistent failure doesn't spin.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+
+/// The most connections the proxy serves at once. Each takes two file descriptors (client and
+/// upstream), so the process's `LimitNOFILE` must leave room for them and the portal.
+const MAX_CONNECTIONS: usize = 4096;
+
+/// The most connections the proxy serves at once from one source address, so one client can't
+/// take every slot.
+const MAX_PER_SOURCE: usize = 256;
 
 /// Binds the proxy's dual-stack listener on `[::]:<port>` (`IPV6_V6ONLY=0`).
 pub(crate) fn bind(port: u16) -> io::Result<TcpListener> {
@@ -36,7 +52,7 @@ pub(crate) fn bind(port: u16) -> io::Result<TcpListener> {
     setsockopt(&socket, sockopt::Ipv6V6Only, &false)?;
     socket.set_reuseaddr(true)?;
     socket.bind(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port))?;
-    socket.listen(1024)
+    socket.listen(LISTEN_BACKLOG)
 }
 
 /// Everything the proxy needs; [`ProxyConfig::run`] serves it.
@@ -71,11 +87,11 @@ impl ProxyConfig {
                     Ok((stream, peer)) => {
                         let orig = original_dst(&stream, peer);
                         let local = stream.local_addr().ok();
-                        conns.spawn(proxy.clone().handle(stream, peer, orig, local));
+                        conns.spawn(proxy.clone().admit(stream, peer, orig, local));
                     }
                     Err(e) => {
                         tracing::warn!("proxy accept failed: {e}");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        tokio::time::sleep(ACCEPT_RETRY).await;
                     }
                 },
                 Some(_) = conns.join_next() => {}
@@ -122,7 +138,7 @@ impl Verdict {
     fn grant(self) -> Option<Grant> {
         match self {
             Verdict::Allow(grant) => Some(grant),
-            _ => None,
+            Verdict::PathDenied | Verdict::Deny => None,
         }
     }
 }
@@ -143,6 +159,63 @@ struct Proxy {
     mode: Mode,
     log: DropLog,
     timeout: Duration,
+    limits: Arc<Limits>,
+}
+
+/// Counts the connections the proxy serves, in total and per source address.
+struct Limits {
+    total: usize,
+    per_source: usize,
+    open: Mutex<(usize, HashMap<IpAddr, usize>)>,
+}
+
+/// One connection's slot in [`Limits`], released on drop.
+struct Slot {
+    limits: Arc<Limits>,
+    src: IpAddr,
+}
+
+impl Limits {
+    fn new(total: usize, per_source: usize) -> Self {
+        Limits {
+            total,
+            per_source,
+            open: Mutex::new((0, HashMap::new())),
+        }
+    }
+
+    /// A slot for a connection from `src`, or `None` when it would go over either limit.
+    fn acquire(limits: &Arc<Limits>, src: IpAddr) -> Option<Slot> {
+        let mut open = limits.open.lock().unwrap_or_else(|e| e.into_inner());
+        let (total, by_source) = &mut *open;
+        let from_src = by_source.entry(src).or_default();
+        if *total >= limits.total || *from_src >= limits.per_source {
+            if *from_src == 0 {
+                by_source.remove(&src);
+            }
+            return None;
+        }
+        *total += 1;
+        *from_src += 1;
+        Some(Slot {
+            limits: limits.clone(),
+            src,
+        })
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut open = self.limits.open.lock().unwrap_or_else(|e| e.into_inner());
+        let (total, by_source) = &mut *open;
+        *total -= 1;
+        if let Some(n) = by_source.get_mut(&self.src) {
+            *n -= 1;
+            if *n == 0 {
+                by_source.remove(&self.src);
+            }
+        }
+    }
 }
 
 impl Proxy {
@@ -151,7 +224,7 @@ impl Proxy {
             .clients
             .iter()
             .map(|c| {
-                let hosts = c.allow.iter().filter(|a| is_host_rule(a)).cloned();
+                let hosts = c.allow.iter().filter(|a| a.is_host_rule()).cloned();
                 (c.cidr, hosts.collect::<Vec<_>>())
             })
             .filter(|(_, allow)| !allow.is_empty())
@@ -162,6 +235,7 @@ impl Proxy {
             mode,
             log: DropLog::new(mode),
             timeout: TIMEOUT,
+            limits: Arc::new(Limits::new(MAX_CONNECTIONS, MAX_PER_SOURCE)),
         }
     }
 
@@ -193,16 +267,45 @@ impl Proxy {
                 return Verdict::Allow(Grant::Client);
             }
         }
-        if let Some((id, rules)) = view.get(&src)
-            && allows(rules)
+        if let Some(session) = view.get(&src)
+            && allows(&session.host_rules)
         {
-            return Verdict::Allow(Grant::Session { ip: src, id: *id });
+            return Verdict::Allow(Grant::Session {
+                ip: src,
+                id: session.id,
+            });
         }
         if path_denied {
             Verdict::PathDenied
         } else {
             Verdict::Deny
         }
+    }
+
+    /// Serves one accepted connection from `peer` if the connection limits allow it, and resets
+    /// it otherwise. Over the limit is enforced in permissive mode too: it protects the gateway.
+    async fn admit(
+        self: Arc<Self>,
+        client: TcpStream,
+        peer: SocketAddr,
+        orig: Option<SocketAddr>,
+        local: Option<SocketAddr>,
+    ) {
+        let src = peer.ip().to_canonical();
+        let Some(_slot) = Limits::acquire(&self.limits, src) else {
+            if let Some(dst) = orig {
+                self.log.record(Denial {
+                    src,
+                    dst: canonical(dst),
+                    proto: Proto::Tcp,
+                    host: None,
+                    path: None,
+                    reason: Some(DenyReason::Limit),
+                });
+            }
+            return reset(client);
+        };
+        self.handle(client, peer, orig, local).await;
     }
 
     /// Serves one accepted connection from `peer`.
@@ -214,8 +317,9 @@ impl Proxy {
         local: Option<SocketAddr>,
     ) {
         let peer = canonical(peer);
+        let local = local.map(canonical);
         let dst = match orig.map(canonical) {
-            Some(dst) if Some(dst) != local.map(canonical) => dst,
+            Some(dst) if !is_proxy_itself(dst, local) => dst,
             _ => {
                 tracing::debug!("proxy: {peer} has no original destination; resetting");
                 return reset(client);
@@ -225,7 +329,7 @@ impl Proxy {
         let mut buf = Vec::with_capacity(1024);
         let hello = tokio::time::timeout(self.timeout, read_hello(&mut client, &mut buf)).await;
         let (host, reason) = match hello {
-            Err(_) => (None, Some("timeout")),
+            Err(_) => (None, Some(DenyReason::Timeout)),
             Ok(Err(_)) | Ok(Ok(None)) => return,
             // Anything that doesn't open with a TLS handshake record is taken for HTTP.
             Ok(Ok(Some(_))) if buf.first() != Some(&sni::CONTENT_HANDSHAKE) => {
@@ -233,10 +337,12 @@ impl Proxy {
             }
             Ok(Ok(Some(hello))) => match hello {
                 ClientHello::Sni(host) => (Some(host), None),
-                ClientHello::NoSni => (None, Some("no-sni")),
-                ClientHello::Ech => (None, Some("ech")),
-                ClientHello::NotTls => (None, Some("not-tls")),
-                ClientHello::Malformed | ClientHello::NeedMore => (None, Some("malformed")),
+                ClientHello::NoSni => (None, Some(DenyReason::NoSni)),
+                ClientHello::Ech => (None, Some(DenyReason::Ech)),
+                ClientHello::NotTls => (None, Some(DenyReason::NotTls)),
+                ClientHello::Malformed | ClientHello::NeedMore => {
+                    (None, Some(DenyReason::Malformed))
+                }
             },
         };
 
@@ -253,10 +359,10 @@ impl Proxy {
             .grant()
         });
         if grant.is_none() {
-            self.log.record(Drop {
+            self.log.record(Denial {
                 src: peer.ip(),
                 dst,
-                proto: "https",
+                proto: Proto::Https,
                 host,
                 path: None,
                 reason,
@@ -266,23 +372,36 @@ impl Proxy {
             }
         }
 
-        let upstream = match tokio::time::timeout(self.timeout, TcpStream::connect(dst)).await {
-            Ok(Ok(upstream)) => upstream,
-            Ok(Err(e)) => {
-                tracing::debug!("proxy: connecting {peer} to {dst} failed: {e}");
-                return reset(client);
-            }
-            Err(_) => {
-                tracing::debug!("proxy: connecting {peer} to {dst} timed out");
-                return reset(client);
-            }
+        let Some(upstream) = self.connect_upstream(peer, dst).await else {
+            return reset(client);
         };
         splice(client, upstream, &buf, grant, sessions).await;
     }
+
+    /// Connects to `dst` for `peer` within the timeout; failures are logged at debug.
+    async fn connect_upstream(&self, peer: SocketAddr, dst: SocketAddr) -> Option<TcpStream> {
+        match tokio::time::timeout(self.timeout, TcpStream::connect(dst)).await {
+            Ok(Ok(upstream)) => Some(upstream),
+            Ok(Err(e)) => {
+                tracing::debug!("proxy: connecting {peer} to {dst} failed: {e}");
+                None
+            }
+            Err(_) => {
+                tracing::debug!("proxy: connecting {peer} to {dst} timed out");
+                None
+            }
+        }
+    }
 }
 
-fn is_host_rule(allow: &Allow) -> bool {
-    matches!(allow.proto, Proto::Http | Proto::Https)
+/// Whether `dst` is the proxy's own listener: its accepted address, or any of the host's own
+/// addresses on its port (the listener is bound to all of them). Connecting there would loop.
+fn is_proxy_itself(dst: SocketAddr, local: Option<SocketAddr>) -> bool {
+    let Some(local) = local else {
+        return true;
+    };
+    // Only a local address can be bound (without IP_FREEBIND).
+    dst == local || (dst.port() == local.port() && std::net::UdpSocket::bind((dst.ip(), 0)).is_ok())
 }
 
 /// `None` if no rule in `rules` allows `host` at `dst`; otherwise whether one also allows `path`
@@ -347,24 +466,33 @@ async fn splice(
         let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
         return;
     };
-    let session_ended = async {
-        loop {
-            if sessions.changed().await.is_err() {
-                return;
-            }
-            if sessions.borrow_and_update().get(&ip).map(|(i, _)| *i) != Some(id) {
-                return;
-            }
-        }
-    };
     tokio::select! {
         _ = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {}
-        () = session_ended => {
+        () = session_gone(&mut sessions, || Some((ip, id))) => {
             tracing::debug!("proxy: session {id} on {ip} ended; closing its connection");
             reset(upstream);
             reset(client);
         }
     }
+}
+
+/// Resolves once the session `granted` names (when it names one) is no longer in the view:
+/// ended, or replaced by another session on its IP. `granted` is read again at each change.
+///
+/// If the session manager drops its sender (it has stopped, at shutdown), this never resolves:
+/// the proxy is aborted next, which closes every connection anyway.
+async fn session_gone(
+    sessions: &mut watch::Receiver<Arc<SessionView>>,
+    granted: impl Fn() -> Option<(IpAddr, u32)>,
+) {
+    while sessions.changed().await.is_ok() {
+        if let Some((ip, id)) = granted()
+            && sessions.borrow_and_update().get(&ip).map(|s| s.id) != Some(id)
+        {
+            return;
+        }
+    }
+    std::future::pending().await
 }
 
 /// Closes `stream` with a TCP RST.
@@ -377,7 +505,7 @@ fn reset(stream: TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::idle_view;
+    use crate::session::{SessionGrant, idle_view};
 
     const SRC: &str = "10.0.0.5";
 
@@ -469,7 +597,13 @@ clients:
         let ip: IpAddr = SRC.parse().unwrap();
         let mut view = SessionView::new();
         assert_eq!(auth(&proxy, &view, "198.51.100.1:443", "c.test"), None);
-        view.insert(ip, (7, rules.clone()));
+        view.insert(
+            ip,
+            SessionGrant {
+                id: 7,
+                host_rules: rules.clone(),
+            },
+        );
         assert_eq!(
             auth(&proxy, &view, "198.51.100.1:443", "c.test"),
             Some(Grant::Session { ip, id: 7 })
@@ -478,7 +612,13 @@ clients:
             auth(&proxy, &view, "192.0.2.1:443", "a.test"),
             Some(Grant::Client)
         );
-        view.insert(ip, (8, rules));
+        view.insert(
+            ip,
+            SessionGrant {
+                id: 8,
+                host_rules: rules,
+            },
+        );
         assert_eq!(
             auth(&proxy, &view, "198.51.100.1:443", "c.test"),
             Some(Grant::Session { ip, id: 8 })
@@ -560,7 +700,11 @@ clients:
         let (tx, rx) = watch::channel(Arc::new(SessionView::new()));
         let yaml = if session {
             let mut view = SessionView::new();
-            view.insert("127.0.0.1".parse().unwrap(), (5, allow(&rule)));
+            let grant = SessionGrant {
+                id: 5,
+                host_rules: allow(&rule),
+            };
+            view.insert("127.0.0.1".parse().unwrap(), grant);
             tx.send_replace(Arc::new(view));
             String::from("clients: []\n")
         } else {
@@ -578,6 +722,11 @@ clients:
     impl Harness {
         /// Connects a client through the proxy to the upstream listener.
         pub(super) async fn connect(&self) -> TcpStream {
+            self.connect_task().await.0
+        }
+
+        /// [`Harness::connect`], also returning the task serving the connection.
+        pub(super) async fn connect_task(&self) -> (TcpStream, tokio::task::JoinHandle<()>) {
             let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = TcpStream::connect(front.local_addr().unwrap())
                 .await
@@ -585,8 +734,8 @@ clients:
             let (stream, peer) = front.accept().await.unwrap();
             let orig = self.upstream.local_addr().ok();
             let local = stream.local_addr().ok();
-            tokio::spawn(self.proxy.clone().handle(stream, peer, orig, local));
-            client
+            let task = tokio::spawn(self.proxy.clone().admit(stream, peer, orig, local));
+            (client, task)
         }
     }
 
@@ -658,6 +807,27 @@ clients:
     }
 
     #[tokio::test]
+    async fn another_local_address_on_the_proxy_port_is_reset() {
+        // A redirected flow aimed at one of the gateway's own addresses on the proxy's port
+        // would loop back into the proxy, even where a rule allows that address.
+        // Listening on every address, as the proxy does.
+        let front = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = front.local_addr().unwrap().port();
+        let rule = format!(
+            "      - {{ dest: [127.0.0.0/8], proto: https, ports: [{port}], hosts: [ok.test] }}\n"
+        );
+        let yaml = format!("clients:\n  - cidr: 127.0.0.0/8\n    allow:\n{rule}");
+        let proxy = Arc::new(Proxy::new(&policy(&yaml), idle_view(), Mode::Enforcing));
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (stream, peer) = front.accept().await.unwrap();
+        let local = stream.local_addr().ok();
+        let orig = Some(SocketAddr::new("127.0.0.2".parse().unwrap(), port));
+        tokio::spawn(proxy.handle(stream, peer, orig, local));
+        send_hello(&mut client, Some("ok.test")).await;
+        assert_reset(&mut client).await;
+    }
+
+    #[tokio::test]
     async fn upstream_failure_is_reset() {
         let h = harness(Mode::Enforcing, false).await;
         let mut client = h.connect().await;
@@ -700,10 +870,40 @@ clients:
             let mut view = (**v).clone();
             view.get_mut(&"127.0.0.1".parse::<IpAddr>().unwrap())
                 .unwrap()
-                .0 = 6;
+                .id = 6;
             *v = Arc::new(view);
         });
         assert_reset(&mut client).await;
+    }
+
+    #[test]
+    fn limits_cap_connections_globally_and_per_source() {
+        let limits = Arc::new(Limits::new(3, 2));
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        let a1 = Limits::acquire(&limits, a).expect("first from a");
+        let _a2 = Limits::acquire(&limits, a).expect("second from a");
+        assert!(Limits::acquire(&limits, a).is_none(), "over a's limit");
+        let _b1 = Limits::acquire(&limits, b).expect("first from b");
+        assert!(
+            Limits::acquire(&limits, b).is_none(),
+            "over the global limit"
+        );
+        drop(a1);
+        assert!(Limits::acquire(&limits, b).is_some(), "a's slot freed");
+    }
+
+    #[tokio::test]
+    async fn over_the_source_limit_is_reset() {
+        let mut h = harness(Mode::Enforcing, false).await;
+        Arc::get_mut(&mut h.proxy).unwrap().limits = Arc::new(Limits::new(16, 1));
+        let mut first = h.connect().await;
+        send_hello(&mut first, Some("ok.test")).await;
+        let (_up, _) = h.upstream.accept().await.unwrap();
+        let mut second = h.connect().await;
+        assert_reset(&mut second).await;
+        // The first is still served.
+        drop(first);
     }
 
     #[tokio::test]

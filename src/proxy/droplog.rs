@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::firewall::ruleset::Mode;
+use crate::policy::Proto;
 
 /// How long a logged key stays quiet, matching the firewall's drop log.
 pub(crate) const WINDOW: Duration = Duration::from_secs(10);
@@ -17,17 +18,62 @@ const MAX_KEYS: usize = 65_536;
 
 /// One denied (or, in permissive mode, would-be denied) request.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct Drop {
+pub(crate) struct Denial {
     pub(crate) src: IpAddr,
     pub(crate) dst: SocketAddr,
-    /// `http` or `https`.
-    pub(crate) proto: &'static str,
+    /// `http` or `https`, or `tcp` when the proxy refused the connection before reading it.
+    pub(crate) proto: Proto,
     pub(crate) host: Option<String>,
     pub(crate) path: Option<String>,
-    pub(crate) reason: Option<&'static str>,
+    pub(crate) reason: Option<DenyReason>,
 }
 
-impl fmt::Display for Drop {
+/// Why a request was denied, when it is not simply that no rule allows its host or path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DenyReason {
+    /// The client sent no complete ClientHello or request head in time.
+    Timeout,
+    /// A ClientHello without SNI.
+    NoSni,
+    /// A ClientHello with Encrypted Client Hello.
+    Ech,
+    /// A TLS record that is not a handshake.
+    NotTls,
+    /// A ClientHello or request head that doesn't parse.
+    Malformed,
+    /// A request head over the size limit.
+    Oversized,
+    /// HTTP/2 with prior knowledge.
+    H2c,
+    /// An HTTP `CONNECT` request.
+    Connect,
+    /// A request naming no host.
+    NoHost,
+    /// A request naming two hosts.
+    AmbiguousHost,
+    /// Over the proxy's connection limit, globally or for the source.
+    Limit,
+}
+
+impl fmt::Display for DenyReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            DenyReason::Timeout => "timeout",
+            DenyReason::NoSni => "no-sni",
+            DenyReason::Ech => "ech",
+            DenyReason::NotTls => "not-tls",
+            DenyReason::Malformed => "malformed",
+            DenyReason::Oversized => "oversized",
+            DenyReason::H2c => "h2c",
+            DenyReason::Connect => "connect",
+            DenyReason::NoHost => "no-host",
+            DenyReason::AmbiguousHost => "ambiguous-host",
+            DenyReason::Limit => "limit",
+        })
+    }
+}
+
+impl fmt::Display for Denial {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -65,7 +111,7 @@ impl fmt::Display for Escaped<'_> {
     }
 }
 
-/// Logs each distinct [`Drop`] at most once per [`WINDOW`].
+/// Logs each distinct [`Denial`] at most once per [`WINDOW`].
 #[derive(Debug)]
 pub(crate) struct DropLog {
     mode: Mode,
@@ -74,7 +120,7 @@ pub(crate) struct DropLog {
 
 #[derive(Debug)]
 struct State {
-    seen: HashMap<Drop, Instant>,
+    seen: HashMap<Denial, Instant>,
     last_sweep: Instant,
 }
 
@@ -89,16 +135,16 @@ impl DropLog {
         }
     }
 
-    /// Logs `drop` at info unless it was logged within the window.
-    pub(crate) fn record(&self, drop: Drop) {
-        if let Some(line) = self.record_at(drop, Instant::now()) {
+    /// Logs `denial` at info unless it was logged within the window.
+    pub(crate) fn record(&self, denial: Denial) {
+        if let Some(line) = self.record_at(denial, Instant::now()) {
             tracing::info!("{line}");
         }
     }
 
-    /// The line to log for `drop` at `now`, or `None` while its key is within the window.
+    /// The line to log for `denial` at `now`, or `None` while its key is within the window.
     /// Sweeps expired keys at most once per window.
-    fn record_at(&self, drop: Drop, now: Instant) -> Option<String> {
+    fn record_at(&self, denial: Denial, now: Instant) -> Option<String> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if now.saturating_duration_since(state.last_sweep) >= WINDOW {
             state
@@ -106,7 +152,7 @@ impl DropLog {
                 .retain(|_, at| now.saturating_duration_since(*at) < WINDOW);
             state.last_sweep = now;
         }
-        if let Some(at) = state.seen.get(&drop)
+        if let Some(at) = state.seen.get(&denial)
             && now.saturating_duration_since(*at) < WINDOW
         {
             return None;
@@ -116,7 +162,7 @@ impl DropLog {
                 .seen
                 .retain(|_, at| now.saturating_duration_since(*at) < WINDOW);
             if state.seen.len() >= MAX_KEYS {
-                tracing::debug!("proxy drop log full; not logging {drop}");
+                tracing::debug!("proxy drop log full; not logging {denial}");
                 return None;
             }
         }
@@ -124,8 +170,8 @@ impl DropLog {
             Mode::Enforcing => "drawbridge drop: ",
             Mode::Permissive => "drawbridge would-drop: ",
         };
-        let line = format!("{prefix}{drop}");
-        state.seen.insert(drop, now);
+        let line = format!("{prefix}{denial}");
+        state.seen.insert(denial, now);
         Some(line)
     }
 
@@ -139,11 +185,11 @@ impl DropLog {
 mod tests {
     use super::*;
 
-    fn drop(host: Option<&str>) -> Drop {
-        Drop {
+    fn denial(host: Option<&str>) -> Denial {
+        Denial {
             src: "10.0.0.5".parse().unwrap(),
             dst: "192.0.2.1:443".parse().unwrap(),
-            proto: "https",
+            proto: Proto::Https,
             host: host.map(str::to_string),
             path: None,
             reason: None,
@@ -155,13 +201,13 @@ mod tests {
         let log = DropLog::new(Mode::Enforcing);
         let now = Instant::now();
         assert_eq!(
-            log.record_at(drop(Some("example.com")), now).unwrap(),
+            log.record_at(denial(Some("example.com")), now).unwrap(),
             "drawbridge drop: SRC=10.0.0.5 DST=192.0.2.1 PROTO=https DPT=443 HOST=example.com"
         );
-        let mut d = drop(None);
-        d.proto = "http";
+        let mut d = denial(None);
+        d.proto = Proto::Http;
         d.path = Some("/admin".into());
-        d.reason = Some("no-sni");
+        d.reason = Some(DenyReason::NoSni);
         assert_eq!(
             log.record_at(d, now).unwrap(),
             "drawbridge drop: SRC=10.0.0.5 DST=192.0.2.1 PROTO=http DPT=443 HOST=- PATH=/admin REASON=no-sni"
@@ -172,7 +218,7 @@ mod tests {
     fn untrusted_fields_are_escaped() {
         // A Host header or SNI could otherwise forge fields or whole lines.
         let log = DropLog::new(Mode::Enforcing);
-        let mut d = drop(Some("a.test PATH=/x\nforged é"));
+        let mut d = denial(Some("a.test PATH=/x\nforged é"));
         d.path = Some("/p\\q".into());
         assert_eq!(
             log.record_at(d, Instant::now()).unwrap(),
@@ -186,15 +232,15 @@ mod tests {
         let t0 = Instant::now();
         for i in 0..MAX_KEYS {
             assert!(
-                log.record_at(drop(Some(&format!("{i}.test"))), t0)
+                log.record_at(denial(Some(&format!("{i}.test"))), t0)
                     .is_some()
             );
         }
-        assert!(log.record_at(drop(Some("full.test")), t0).is_none());
+        assert!(log.record_at(denial(Some("full.test")), t0).is_none());
         assert_eq!(log.len(), MAX_KEYS);
         // Expired keys make room again.
         assert!(
-            log.record_at(drop(Some("full.test")), t0 + WINDOW)
+            log.record_at(denial(Some("full.test")), t0 + WINDOW)
                 .is_some()
         );
     }
@@ -202,7 +248,7 @@ mod tests {
     #[test]
     fn permissive_prefix() {
         let log = DropLog::new(Mode::Permissive);
-        let line = log.record_at(drop(None), Instant::now()).unwrap();
+        let line = log.record_at(denial(None), Instant::now()).unwrap();
         assert!(line.starts_with("drawbridge would-drop: SRC="), "{line}");
     }
 
@@ -210,26 +256,26 @@ mod tests {
     fn deduplicates_per_key_within_the_window() {
         let log = DropLog::new(Mode::Enforcing);
         let t0 = Instant::now();
-        assert!(log.record_at(drop(Some("a.test")), t0).is_some());
+        assert!(log.record_at(denial(Some("a.test")), t0).is_some());
         assert!(
-            log.record_at(drop(Some("a.test")), t0 + Duration::from_secs(9))
+            log.record_at(denial(Some("a.test")), t0 + Duration::from_secs(9))
                 .is_none()
         );
         assert!(
-            log.record_at(drop(Some("b.test")), t0 + Duration::from_secs(9))
+            log.record_at(denial(Some("b.test")), t0 + Duration::from_secs(9))
                 .is_some()
         );
-        assert!(log.record_at(drop(Some("a.test")), t0 + WINDOW).is_some());
+        assert!(log.record_at(denial(Some("a.test")), t0 + WINDOW).is_some());
     }
 
     #[test]
     fn sweeps_expired_keys() {
         let log = DropLog::new(Mode::Enforcing);
         let t0 = Instant::now();
-        log.record_at(drop(Some("a.test")), t0);
-        log.record_at(drop(Some("b.test")), t0);
+        log.record_at(denial(Some("a.test")), t0);
+        log.record_at(denial(Some("b.test")), t0);
         assert_eq!(log.len(), 2);
-        log.record_at(drop(Some("c.test")), t0 + WINDOW * 2);
+        log.record_at(denial(Some("c.test")), t0 + WINDOW * 2);
         assert_eq!(log.len(), 1);
     }
 }

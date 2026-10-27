@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 
 use crate::firewall::ruleset::{RuleSpec, Ruleset, SessionRules};
 use crate::firewall::{Firewall, FirewallError};
-use crate::policy::{Allow, Policy, Proto};
+use crate::policy::{Allow, Policy};
 use crate::portal::Secret;
 
 /// How long to wait before retrying a failed firewall rebuild.
@@ -169,7 +169,15 @@ pub(crate) struct SessionInfo {
 /// What the host-rule proxy needs to know about live sessions: per source IP, the session id
 /// and the user's host rules (`http` and `https` allows), with `dest` narrowed to the IP's
 /// address family. Rules left with no dest are omitted.
-pub(crate) type SessionView = HashMap<IpAddr, (u32, Arc<[Allow]>)>;
+pub(crate) type SessionView = HashMap<IpAddr, SessionGrant>;
+
+/// One live session in the [`SessionView`].
+#[derive(Debug, Clone)]
+pub(crate) struct SessionGrant {
+    /// The session id, which a replacing session on the same IP changes.
+    pub(crate) id: u32,
+    pub(crate) host_rules: Arc<[Allow]>,
+}
 
 /// A view that never changes, for when no portal (and so no session) runs.
 pub(crate) fn idle_view() -> watch::Receiver<Arc<SessionView>> {
@@ -216,7 +224,13 @@ impl<E: Enforcer> SessionTable<E> {
         let view = self
             .by_ip
             .iter()
-            .map(|(&ip, s)| (ip, (s.rules.id, s.host_rules.clone())))
+            .map(|(&ip, s)| {
+                let grant = SessionGrant {
+                    id: s.rules.id,
+                    host_rules: s.host_rules.clone(),
+                };
+                (ip, grant)
+            })
             .collect();
         self.view.send_replace(Arc::new(view));
     }
@@ -500,7 +514,7 @@ fn host_rules(policy: &Policy, username: &str, ip: IpAddr) -> Arc<[Allow]> {
     };
     user.allow
         .iter()
-        .filter(|a| matches!(a.proto, Proto::Http | Proto::Https))
+        .filter(|a| a.is_host_rule())
         .filter_map(|a| {
             let dest: Vec<_> = a
                 .dest
@@ -1297,8 +1311,8 @@ users:
 
     /// The view's entry for `ip`: session id and each host rule as `dests proto hosts`.
     fn entry(view: &SessionView, ip: IpAddr) -> Option<(u32, Vec<String>)> {
-        let (id, rules) = view.get(&ip)?;
-        let rules = rules
+        let SessionGrant { id, host_rules } = view.get(&ip)?;
+        let rules = host_rules
             .iter()
             .map(|a| {
                 let dests: Vec<_> = a.dest.iter().map(ToString::to_string).collect();

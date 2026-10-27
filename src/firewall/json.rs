@@ -10,7 +10,8 @@ use std::net::{IpAddr, SocketAddr};
 
 use ipnetwork::IpNetwork;
 use nftables::expr::{
-    CT, Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix, Range,
+    CT, Expression, Fib, FibFlag, FibResult, Meta, MetaKey, NamedExpression, Payload, PayloadField,
+    Prefix, Range,
 };
 use nftables::schema::{
     Chain, FlushObject, NfCmd, NfListObject, NfObject, Nftables, Rule, Set, SetFlag, SetType,
@@ -22,10 +23,10 @@ use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
 use super::ruleset::{
     BASE_CHAIN_PRIORITY, BASE_CHAINS, DROP_LOG_CHAIN, DROP_LOG_PORTS_CHAIN, FILTER_CHAIN, Family,
     KeyField, LOG_BURST, LOG_RATE, LOG_SET_SIZE, LOG_SETS, LOG_WINDOW, LogSet, Mode, NAT_CHAIN,
-    PORT_PROTOS, PROXY_REDIRECT_CHAIN, RedirectSpec, RuleSpec, Ruleset, SESSION_FLOWS_CHAIN,
-    SESSIONS_CHAIN, SessionRules, TABLE, session_chain,
+    PORT_PROTOS, PROXY_REDIRECT_CHAIN, RedirectSpec, RuleProto, RuleSpec, Ruleset,
+    SESSION_FLOWS_CHAIN, SESSIONS_CHAIN, SessionRules, TABLE, session_chain,
 };
-use crate::policy::{PortSpec, Proto};
+use crate::policy::PortSpec;
 
 /// The `dstnat` priority of the nat chain, as a number: nft 0.9.3's JSON takes no names.
 const NAT_CHAIN_PRIORITY: i32 = -100;
@@ -54,11 +55,15 @@ pub(crate) fn apply_without_drop_log(ruleset: &Ruleset) -> Nftables<'static> {
     document(cmds)
 }
 
-/// [`apply`] without the nat `prerouting` and `proxy_redirect` chains (the proxy accept in
-/// `client_filter`, which needs only conntrack, stays). If the kernel rejects [`apply`] but
-/// `nft -c` accepts this, the nat modules are missing.
+/// [`apply`] without the transparent proxy's rules: the nat `prerouting` and `proxy_redirect`
+/// chains and the proxy accept in `client_filter`. If the kernel rejects [`apply`] but `nft -c`
+/// accepts this, the nat or fib modules are missing.
 pub(crate) fn apply_without_nat(ruleset: &Ruleset) -> Nftables<'static> {
-    let mut cmds = apply_cmds(ruleset);
+    let without_proxy = Ruleset {
+        proxy_port: None,
+        ..ruleset.clone()
+    };
+    let mut cmds = apply_cmds(&without_proxy);
     cmds.extend(drop_log(ruleset.mode));
     document(cmds)
 }
@@ -248,8 +253,9 @@ fn redirect_rule(spec: &RedirectSpec, proxy_port: u16) -> Vec<Statement<'static>
     rule
 }
 
-/// `meta l4proto tcp th dport P ct status dnat counter accept`: only connections redirected to
-/// the proxy reach it.
+/// `meta l4proto tcp th dport P ct status dnat fib daddr type local counter accept`: only
+/// connections redirected to the proxy reach it. `fib daddr type local` keeps it from accepting
+/// someone else's DNAT to port P (a container's published port, say) in the forward hook.
 fn proxy_accept_rule(proxy_port: u16) -> Vec<Statement<'static>> {
     vec![
         match_eq(meta(MetaKey::L4proto), Expression::Number(IPPROTO_TCP)),
@@ -258,6 +264,13 @@ fn proxy_accept_rule(proxy_port: u16) -> Vec<Statement<'static>> {
             Expression::Number(proxy_port.into()),
         ),
         matches(Operator::IN, ct("status"), string("dnat")),
+        match_eq(
+            Expression::Named(NamedExpression::Fib(Fib {
+                result: FibResult::Type,
+                flags: HashSet::from([FibFlag::Daddr]),
+            })),
+            string("local"),
+        ),
         counter(),
         Statement::Accept(None),
     ]
@@ -417,24 +430,23 @@ fn allow_rule(spec: &RuleSpec) -> Vec<Statement<'static>> {
         match_eq(addr_field(spec.src.ip(), "daddr"), network(spec.dst)),
     ];
     match (spec.proto, spec.ports) {
-        (Proto::Tcp | Proto::Udp, Some(p)) => {
+        (RuleProto::Tcp | RuleProto::Udp, Some(p)) => {
             rule.push(match_eq(
                 payload(&spec.proto.to_string(), "dport"),
                 ports(p),
             ));
         }
-        (Proto::Icmp, _) if !spec.src.is_ipv4() => {
+        (RuleProto::Icmp, _) if !spec.src.is_ipv4() => {
             rule.push(match_eq(
                 meta(MetaKey::L4proto),
                 Expression::Number(IPPROTO_ICMPV6),
             ));
         }
-        (Proto::Tcp | Proto::Udp | Proto::Icmp, _) => {
+        (RuleProto::Tcp | RuleProto::Udp | RuleProto::Icmp, _) => {
             let proto = Expression::Number(l4proto(spec.proto));
             rule.push(match_eq(meta(MetaKey::L4proto), proto));
         }
-        (Proto::Any, _) => {}
-        (Proto::Http | Proto::Https, _) => unreachable!("host rules are not expanded"),
+        (RuleProto::Any, _) => {}
     }
     if let Some(mark) = spec.mark {
         rule.push(set_mark(mark));
@@ -467,13 +479,12 @@ fn ports(p: PortSpec) -> Expression<'static> {
 }
 
 /// The IPv4 protocol number of `proto` (IPv6 ICMP rules use [`IPPROTO_ICMPV6`]).
-fn l4proto(proto: Proto) -> u32 {
+fn l4proto(proto: RuleProto) -> u32 {
     match proto {
-        Proto::Tcp => IPPROTO_TCP,
-        Proto::Udp => IPPROTO_UDP,
-        Proto::Icmp => IPPROTO_ICMP,
-        Proto::Any => unreachable!("`any` matches every protocol"),
-        Proto::Http | Proto::Https => unreachable!("host rules are not expanded"),
+        RuleProto::Tcp => IPPROTO_TCP,
+        RuleProto::Udp => IPPROTO_UDP,
+        RuleProto::Icmp => IPPROTO_ICMP,
+        RuleProto::Any => unreachable!("`any` matches every protocol"),
     }
 }
 
@@ -743,7 +754,8 @@ mod tests {
     // The redirect, `ct status` and nat chain forms follow nftables 0.9.3's src/parser_json.c:
     // json_parse_nat_stmt reads `redirect` as an object with optional `family`, `addr`, `port`
     // and `flags`; json_parse_match_expr maps op "in" to OP_IMPLICIT, the flag test of
-    // `ct status dnat`; json_parse_cmd_add_chain needs an integer `prio` (dstnat is -100).
+    // `ct status dnat`; json_parse_cmd_add_chain needs an integer `prio` (dstnat is -100);
+    // json_parse_fib_expr reads `result` as a name ("type") and `flags` as an array of names.
     #[test]
     fn redirect_rule_v4_without_mark() {
         let spec = redirect("192.168.50.0/24", "10.0.2.0/24", 443, 443, None);
@@ -793,6 +805,8 @@ mod tests {
                 {"match": {"op": "==", "left": {"payload": {"protocol": "th", "field": "dport"}},
                     "right": 3128}},
                 {"match": {"op": "in", "left": {"ct": {"key": "status"}}, "right": "dnat"}},
+                {"match": {"op": "==", "left": {"fib": {"result": "type", "flags": ["daddr"]}},
+                    "right": "local"}},
                 counter,
                 {"accept": null},
             ])
@@ -869,8 +883,15 @@ mod tests {
             name == "prerouting" || name == "proxy_redirect"
         };
         assert!(full.iter().any(is_nat));
-        let kept: Vec<_> = full.into_iter().filter(|c| !is_nat(c)).collect();
+        let mut kept: Vec<_> = full.into_iter().filter(|c| !is_nat(c)).collect();
+        // The proxy accept needs nft_fib, so one client_filter rule goes too.
+        let rule = ("add".into(), "rule".into(), "client_filter".into());
+        let at = kept.iter().position(|c| *c == rule).unwrap();
+        kept.remove(at);
         assert_eq!(kept, reduced);
+        let accept = rule_value(proxy_accept_rule(3128));
+        assert!(rules_in(&apply(&ruleset), "client_filter").contains(&accept));
+        assert!(!rules_in(&apply_without_nat(&ruleset), "client_filter").contains(&accept));
     }
 
     #[test]

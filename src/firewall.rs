@@ -25,8 +25,8 @@ pub enum FirewallError {
     )]
     DropLog { stderr: String },
     #[error(
-        "the kernel rejected the transparent proxy's nat rules; check that the nft_redir, nft_nat \
-         and nf_conntrack modules are available (built in, or loadable): {stderr}"
+        "the kernel rejected the transparent proxy's rules; check that the nft_redir, nft_nat, \
+         nft_fib_inet and nf_conntrack modules are available (built in, or loadable): {stderr}"
     )]
     Proxy { stderr: String },
     #[error("nft at {} is v{found}; Drawbridge needs nftables >= {MIN_VERSION}", path.display())]
@@ -78,7 +78,7 @@ impl Firewall {
 
     /// Atomically replaces the gateway table with one implementing `ruleset`. If the kernel
     /// rejects it but accepts the same batch without the drop log, reports
-    /// [`FirewallError::DropLog`]; failing that, if it accepts the batch without the nat chains,
+    /// [`FirewallError::DropLog`]; failing that, if it accepts the batch without the proxy's rules,
     /// [`FirewallError::Proxy`]. Each dry run leaves out one part only, so a kernel missing both
     /// sets of modules gets the plain rejection.
     pub async fn apply(&self, ruleset: &Ruleset) -> Result<(), FirewallError> {

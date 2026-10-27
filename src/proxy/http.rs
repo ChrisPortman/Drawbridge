@@ -22,14 +22,13 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{Notify, watch};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use super::droplog::Drop;
+use super::droplog::{Denial, DenyReason};
 use super::{Grant, Proxy, Verdict};
 use crate::firewall::ruleset::Mode;
 use crate::policy::Proto;
-use crate::session::SessionView;
 
 /// The largest request head the proxy accepts (hyper's buffer limit).
 const MAX_HEAD: usize = 16 * 1024;
@@ -52,29 +51,29 @@ pub(super) async fn serve(
         Ok(Ok(false)) => {
             proxy
                 .log
-                .record(drop_line(peer, dst, None, None, Some("h2c")));
+                .record(drop_line(peer, dst, None, None, Some(DenyReason::H2c)));
             if proxy.mode == Mode::Enforcing {
                 return super::reset(client);
             }
             // Permissive: pass h2c through untouched.
-            return match TcpStream::connect(dst).await {
-                Ok(upstream) => {
+            return match proxy.connect_upstream(peer, dst).await {
+                Some(upstream) => {
                     super::splice(client, upstream, &head, None, proxy.sessions.clone()).await;
                 }
-                Err(_) => super::reset(client),
+                None => super::reset(client),
             };
         }
         Ok(Err(_)) => return,
         Err(_) => {
             proxy
                 .log
-                .record(drop_line(peer, dst, None, None, Some("timeout")));
+                .record(drop_line(peer, dst, None, None, Some(DenyReason::Timeout)));
             return super::reset(client);
         }
     }
 
     let reset = Arc::new(AtomicBool::new(false));
-    let answering = Arc::new(AtomicBool::new(false));
+    let answering = Arc::new(Answering::default());
     let idle = Arc::new(AtomicBool::new(false));
     let io = Io {
         head,
@@ -83,6 +82,8 @@ pub(super) async fn serve(
         reset: reset.clone(),
         answering: answering.clone(),
         idle: idle.clone(),
+        in_response: false,
+        response_flushed: false,
         upgraded: false,
     };
     let conn = Arc::new(Conn {
@@ -95,6 +96,7 @@ pub(super) async fn serve(
         upstream: tokio::sync::Mutex::new(None),
         session: Mutex::new(None),
         upgraded: Mutex::new(None),
+        upstream_conn: Mutex::new(None),
     });
     let service = {
         let conn = conn.clone();
@@ -107,7 +109,8 @@ pub(super) async fn serve(
         .serve_connection(TokioIo::new(io), service)
         .with_upgrades();
     let mut served = Box::pin(served);
-    let ended = session_ended(&conn, proxy.sessions.clone());
+    let mut sessions = proxy.sessions.clone();
+    let ended = super::session_gone(&mut sessions, || *conn.session.lock().unwrap());
     tokio::select! {
         res = &mut served => {
             match res {
@@ -117,18 +120,18 @@ pub(super) async fn serve(
                     tracing::debug!("proxy: closing idle HTTP connection from {peer}");
                 }
                 Err(e) => {
-                let reason = if e.is_timeout() {
-                    "timeout"
-                } else if e.is_parse_too_large() {
-                    "oversized"
-                } else {
-                    "malformed"
-                };
-                tracing::debug!("proxy: HTTP from {peer} failed: {e}");
-                if e.is_timeout() || e.is_parse_too_large() {
-                    proxy.log.record(drop_line(peer, dst, None, None, Some(reason)));
-                }
-                conn.reset.store(true, Ordering::SeqCst);
+                    tracing::debug!("proxy: HTTP from {peer} failed: {e}");
+                    let reason = if e.is_timeout() {
+                        Some(DenyReason::Timeout)
+                    } else if e.is_parse_too_large() {
+                        Some(DenyReason::Oversized)
+                    } else {
+                        None
+                    };
+                    if reason.is_some() {
+                        proxy.log.record(drop_line(peer, dst, None, None, reason));
+                    }
+                    conn.reset.store(true, Ordering::SeqCst);
                 }
                 Ok(()) => {}
             }
@@ -143,14 +146,11 @@ pub(super) async fn serve(
     drop(served);
 
     let upgraded = conn.upgraded.lock().unwrap().take();
-    if let Some(mut task) = upgraded {
-        let ended = session_ended(&conn, proxy.sessions.clone());
+    if let Some(task) = upgraded {
+        let ended = super::session_gone(&mut sessions, || *conn.session.lock().unwrap());
         tokio::select! {
-            _ = &mut task => {}
-            () = ended => {
-                conn.reset.store(true, Ordering::SeqCst);
-                task.abort();
-            }
+            () = task => {}
+            () = ended => conn.reset.store(true, Ordering::SeqCst),
         }
     }
 }
@@ -174,32 +174,17 @@ async fn read_preface(client: &mut TcpStream, head: &mut Vec<u8>) -> io::Result<
     }
 }
 
-/// Resolves once a session that allowed a request on `conn` is gone from the view.
-async fn session_ended(conn: &Conn, mut sessions: watch::Receiver<Arc<SessionView>>) {
-    loop {
-        if sessions.changed().await.is_err() {
-            return std::future::pending().await;
-        }
-        let granted = *conn.session.lock().unwrap();
-        if let Some((ip, id)) = granted
-            && sessions.borrow_and_update().get(&ip).map(|(i, _)| *i) != Some(id)
-        {
-            return;
-        }
-    }
-}
-
 fn drop_line(
     src: SocketAddr,
     dst: SocketAddr,
     host: Option<String>,
     path: Option<String>,
-    reason: Option<&'static str>,
-) -> Drop {
-    Drop {
+    reason: Option<DenyReason>,
+) -> Denial {
+    Denial {
         src: src.ip(),
         dst,
-        proto: "http",
+        proto: Proto::Http,
         host,
         path,
         reason,
@@ -212,8 +197,8 @@ struct Conn {
     peer: SocketAddr,
     dst: SocketAddr,
     reset: Arc<AtomicBool>,
-    /// Set while a response from [`Conn::request`] is on its way out (see [`Io::poll_write`]).
-    answering: Arc<AtomicBool>,
+    /// Tells the [`Io`] about the responses [`Conn::request`] produces.
+    answering: Arc<Answering>,
     /// Notified when a request is denied with a RST.
     denied: Notify,
     /// The upstream connection, opened by the first forwarded request.
@@ -221,7 +206,27 @@ struct Conn {
     /// The latest session that allowed a request here; its end closes the connection.
     session: Mutex<Option<(IpAddr, u32)>>,
     /// Splices the two sides once an Upgrade succeeded.
-    upgraded: Mutex<Option<JoinHandle<()>>>,
+    upgraded: Mutex<Option<AbortOnDrop>>,
+    /// Drives the upstream connection, opened with `upstream`.
+    upstream_conn: Mutex<Option<AbortOnDrop>>,
+}
+
+/// A spawned task that is aborted when this is dropped, so it can't outlive the connection
+/// (whose task the proxy aborts on shutdown) that spawned it.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl Future for AbortOnDrop {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        Pin::new(&mut self.0).poll(cx).map(|_| ())
+    }
 }
 
 impl Conn {
@@ -236,7 +241,7 @@ impl Conn {
             .map_or("/", |p| p.as_str())
             .to_owned();
         let verdict = match &host {
-            _ if req.method() == Method::CONNECT => Err("connect"),
+            _ if req.method() == Method::CONNECT => Err(DenyReason::Connect),
             Err(reason) => Err(*reason),
             Ok(host) => {
                 let view = self.proxy.sessions.borrow().clone();
@@ -280,12 +285,20 @@ impl Conn {
         self.forward(req).await
     }
 
+    /// Marks `resp` as the service's, so the [`Io`] lets it out.
     fn answer(&self, resp: Response<Body>) -> Response<Body> {
-        self.answering.store(true, Ordering::SeqCst);
-        resp
+        let a = &self.answering;
+        a.body_done.store(false, Ordering::SeqCst);
+        a.upgrade.store(
+            resp.status() == StatusCode::SWITCHING_PROTOCOLS,
+            Ordering::SeqCst,
+        );
+        a.head_next.store(true, Ordering::SeqCst);
+        let done = a.clone();
+        resp.map(|body| TrackedBody { body, done }.boxed())
     }
 
-    fn log(&self, host: Option<String>, path: Option<String>, reason: Option<&'static str>) {
+    fn log(&self, host: Option<String>, path: Option<String>, reason: Option<DenyReason>) {
         self.proxy
             .log
             .record(drop_line(self.peer, self.dst, host, path, reason));
@@ -330,7 +343,7 @@ impl Conn {
                     .await;
                 }
             });
-            *self.upgraded.lock().unwrap() = Some(task);
+            *self.upgraded.lock().unwrap() = Some(AbortOnDrop(task));
         }
         Ok(self.answer(resp.map(BodyExt::boxed)))
     }
@@ -338,21 +351,14 @@ impl Conn {
     async fn connect(&self) -> Option<SendRequest<Incoming>> {
         let peer = self.peer;
         let dst = self.dst;
-        let stream = match tokio::time::timeout(self.proxy.timeout, TcpStream::connect(dst)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
-                tracing::debug!("proxy: connecting {peer} to {dst} failed: {e}");
-                return None;
-            }
-            Err(_) => {
-                tracing::debug!("proxy: connecting {peer} to {dst} timed out");
-                return None;
-            }
-        };
+        let stream = self.proxy.connect_upstream(peer, dst).await?;
         let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .ok()?;
-        tokio::spawn(conn.with_upgrades());
+        let task = tokio::spawn(async move {
+            let _ = conn.with_upgrades().await;
+        });
+        *self.upstream_conn.lock().unwrap() = Some(AbortOnDrop(task));
         Some(sender)
     }
 }
@@ -360,11 +366,11 @@ impl Conn {
 /// The host a request is for: its absolute-form authority (without userinfo) or its Host header.
 /// A request that names two hosts (two Host headers, or an authority that disagrees with the
 /// Host header) is `ambiguous-host`: upstreams differ on which one wins.
-fn request_host(req: &Request<Incoming>) -> Result<String, &'static str> {
+fn request_host(req: &Request<Incoming>) -> Result<String, DenyReason> {
     let mut headers = req.headers().get_all(HOST).iter();
     let header = match (headers.next(), headers.next()) {
-        (_, Some(_)) => return Err("ambiguous-host"),
-        (Some(v), None) => Some(v.to_str().map_err(|_| "no-host")?),
+        (_, Some(_)) => return Err(DenyReason::AmbiguousHost),
+        (Some(v), None) => Some(v.to_str().map_err(|_| DenyReason::NoHost)?),
         (None, None) => None,
     };
     let authority = req
@@ -372,9 +378,9 @@ fn request_host(req: &Request<Incoming>) -> Result<String, &'static str> {
         .authority()
         .map(|a| a.as_str().rsplit('@').next().unwrap_or_default());
     match (authority, header) {
-        (Some(a), Some(h)) if !a.eq_ignore_ascii_case(h) => Err("ambiguous-host"),
+        (Some(a), Some(h)) if !a.eq_ignore_ascii_case(h) => Err(DenyReason::AmbiguousHost),
         (Some(host), _) | (None, Some(host)) => Ok(host.to_owned()),
-        (None, None) => Err("no-host"),
+        (None, None) => Err(DenyReason::NoHost),
     }
 }
 
@@ -393,13 +399,69 @@ fn not_found(req: &Request<Incoming>) -> Response<Body> {
     resp
 }
 
+/// What [`Conn::answer`] tells the [`Io`] about the service's responses.
+#[derive(Default)]
+struct Answering {
+    /// The next write starts a response head the service produced.
+    head_next: AtomicBool,
+    /// That response is a `101 Switching Protocols`.
+    upgrade: AtomicBool,
+    /// hyper has finished with (or dropped) that response's body.
+    body_done: AtomicBool,
+}
+
+/// A response body that tells [`Answering::body_done`] when hyper is done with it.
+struct TrackedBody {
+    body: Body,
+    done: Arc<Answering>,
+}
+
+impl hyper::body::Body for TrackedBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+        let polled = Pin::new(&mut self.body).poll_frame(cx);
+        if let Poll::Ready(None) = polled {
+            self.done.body_done.store(true, Ordering::SeqCst);
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+impl Drop for TrackedBody {
+    fn drop(&mut self) {
+        self.done.body_done.store(true, Ordering::SeqCst);
+    }
+}
+
 /// The client stream with the bytes the proxy read before hyper took over replayed first.
+///
+/// hyper answers a request it can't parse (an oversized head gets 431) on its own. The `Io`
+/// refuses any write that isn't part of a response the service produced, so the connection
+/// fails and is reset instead. A response lasts from its head until its body is done, flushed,
+/// and the client has sent more (hyper only parses, and so only fails on, a next request then).
 struct Io {
     head: Vec<u8>,
     pos: usize,
     stream: TcpStream,
     reset: Arc<AtomicBool>,
-    answering: Arc<AtomicBool>,
+    answering: Arc<Answering>,
+    /// Whether the writes belong to a response the service produced.
+    in_response: bool,
+    /// Whether that response's body is done and everything written is flushed.
+    response_flushed: bool,
     /// Set when a response head goes out, cleared when the client sends more: whether the
     /// connection is waiting for a next request that hasn't started.
     idle: Arc<AtomicBool>,
@@ -407,7 +469,7 @@ struct Io {
     upgraded: bool,
 }
 
-impl std::ops::Drop for Io {
+impl Drop for Io {
     fn drop(&mut self) {
         if self.reset.load(Ordering::SeqCst)
             && let Err(e) = self.stream.set_zero_linger()
@@ -433,6 +495,9 @@ impl AsyncRead for Io {
         let polled = Pin::new(&mut self.stream).poll_read(cx, buf);
         if buf.filled().len() > filled {
             self.idle.store(false, Ordering::SeqCst);
+            if self.response_flushed {
+                self.in_response = false;
+            }
         }
         polled
     }
@@ -444,23 +509,29 @@ impl AsyncWrite for Io {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // hyper answers a request it can't parse (an oversized head gets 431) on its own. A
-        // response head the service didn't produce is one of those: refuse it, so the
-        // connection fails and is reset instead.
         // After a 101, the bytes are the upgraded protocol's.
-        if !self.upgraded && buf.starts_with(b"HTTP/1.") {
-            if !self.answering.swap(false, Ordering::SeqCst) {
+        if !self.upgraded {
+            if self.answering.head_next.swap(false, Ordering::SeqCst) {
+                self.in_response = true;
+                self.response_flushed = false;
+                self.upgraded = self.answering.upgrade.load(Ordering::SeqCst);
+                self.idle.store(true, Ordering::SeqCst);
+            } else if !self.in_response {
                 self.reset.store(true, Ordering::SeqCst);
                 return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
             }
-            self.upgraded = buf[8..].starts_with(b" 101 ");
-            self.idle.store(true, Ordering::SeqCst);
         }
         Pin::new(&mut self.stream).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
+        let flushed = Pin::new(&mut self.stream).poll_flush(cx);
+        if let Poll::Ready(Ok(())) = flushed
+            && self.answering.body_done.load(Ordering::SeqCst)
+        {
+            self.response_flushed = true;
+        }
+        flushed
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -692,6 +763,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_head_after_a_response_is_reset() {
+        // The 431 hyper writes on its own comes after a response the service produced.
+        let h = http(Mode::Enforcing).await;
+        let mut client = h.connect().await;
+        client
+            .write_all(b"GET /private HTTP/1.1\r\nhost: ok.test\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_response(&mut client).await.starts_with("HTTP/1.1 404"));
+        let big = format!(
+            "GET /pub HTTP/1.1\r\nhost: ok.test\r\nx: {}\r\n\r\n",
+            "a".repeat(20_000)
+        );
+        let _ = client.write_all(big.as_bytes()).await;
+        assert_reset(&mut client).await;
+    }
+
+    #[tokio::test]
     async fn incomplete_head_is_reset_after_the_timeout() {
         assert_request_reset(b"GET /pub HTTP/1.1\r\nhost: ok").await;
     }
@@ -718,6 +807,90 @@ mod tests {
         up.write_all(b"pong").await.unwrap();
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"pong");
+    }
+
+    /// Reads from `stream` until it closes, failing if it is still open after 5s.
+    async fn assert_closes(stream: &mut TcpStream) {
+        let mut buf = [0; 64];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .expect("still open")
+            {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_the_connection_closes_an_upgraded_splice() {
+        // Aborting the proxy aborts its connections; their splices must not outlive them.
+        let h = http(Mode::Enforcing).await;
+        let (mut client, task) = h.connect_task().await;
+        client
+            .write_all(b"GET /pub/ws HTTP/1.1\r\nhost: ok.test\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n")
+            .await
+            .unwrap();
+        let mut up = accept(&h).await;
+        read_head(&mut up).await;
+        up.write_all(b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_head(&mut client).await.starts_with("HTTP/1.1 101"));
+        task.abort();
+        assert_closes(&mut up).await;
+        assert_closes(&mut client).await;
+    }
+
+    #[tokio::test]
+    async fn aborting_the_connection_closes_the_upstream() {
+        let h = http(Mode::Enforcing).await;
+        let (mut client, task) = h.connect_task().await;
+        client
+            .write_all(b"GET /pub HTTP/1.1\r\nhost: ok.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut up = accept(&h).await;
+        read_head(&mut up).await;
+        up.write_all(OK).await.unwrap();
+        read_response(&mut client).await;
+        task.abort();
+        assert_closes(&mut up).await;
+    }
+
+    #[tokio::test]
+    async fn a_body_that_looks_like_a_response_head_is_forwarded() {
+        // Only a response the service produced may go out, but a body chunk that happens to
+        // start like a head is part of one.
+        let h = http(Mode::Enforcing).await;
+        let mut client = h.connect().await;
+        client
+            .write_all(b"GET /pub HTTP/1.1\r\nhost: ok.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut up = accept(&h).await;
+        read_head(&mut up).await;
+        up.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\n")
+            .await
+            .unwrap();
+        // Let the head go out on its own before the body.
+        assert!(read_head(&mut client).await.starts_with("HTTP/1.1 200"));
+        up.write_all(b"HTTP/1.").await.unwrap();
+        let mut body = [0; 7];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut body))
+            .await
+            .expect("no body in time")
+            .expect("body forwarded");
+        assert_eq!(&body, b"HTTP/1.");
+        // And the connection is still usable.
+        client
+            .write_all(b"GET /pub HTTP/1.1\r\nhost: ok.test\r\n\r\n")
+            .await
+            .unwrap();
+        read_head(&mut up).await;
+        up.write_all(OK).await.unwrap();
+        assert!(read_response(&mut client).await.starts_with("HTTP/1.1 200"));
     }
 
     #[tokio::test]
@@ -749,7 +922,7 @@ mod tests {
         h.sessions
             .take()
             .unwrap()
-            .send_replace(Arc::new(SessionView::new()));
+            .send_replace(Arc::new(crate::session::SessionView::new()));
         assert_reset(&mut client).await;
     }
 }

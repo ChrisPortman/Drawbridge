@@ -166,7 +166,7 @@ This section covers deploying, configuring and operating a Drawbridge gateway. I
   kernels load them on demand. On hosts that disable module loading, load them at boot, or `run`
   fails with "the kernel rejected the drop log".
 - For [host rules](#host-rules) only: the nat modules `nft_nat`, `nft_redir` and `nf_conntrack`
-  (with `nf_nat`). Without them `run` fails, naming those modules.
+  (with `nf_nat`), and `nft_fib_inet`. Without them `run` fails, naming those modules.
 
 **For user logins (the portal)**
 
@@ -294,8 +294,12 @@ users:
 - A host is exact or has a leading `*.` wildcard (one or more labels, not the bare domain).
   Matching ignores case and a trailing dot. `https` hosts can't have paths.
 - An `http` path is a prefix on `/` boundaries: `/team` allows `/team` and `/team/x`, not
-  `/teams`. A request whose path has a `.` or `..` segment (also percent-encoded) or a backslash
-  never matches a path rule, because the backend could resolve it outside the prefix.
+  `/teams`. It is compared byte for byte, so anything a backend might read differently never
+  matches a path rule: a `.` or `..` segment (also percent-encoded, or before `;` parameters as in
+  `/..;/`), a backslash, a fragment (`#`), and a percent-encoded `/`, `\`, `%`, `?` or `#`. Such a
+  request gets `404` even where the backend would resolve it inside the prefix (`/team/./x`).
+  A rule's path may only use letters, digits and `-._~!$&'()*+,=:@`, with no empty, `.` or `..`
+  segment.
 - Host rules need `--proxy-port`. nftables redirects connections from the client (or the logged-in
   user's address) to each rule's `dest` and ports to Drawbridge's built-in transparent proxy. The
   proxy reads the TLS SNI or each HTTP request's `Host` header and path, and connects to the
@@ -309,18 +313,23 @@ users:
   a TCP reset, like a firewall. An allowed host with a path that isn't gets `404 Not Found`, and
   the connection stays open. Every request on a keep-alive connection is checked. A keep-alive
   connection with no new request for 10 seconds is closed normally (not reset, not logged).
+- **Connection limits:** the proxy serves at most 4,096 connections at once, and 256 from one
+  source address. A connection over either limit is reset (in permissive mode too) and logged
+  with `PROTO=tcp REASON=limit`. Each proxied connection uses two file descriptors, so give the
+  service a `LimitNOFILE` well above 8,192 (the unit below sets 16384).
 - Denials are logged by Drawbridge itself (not the kernel), once per distinct line every 10
   seconds, as
-  `drawbridge drop: SRC=… DST=… PROTO=http|https DPT=… HOST=… [PATH=…] [REASON=…]`. `REASON` is
-  one of `no-sni`, `ech`, `not-tls`, `malformed`, `timeout`, `oversized`, `h2c`, `connect`,
-  `no-host` and `ambiguous-host`; a path denial carries `PATH`. Spaces, backslashes and bytes outside printable
+  `drawbridge drop: SRC=… DST=… PROTO=http|https|tcp DPT=… HOST=… [PATH=…] [REASON=…]`. `REASON`
+  is one of `no-sni`, `ech`, `not-tls`, `malformed`, `timeout`, `oversized`, `h2c`, `connect`,
+  `no-host`, `ambiguous-host` and `limit`; a path denial carries `PATH`. Spaces, backslashes and bytes outside printable
   ASCII in `HOST` and `PATH` are written as `\xNN`. In permissive mode the proxy lets these
   through and logs `drawbridge would-drop: `.
 
 Limitations:
 - **Domain fronting isn't detected.** HTTPS is spliced, not decrypted: a client can send an
   allowed SNI and then ask the backend for another virtual host inside TLS. Host rules are only as
-  strict as the backend's own SNI and `Host` checks.
+  strict as the backend's own SNI and `Host` checks. Likewise only the first ClientHello is
+  checked: after a HelloRetryRequest, the client's second ClientHello is spliced unread.
 - **ECH is denied,** because it hides the real SNI.
 - **Backends see the gateway as the source,** not the client.
 - **No h2c.** HTTP/2 over TLS works (it's spliced); cleartext HTTP/2 is reset.
@@ -364,7 +373,7 @@ table inet drawbridge {
 	chain client_filter {
 		ct mark != 0x00000000 goto session_flows
 		ct state established,related accept
-		meta l4proto tcp th dport 3128 ct status dnat counter accept
+		meta l4proto tcp th dport 3128 ct status dnat fib daddr type local counter accept
 		ip daddr 192.168.50.1 tcp dport 8443 counter accept
 		ip saddr 192.168.50.0/24 ip daddr 10.0.1.0/24 tcp dport 443 counter accept
 		ip saddr 192.168.50.0/24 ip daddr 10.0.1.0/24 tcp dport 8000-8100 counter accept
@@ -506,6 +515,8 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 RestrictAddressFamilies=AF_NETLINK AF_INET AF_INET6 AF_UNIX
+# Room for the host-rule proxy's connections (two descriptors each) and the portal.
+LimitNOFILE=16384
 # SIGTERM (the default) triggers a clean shutdown that removes the rules.
 KillSignal=SIGTERM
 Restart=on-failure
@@ -894,8 +905,9 @@ flowchart TD
   redirects each host rule's source, `dest` and ports to `--proxy-port`; a session's redirects
   also set its conntrack mark. The redirected packet's destination is then the gateway, so no
   address rule can accept it for the backend. `client_filter` accepts it right after
-  `established,related` with `tcp dport <proxy port> ct status dnat`, so only redirected
-  connections reach the proxy. `proxy_redirect` is rebuilt with every session change, in the same
+  `established,related` with `tcp dport <proxy port> ct status dnat fib daddr type local`, so
+  only connections redirected to the gateway itself reach the proxy (not another tool's DNAT to
+  the same port, which is forwarded). `proxy_redirect` is rebuilt with every session change, in the same
   transaction.
 - Session ids start at a random value on each run, so connections marked before a restart can't
   pass as a new session's.
