@@ -88,3 +88,16 @@ DropLog retry. `Enforcer` becomes async (native `async fn`). There is no mock-ru
 - Nothing below the JSON level is tested by Drawbridge; that is nft's job.
 - Issue #11 features (redirect, `ct status`) are out of scope, but the JSON schema doesn't block
   them.
+
+## Deviations
+
+Where the implementation differs from the plan above:
+
+- `Firewall::teardown` returns `Result<()>`, not whether a table was removed: the add+delete
+  batch can't tell if the table existed.
+- `FirewallError` wraps `NftError` and adds `DropLog`, `UnsupportedVersion` and
+  `UnparseableVersion`, rather than being replaced by `NftError`.
+- `server check` needs nft, because it runs `nft --version`. `--nft-skip-version-check` skips
+  only the version floor and parse, not running nft.
+- The e2e drop-log grep matches protocol numbers, which is how nft prints the drop log's
+  `l4proto` keys.

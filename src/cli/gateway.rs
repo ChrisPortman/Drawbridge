@@ -81,20 +81,13 @@ fn lock(args: &LockArgs) -> anyhow::Result<File> {
     }
 }
 
-/// Checks `nft --version`, or with `--nft-skip-version-check` only logs it.
+/// Checks `nft --version`; with `--nft-skip-version-check`, only that nft runs, and logs it.
 async fn firewall(args: &NftArgs) -> anyhow::Result<Firewall> {
     let firewall = Firewall::new(&args.nft_path);
-    if args.nft_skip_version_check {
-        match firewall.version_output().await {
-            Ok(raw) => {
-                warn!(nft = %args.nft_path.display(), version = raw, "nft version check skipped")
-            }
-            Err(e) => {
-                warn!(nft = %args.nft_path.display(), error = %e, "nft version check skipped")
-            }
-        }
-    } else {
-        firewall.check_version().await.context("checking nft")?;
+    let skip = args.nft_skip_version_check;
+    let raw = firewall.check_version(skip).await.context("checking nft")?;
+    if skip {
+        warn!(nft = %args.nft_path.display(), version = raw, "nft version check skipped");
     }
     Ok(firewall)
 }

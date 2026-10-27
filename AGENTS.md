@@ -200,8 +200,9 @@ with the `nftables` crate's types. ADR `docs/decisions/0003-replace-rustables-wi
 records why.
 
 - `--nft-path` (default `/usr/sbin/nft`) must be absolute; nft is never looked up in `PATH`.
-  Every `server` command, `check` included, runs the version check unless
-  `--nft-skip-version-check` is set, so `cargo run -- server check` needs nft installed.
+  Every `server` command, `check` included, runs `nft --version`, so `cargo run -- server check`
+  needs nft installed. `--nft-skip-version-check` skips only the version floor and parse; a
+  missing or hung nft is still a startup error.
 - `CAP_NET_ADMIN` must survive the exec: root, or systemd `AmbientCapabilities=CAP_NET_ADMIN`.
   File capabilities on `drawbridge` alone don't reach `nft`; that's unsupported.
 - Keep the JSON within what 0.9.3 parses. Log sets carry `flags: timeout` only: nft adds

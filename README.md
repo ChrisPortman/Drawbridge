@@ -155,7 +155,7 @@ This section covers deploying, configuring and operating a Drawbridge gateway. I
   `--nft-path` (`DRAWBRIDGE_NFT_PATH`); it is never looked up in `PATH`. Every `server` command
   checks `nft --version` first, including `check`. If a newer nft prints its version in a form
   Drawbridge can't parse, `--nft-skip-version-check` (`DRAWBRIDGE_NFT_SKIP_VERSION_CHECK`) logs it
-  instead.
+  instead; nft must still run.
 - `CAP_NET_ADMIN`, in a form that survives the exec of `nft`: run as root, or under systemd with
   `AmbientCapabilities=CAP_NET_ADMIN` (as in the unit below). File capabilities on the
   `drawbridge` binary alone are not supported, because they don't pass to `nft`. Add

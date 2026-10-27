@@ -10,7 +10,7 @@ pub use nft::NftError;
 use std::path::PathBuf;
 
 use nftables::schema::{NfObject, Nftables};
-use tracing::error;
+use tracing::{debug, error};
 
 use nft::{MIN_VERSION, Nft, parse_version};
 use ruleset::{Ruleset, SessionRules};
@@ -47,9 +47,13 @@ impl Firewall {
         }
     }
 
-    /// Checks that `nft --version` is at least [`MIN_VERSION`]. Returns the raw output.
-    pub async fn check_version(&self) -> Result<String, FirewallError> {
-        let raw = self.version_output().await?;
+    /// Runs `nft --version` and returns its raw output. Unless `skip_floor`, also checks that it
+    /// is at least [`MIN_VERSION`]. A missing or hung nft is an error either way.
+    pub(crate) async fn check_version(&self, skip_floor: bool) -> Result<String, FirewallError> {
+        let raw = self.nft.version().await?;
+        if skip_floor {
+            return Ok(raw);
+        }
         let path = self.nft.path().to_owned();
         match parse_version(&raw) {
             Some(v) if v >= MIN_VERSION => Ok(raw),
@@ -61,15 +65,10 @@ impl Firewall {
         }
     }
 
-    /// The raw output of `nft --version`, unchecked.
-    pub async fn version_output(&self) -> Result<String, FirewallError> {
-        Ok(self.nft.version().await?)
-    }
-
     /// Dry-runs the teardown batch with `nft -c`, so a missing capability shows up before any
     /// change. Commits nothing.
-    pub async fn probe(&self) -> Result<(), FirewallError> {
-        self.check(&json::teardown()).await
+    pub(crate) async fn probe(&self) -> Result<(), FirewallError> {
+        self.dry_run(&json::teardown()).await
     }
 
     /// Atomically replaces the gateway table with one implementing `ruleset`. If the kernel
@@ -82,9 +81,12 @@ impl Firewall {
             Err(e) => return Err(e),
         };
         // Kernel errors carry no command index; dry-run without the drop log to attribute it.
-        match self.check(&json::apply_without_drop_log(ruleset)).await {
+        match self.dry_run(&json::apply_without_drop_log(ruleset)).await {
             Ok(()) => Err(FirewallError::DropLog { stderr: err }),
-            Err(_) => Err(NftError::Rejected { stderr: err }.into()),
+            Err(retry) => {
+                debug!(error = %retry, "the batch without the drop log was rejected too");
+                Err(NftError::Rejected { stderr: err }.into())
+            }
         }
     }
 
@@ -111,7 +113,7 @@ impl Firewall {
         Ok(result.inspect_err(|e| log_invalid(doc, e))?)
     }
 
-    async fn check(&self, doc: &Nftables<'_>) -> Result<(), FirewallError> {
+    async fn dry_run(&self, doc: &Nftables<'_>) -> Result<(), FirewallError> {
         let result = self.nft.check(&to_json(doc)).await;
         Ok(result.inspect_err(|e| log_invalid(doc, e))?)
     }
@@ -124,16 +126,20 @@ fn to_json(doc: &Nftables) -> String {
 /// Logs the command nft refused to parse: a Drawbridge bug.
 fn log_invalid(doc: &Nftables, e: &NftError) {
     if let NftError::InvalidJson { index, .. } = e {
-        let cmd = doc
-            .objects
-            .get(*index)
-            .map(|c: &NfObject| serde_json::to_string(c).unwrap_or_default());
+        let cmd =
+            invalid_command(doc, *index).map(|c| serde_json::to_string(c).unwrap_or_default());
         error!(
             index,
             command = cmd.as_deref().unwrap_or("?"),
             "nft rejected a command as invalid JSON"
         );
     }
+}
+
+/// The command at nft's "command array" `index`. nft counts every array element (a `metainfo`
+/// object too), so this is a plain index into `objects`.
+fn invalid_command<'a, 'b>(doc: &'a Nftables<'b>, index: usize) -> Option<&'a NfObject<'b>> {
+    doc.objects.get(index)
 }
 
 #[cfg(test)]
@@ -217,20 +223,54 @@ esac"#
         assert!(fw.teardown().await.is_err());
     }
 
+    /// Captured from nft v1.1.3 given three commands whose third (a chain without a name) is
+    /// invalid. A leading `metainfo` object gives the same index.
+    const INVALID_AT_2: &str = "Error: Object item not found: name\n\
+        {\"nftables\":[...]}\n   ^\n\
+        internal:0:0-0: Error: Parsing command array at index 2 failed.\n";
+
+    #[test]
+    fn invalid_json_index_names_the_bad_command() {
+        let doc = json::apply(&ruleset());
+        let NftError::InvalidJson { index, .. } = nft::classify(INVALID_AT_2) else {
+            panic!("not InvalidJson");
+        };
+        assert_eq!(index, 2);
+        assert!(std::ptr::eq(
+            invalid_command(&doc, index).unwrap(),
+            &doc.objects[2]
+        ));
+    }
+
     fn version(name: &str, out: &str) -> Firewall {
         Firewall::new(fake_nft(name, &format!("echo '{out}'")))
     }
 
     #[tokio::test]
+    async fn skipped_version_check_still_needs_nft() {
+        let raw = version("fw-v-skip", "nft 2 (new format)")
+            .check_version(true)
+            .await
+            .unwrap();
+        assert_eq!(raw, "nft 2 (new format)");
+
+        let e = Firewall::new("/nonexistent/nft")
+            .check_version(true)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, FirewallError::Nft(_)), "{e:?}");
+    }
+
+    #[tokio::test]
     async fn version_check() {
         let raw = version("fw-v-ok", "nftables v1.0.6 (Lester Gooch #5)")
-            .check_version()
+            .check_version(false)
             .await
             .unwrap();
         assert_eq!(raw, "nftables v1.0.6 (Lester Gooch #5)");
 
         let e = version("fw-v-old", "nftables v0.9.1 (Headless Horseman)")
-            .check_version()
+            .check_version(false)
             .await
             .unwrap_err();
         assert!(
@@ -240,7 +280,7 @@ esac"#
         );
 
         let e = version("fw-v-odd", "nft 2 (new format)")
-            .check_version()
+            .check_version(false)
             .await
             .unwrap_err();
         let msg = e.to_string();

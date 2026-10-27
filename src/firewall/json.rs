@@ -509,14 +509,19 @@ mod tests {
         );
     }
 
+    /// The first (in nft JSON, the only) key and value of a JSON object.
+    fn only_entry(value: &serde_json::Value) -> (&String, &serde_json::Value) {
+        value.as_object().unwrap().iter().next().unwrap()
+    }
+
     /// Each command of `doc` as `(command, object kind, chain or set name)`.
     fn outline(doc: &Nftables) -> Vec<(String, String, String)> {
         let value = to_value(doc);
         let cmds = value["nftables"].as_array().unwrap();
         cmds.iter()
             .map(|cmd| {
-                let (verb, obj) = cmd.as_object().unwrap().iter().next().unwrap();
-                let (kind, body) = obj.as_object().unwrap().iter().next().unwrap();
+                let (verb, obj) = only_entry(cmd);
+                let (kind, body) = only_entry(obj);
                 let name = body.get("chain").or(body.get("name")).unwrap();
                 (
                     verb.clone(),
