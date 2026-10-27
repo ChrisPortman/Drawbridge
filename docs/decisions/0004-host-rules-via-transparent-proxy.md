@@ -158,7 +158,23 @@ Delivered as sub-issues of #7. They touch these modules:
 
 ## Deviations
 
-None yet.
+- **Kernel encoding.** A kernel without the nat modules gets its own error,
+  `FirewallError::Proxy` (naming `nft_redir`, `nft_nat` and `nf_conntrack`), from a second dry run
+  without the nat chains, rather than sharing the drop log's. Each dry run leaves out one part, so
+  a kernel missing both gets the plain rejection.
+- **One proxy port for both protocols.** The proxy tells TLS from HTTP by the first byte, so http
+  and https host rules share `--proxy-port`.
+- **More denials than listed above** (found in review of #7, #19): a request naming two hosts
+  (two `Host` headers, or an absolute-form authority that differs from `Host`) is reset as
+  `ambiguous-host`, because upstreams disagree on which wins; and an http path with a `.` or `..`
+  segment (also percent-encoded) or a backslash never matches a path rule, because the upstream
+  may resolve it outside the prefix. Drop-log fields from the client (`HOST`, `PATH`) are escaped
+  (`\xNN`), and the log's key map is capped at 65,536 like the kernel's sets.
+- **Idle keep-alive.** hyper's header timeout also runs between requests, so the proxy closes a
+  keep-alive connection that sends no new request within 10 seconds. It closes it with a FIN, not
+  a RST, and doesn't log it; clients open a new connection.
+- **e2e backends:** `busybox httpd` (paths), a socat HTTP stream (the long-lived proxied
+  connection) and `openssl s_server`, all on the server node.
 
 ## Consequences
 

@@ -63,6 +63,7 @@ Behaviours to know up front:
   - [Deployment requirements](#deployment-requirements)
   - [Commands](#commands)
   - [Writing a policy](#writing-a-policy)
+    - [Host rules](#host-rules)
   - [Checking a policy](#checking-a-policy)
   - [Setting up the OIDC provider and TLS](#setting-up-the-oidc-provider-and-tls)
   - [Running as a service](#running-as-a-service)
@@ -164,6 +165,8 @@ This section covers deploying, configuring and operating a Drawbridge gateway. I
   `nf_log_syslog` (`nf_log_ipv4` and `nf_log_ipv6` before Linux 5.12) and `nft_limit`. Distribution
   kernels load them on demand. On hosts that disable module loading, load them at boot, or `run`
   fails with "the kernel rejected the drop log".
+- For [host rules](#host-rules) only: the nat modules `nft_nat`, `nft_redir` and `nf_conntrack`
+  (with `nf_nat`). Without them `run` fails, naming those modules.
 
 **For user logins (the portal)**
 
@@ -248,8 +251,9 @@ Field rules:
 | `clients[].cidr` | Source network, IPv4 or IPv6. Host bits are ignored (`10.8.0.7/24` means `10.8.0.0/24`). |
 | `users[].username` | Matched **exactly and case-sensitively** against the configured username claim (see [below](#choosing-the-username-claim)). Must be unique. |
 | `allow[].dest` | One or more destination CIDRs; must not be empty. For `clients`, every dest must be the same address family as `cidr`. |
-| `allow[].proto` | `tcp`, `udp`, `icmp` (ICMP or ICMPv6 as appropriate) or `any`. |
-| `allow[].ports` | Optional; `tcp`/`udp` only. Single ports (`443`) or inclusive ranges (`8000-8100`). Omitted means any port. |
+| `allow[].proto` | `tcp`, `udp`, `icmp` (ICMP or ICMPv6 as appropriate) or `any`; or `http` / `https` for [host rules](#host-rules). |
+| `allow[].ports` | Optional; `tcp`/`udp`/`http`/`https` only. Single ports (`443`) or inclusive ranges (`8000-8100`). Omitted means any port, or 80 for `http` and 443 for `https`. |
+| `allow[].hosts` | Required for `http`/`https`, invalid otherwise: the hostnames allowed at `dest` (see [Host rules](#host-rules)). |
 
 Rules are additive and allow-only; there is no deny. Replies to allowed connections are always
 permitted. Unknown fields are rejected, so typos fail loudly. Errors name the offending entry:
@@ -262,6 +266,68 @@ $ drawbridge server check --policy policy.yaml --external-iface wg0
 > **Note:** a policy with `users` requires the portal to be enabled (`--portal-listen`), and
 > `run` refuses to start otherwise.
 
+#### Host rules
+
+`proto: http` and `proto: https` rules allow web traffic by hostname, and for `http` by path, not
+just by address. `dest` still names the backends' addresses, and `hosts` the names clients may ask
+those backends for:
+
+```yaml
+clients:
+  - cidr: 10.8.0.0/24
+    allow:
+      - dest: [10.0.50.10/32]
+        proto: https                     # port 443 unless ports says otherwise
+        hosts: [git.example.com, "*.docs.example.com"]
+      - dest: [10.0.50.20/32]
+        proto: http                      # port 80 unless ports says otherwise
+        ports: [80, 8080]
+        hosts: [wiki.example.com/team]   # only paths under /team
+users:
+  - username: alice
+    allow:
+      - dest: [10.0.50.30/32]
+        proto: https
+        hosts: [grafana.example.com]
+```
+
+- A host is exact or has a leading `*.` wildcard (one or more labels, not the bare domain).
+  Matching ignores case and a trailing dot. `https` hosts can't have paths.
+- An `http` path is a prefix on `/` boundaries: `/team` allows `/team` and `/team/x`, not
+  `/teams`. A request whose path has a `.` or `..` segment (also percent-encoded) or a backslash
+  never matches a path rule, because the backend could resolve it outside the prefix.
+- Host rules need `--proxy-port`. nftables redirects connections from the client (or the logged-in
+  user's address) to each rule's `dest` and ports to Drawbridge's built-in transparent proxy. The
+  proxy reads the TLS SNI or each HTTP request's `Host` header and path, and connects to the
+  original destination only if a rule allows it. For a user, that lasts as long as the session:
+  ending it closes the connections it allowed.
+- **Host rules take precedence over address rules.** Once a host rule covers a source,
+  destination and port, that traffic goes through the proxy, even if a `tcp` rule also allows it.
+- **Denials:** a host that isn't allowed, an unparseable or ambiguous request, a TLS ClientHello
+  without SNI or with ECH, `CONNECT`, cleartext HTTP/2 (h2c), an oversized (over 16 KiB) request
+  head, and a client that doesn't send its ClientHello or request head within 10 seconds all get
+  a TCP reset, like a firewall. An allowed host with a path that isn't gets `404 Not Found`, and
+  the connection stays open. Every request on a keep-alive connection is checked. A keep-alive
+  connection with no new request for 10 seconds is closed normally (not reset, not logged).
+- Denials are logged by Drawbridge itself (not the kernel), once per distinct line every 10
+  seconds, as
+  `drawbridge drop: SRC=… DST=… PROTO=http|https DPT=… HOST=… [PATH=…] [REASON=…]`. `REASON` is
+  one of `no-sni`, `ech`, `not-tls`, `malformed`, `timeout`, `oversized`, `h2c`, `connect`,
+  `no-host` and `ambiguous-host`; a path denial carries `PATH`. Spaces, backslashes and bytes outside printable
+  ASCII in `HOST` and `PATH` are written as `\xNN`. In permissive mode the proxy lets these
+  through and logs `drawbridge would-drop: `.
+
+Limitations:
+- **Domain fronting isn't detected.** HTTPS is spliced, not decrypted: a client can send an
+  allowed SNI and then ask the backend for another virtual host inside TLS. Host rules are only as
+  strict as the backend's own SNI and `Host` checks.
+- **ECH is denied,** because it hides the real SNI.
+- **Backends see the gateway as the source,** not the client.
+- **No h2c.** HTTP/2 over TLS works (it's spliced); cleartext HTTP/2 is reset.
+- **HTTP isn't forwarded byte for byte.** The proxy parses and re-sends each request: header
+  names are lowercased and framing is normalised. Some clients and servers depend on exact bytes.
+- An oversized request head gets a reset, not `431`.
+
 ### Checking a policy
 
 `check` validates the policy and prints, in `nft` syntax, exactly the ruleset `run` would install
@@ -269,7 +335,8 @@ at startup. Run it after every policy change; it's safe to run anywhere. This is
 [`examples/policy.yaml`](examples/policy.yaml):
 
 ```text
-$ drawbridge server check --policy examples/policy.yaml --external-iface wg0 --portal-listen 192.168.50.1:8443
+$ drawbridge server check --policy examples/policy.yaml --external-iface wg0 \
+    --portal-listen 192.168.50.1:8443 --proxy-port 3128
 table inet drawbridge {
 	set drop_seen4 { type ipv4_addr . ipv4_addr . inet_proto . inet_service; size 65536; flags dynamic,timeout; timeout 10s; }
 	set drop_seen4_proto { type ipv4_addr . ipv4_addr . inet_proto; size 65536; flags dynamic,timeout; timeout 10s; }
@@ -287,9 +354,17 @@ table inet drawbridge {
 		iifname "wg0" jump drop_log
 		iifname "wg0" counter drop
 	}
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "wg0" jump proxy_redirect
+	}
+	chain proxy_redirect {
+		ip saddr 192.168.50.0/24 ip daddr 10.0.2.0/24 tcp dport 443 counter redirect to :3128
+	}
 	chain client_filter {
 		ct mark != 0x00000000 goto session_flows
 		ct state established,related accept
+		meta l4proto tcp th dport 3128 ct status dnat counter accept
 		ip daddr 192.168.50.1 tcp dport 8443 counter accept
 		ip saddr 192.168.50.0/24 ip daddr 10.0.1.0/24 tcp dport 443 counter accept
 		ip saddr 192.168.50.0/24 ip daddr 10.0.1.0/24 tcp dport 8000-8100 counter accept
@@ -304,19 +379,25 @@ table inet drawbridge {
 	chain drop_log {
 		meta l4proto tcp goto drop_log_ports
 		meta l4proto udp goto drop_log_ports
-		ip saddr . ip daddr . meta l4proto != @drop_seen4_proto add @drop_seen4_proto { ip saddr . ip daddr . meta l4proto } counter log prefix "drawbridge drop: "
-		ip6 saddr . ip6 daddr . meta l4proto != @drop_seen6_proto add @drop_seen6_proto { ip6 saddr . ip6 daddr . meta l4proto } counter log prefix "drawbridge drop: "
+		ip saddr . ip daddr . meta l4proto != @drop_seen4_proto limit rate 50/second burst 100 packets add @drop_seen4_proto { ip saddr . ip daddr . meta l4proto } counter log prefix "drawbridge drop: "
+		ip saddr . ip daddr . meta l4proto != @drop_seen4_proto counter
+		ip6 saddr . ip6 daddr . meta l4proto != @drop_seen6_proto limit rate 50/second burst 100 packets add @drop_seen6_proto { ip6 saddr . ip6 daddr . meta l4proto } counter log prefix "drawbridge drop: "
+		ip6 saddr . ip6 daddr . meta l4proto != @drop_seen6_proto counter
 	}
 	chain drop_log_ports {
-		ip saddr . ip daddr . meta l4proto . th dport != @drop_seen4 add @drop_seen4 { ip saddr . ip daddr . meta l4proto . th dport } counter log prefix "drawbridge drop: "
-		ip6 saddr . ip6 daddr . meta l4proto . th dport != @drop_seen6 add @drop_seen6 { ip6 saddr . ip6 daddr . meta l4proto . th dport } counter log prefix "drawbridge drop: "
+		ip saddr . ip daddr . meta l4proto . th dport != @drop_seen4 limit rate 50/second burst 100 packets add @drop_seen4 { ip saddr . ip daddr . meta l4proto . th dport } counter log prefix "drawbridge drop: "
+		ip saddr . ip daddr . meta l4proto . th dport != @drop_seen4 counter
+		ip6 saddr . ip6 daddr . meta l4proto . th dport != @drop_seen6 limit rate 50/second burst 100 packets add @drop_seen6 { ip6 saddr . ip6 daddr . meta l4proto . th dport } counter log prefix "drawbridge drop: "
+		ip6 saddr . ip6 daddr . meta l4proto . th dport != @drop_seen6 counter
 	}
 }
 ```
 
 User rules don't appear here. They're added per session, at login (see
 [Inspecting the rules](#inspecting-the-rules)). The `set` definitions and the `drop_log` chains
-implement the [dropped-traffic log](#dropped-traffic-log). With `--permissive`, the base chains end
+implement the [dropped-traffic log](#dropped-traffic-log). The `prerouting` and `proxy_redirect`
+chains and the `ct status dnat` accept send [host rules](#host-rules) to the proxy; without
+`--proxy-port` they aren't there. With `--permissive`, the base chains end
 in `counter accept` and the log prefix is `drawbridge would-drop: `.
 
 ### Setting up the OIDC provider and TLS
@@ -505,6 +586,7 @@ recommended form for a service. Run `drawbridge server run --help` for the autho
 | `--policy` | `DRAWBRIDGE_POLICY` | (required) | Path to the YAML policy. |
 | `--external-iface` | `DRAWBRIDGE_EXTERNAL_IFACE` | (required) | Client interface, e.g. `wg0`: 1–15 characters from `A-Za-z0-9_.-`. It must exist when `run` starts. |
 | `--lock-file` | `DRAWBRIDGE_LOCK_FILE` | `/run/drawbridge.lock` | Instance lock used by `run` and `teardown`. |
+| `--proxy-port` | `DRAWBRIDGE_PROXY_PORT` | (off) | TCP port of the transparent proxy for [host rules](#host-rules), e.g. `3128`; required when the policy has any. The proxy listens on every address (`[::]`), but nftables only lets redirected connections reach it, and it resets any connection that wasn't redirected. Pick a port nothing else on the gateway uses. |
 | `--permissive` | `DRAWBRIDGE_PERMISSIVE` | off | Accept traffic the policy doesn't allow, logging it as `drawbridge would-drop: ` instead of dropping it. For rollout; see [Rolling out with permissive mode](#rolling-out-with-permissive-mode). The variable takes `true` or `false`; anything else is a startup error. |
 | | `RUST_LOG` | `info` | Log level/filter, e.g. `debug` or `drawbridge=debug`. |
 
@@ -667,6 +749,10 @@ messages:
   without `DRAWBRIDGE_PERMISSIVE`.
 - **The portal is the only automatic exception.** Every client may connect to the listen
   addresses; everything else, including the provider and DNS, must be allowed in the policy.
+- **Host rules are enforced in userspace.** The proxy decides on the SNI or the HTTP request,
+  without decrypting TLS, so domain fronting gets past it (see [Host rules](#host-rules)). It
+  runs inside the gateway process, so a stopped gateway leaves host-rule traffic, like everything
+  else, unfiltered.
 - **Source IP is identity.** A session is bound to the TCP peer address the user logged in from.
   Don't put a reverse proxy or NAT in front of the portal, because every user would then share one
   address. On WireGuard, each peer's source addresses are fixed by its `AllowedIPs`, which stops
@@ -804,6 +890,13 @@ flowchart TD
   along the way returns to it, after `drop_log`.
 - **Drawbridge owns the conntrack mark** on connections arriving on the external interface. Don't
   run other tools that set conntrack marks on that traffic.
+- With host rules, a nat `prerouting` chain (`iifname wg0 jump proxy_redirect`) runs first and
+  redirects each host rule's source, `dest` and ports to `--proxy-port`; a session's redirects
+  also set its conntrack mark. The redirected packet's destination is then the gateway, so no
+  address rule can accept it for the backend. `client_filter` accepts it right after
+  `established,related` with `tcp dport <proxy port> ct status dnat`, so only redirected
+  connections reach the proxy. `proxy_redirect` is rebuilt with every session change, in the same
+  transaction.
 - Session ids start at a random value on each run, so connections marked before a restart can't
   pass as a new session's.
 

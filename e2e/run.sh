@@ -226,13 +226,60 @@ flow_start() {
         SYSTEM:'while echo p && read -r _; do echo ok >>/tmp/flow; sleep 1; done'
 }
 
-flow() { # flow <alive|dead> <service> <description>  (is the connection from flow_start passing?)
-    local before after got=dead
-    before=$(dc exec -T "$2" sh -c 'cat /tmp/flow 2>/dev/null | wc -l')
+# flow <alive|dead> <service> <description> [file]: is the connection from flow_start (or
+# stream_start, with file /tmp/stream) passing?
+flow() {
+    local before after got=dead file=${4:-/tmp/flow}
+    before=$(dc exec -T "$2" sh -c "cat $file 2>/dev/null | wc -l")
     sleep 3
-    after=$(dc exec -T "$2" sh -c 'cat /tmp/flow 2>/dev/null | wc -l')
+    after=$(dc exec -T "$2" sh -c "cat $file 2>/dev/null | wc -l")
     ((after > before)) && got=alive
     report "$1" "$got" "$3"
+}
+
+# stream_start <service>: holds one proxied HTTP request to the server's endless stream
+# (stream.example.com on 8083) open, appending each line it receives to /tmp/stream in <service>.
+stream_start() {
+    dc exec -T "$1" rm -f /tmp/stream
+    dc exec -d "$1" sh -c \
+        "curl -sN -H 'Host: stream.example.com' http://$SERVER:8083/ >/tmp/stream 2>/dev/null"
+}
+
+# http_ <expected> <service> <Host header> <url>: one HTTP request; the status code, "reset" if
+# the connection was reset before any response, or "timeout" if nothing answered (a drop).
+http_() {
+    local code status=0 got
+    code=$(dc exec -T "$2" curl -s -o /dev/null -m4 -H "Host: $3" -w '%{http_code}' "$4" \
+        2>/dev/null) || status=$?
+    if [[ $code != 000 && -n $code ]]; then
+        got=$code
+    elif ((status == 56 || status == 52)); then
+        got=reset
+    elif ((status == 28)); then
+        got=timeout
+    else
+        got="exit $status"
+    fi
+    report "$1" "$got" "$2 -> $4 (Host: $3)"
+}
+
+# tls <open|reset|timeout> <service> <sni|-> <host> <port>: a TLS handshake with openssl s_client,
+# sending <sni> as the SNI, or none for "-".
+tls() {
+    local sni=(-servername "$3") out got
+    [[ $3 == - ]] && sni=(-noservername)
+    out=$(dc exec -T "$2" sh -c 'echo | timeout 6 openssl s_client -connect "$0" "$@" 2>&1' \
+        "$4:$5" "${sni[@]}") || true
+    if grep -q '^New, TLS' <<<"$out"; then
+        got=open
+    elif grep -qiE 'errno=104|reset by peer' <<<"$out"; then
+        got=reset
+    elif grep -qiE 'errno=110|timed out|connect:errno' <<<"$out" || [[ -z $out ]]; then
+        got=timeout
+    else
+        got="unexpected: $(head -n3 <<<"$out" | tr '\n' ' ')"
+    fi
+    report "$1" "$got" "$2 -> $4:$5 TLS (SNI $3)"
 }
 
 # nft_counter <chain> <pattern>: total packets counted by the rules in <chain> matching <pattern>.
@@ -270,11 +317,54 @@ SERVER6=fd00:10::20
 GATEWAY=172.30.0.2
 
 echo "== transparent proxy"
-# Host-rule traffic is checked by #19; this shows the proxy's lifecycle with --proxy-port set.
 report yes "$(dc exec -T gateway ss -Hltn 'sport = :3128' | grep -q . && echo yes || echo no)" \
     "proxy listening on :3128"
 report yes "$(dc exec -T gateway nft list chain inet drawbridge prerouting >/dev/null 2>&1 \
     && echo yes || echo no)" "nat prerouting chain installed"
+
+echo "== host rules"
+APP=http://$SERVER/
+# Client http: every request is checked by host and path.
+th=$(now_ts)
+http_ 200   client-allowed app.example.com "${APP}public/"
+http_ 404   client-allowed app.example.com "${APP}private/"   # host allowed, path not
+http_ reset client-allowed evil.example.com "${APP}public/"
+http_ 200   client-allowed app.example.com "http://[$SERVER6]/public/"   # and over IPv6
+http_ 404   client-allowed app.example.com "http://[$SERVER6]/private/"
+http_ timeout client-denied app.example.com "${APP}public/"     # no host rule: not redirected
+# Client https: the SNI decides; the TLS session itself goes end to end.
+tls open    client-allowed secure.example.com $SERVER 443
+tls reset   client-allowed evil.example.com   $SERVER 443   # the tcp/443 IP rule doesn't bypass it
+tls reset   client-allowed -                  $SERVER 443
+tls timeout client-denied  secure.example.com $SERVER 443
+sleep 1
+th1=$(now_ts)
+log_has present gateway "$th" "$th1" \
+    'drawbridge drop: SRC=172.30.0.10 DST=10.10.0.20 PROTO=http DPT=80 HOST=app.example.com PATH=/private/' \
+    "the denied path is logged with its PATH"
+log_has present gateway "$th" "$th1" \
+    'drawbridge drop: SRC=172.30.0.10 DST=10.10.0.20 PROTO=http DPT=80 HOST=evil.example.com$' \
+    "the denied http host is logged"
+log_has present gateway "$th" "$th1" \
+    'drawbridge drop: SRC=172.30.0.10 DST=10.10.0.20 PROTO=https DPT=443 HOST=evil.example.com$' \
+    "the denied SNI is logged"
+log_has present gateway "$th" "$th1" \
+    'drawbridge drop: SRC=172.30.0.10 DST=10.10.0.20 PROTO=https DPT=443 HOST=- REASON=no-sni' \
+    "a ClientHello without SNI is logged as no-sni"
+log_has absent gateway "$th" "$th1" 'drawbridge drop: .*HOST=(app|secure)\.example\.com$' \
+    "allowed requests are not logged"
+# The proxy closes a keep-alive connection after 10s without a next request: with a FIN, not a
+# RST, and without logging it. It answers the denied path itself, so busybox httpd (which closes
+# after every response) isn't involved.
+ti=$(now_ts)
+status=0
+out=$(dc exec -T client-allowed sh -c "{
+    printf 'GET /private/ HTTP/1.1\r\nHost: app.example.com\r\n\r\n'; sleep 14; } |
+    socat -T20 - TCP:$SERVER:80" 2>&1) || status=$?
+report "1 0" "$(grep -c '^HTTP/1.1 404' <<<"$out") $status" \
+    "an idle keep-alive connection is answered, then closed cleanly (404s, exit status)"
+log_has absent gateway "$ti" "$(now_ts)" 'drawbridge drop: .*REASON=timeout' \
+    "an idle keep-alive connection is not logged as a timeout"
 
 echo "== gateway running: IPv4"
 tcp open   client-allowed $SERVER 8080
@@ -330,6 +420,7 @@ report yes "$got" "dropped ICMPv6 is logged"
 echo "== portal login"
 tcp open   client-user $GATEWAY 8443   # every client may reach the portal
 tcp closed client-user $SERVER 8081
+http_ timeout client-user stream.example.com "http://$SERVER:8083/"   # alice's host rule
 report 403 "$(login client-user bob@example.com)" "bob (no policy) is refused"
 tcp closed client-user $SERVER 8081
 report 0 "$(session_rules)" "no session after a refused login"
@@ -341,6 +432,8 @@ report 200 "$(login client-user alice@example.com)" "alice logs in"
 sleep 1
 log_has present gateway "$ta" "$(now_ts)" "session provisioned" "gateway provisions alice's session"
 tcp open   client-user $SERVER 8081
+http_ 200  client-user stream.example.com "http://$SERVER:8083/"   # through the proxy
+http_ reset client-user evil.example.com "http://$SERVER:8083/"
 tcp closed client-user $SERVER 8080    # not in alice's allow list
 tcp closed client-user $SERVER6 8081   # the session is for the address alice logged in from
 tcp closed client-denied $SERVER 8081  # and for no other client
@@ -459,6 +552,8 @@ report yes "$(service_log | grep -q 'TLS certificate checks for the portal are o
 tcp open   client-user $SERVER 8081
 flow_start client-user $SERVER 8082
 flow alive client-user "connection opened during the CLI session"
+stream_start client-user
+flow alive client-user "proxied HTTP stream opened during the CLI session" /tmp/stream
 
 # The ID token expires at about L+30; the service refreshes at about L+24 and again at L+48,
 # with the refresh token Dex rotated the first time.
@@ -484,6 +579,7 @@ report 0 "$status" "client logout succeeds"
 evidence <<<"$out"
 tcp closed client-user $SERVER 8081    # the session still had about 20s to run
 flow dead  client-user "logout cuts the connection"
+flow dead  client-user "logout cuts the proxied HTTP stream" /tmp/stream
 report 0 "$(session_rules)" "logout removes the session"
 sleep 1
 log_has present gateway "$tq" "$(now_ts)" "session ended" "gateway ends the session at logout"
@@ -528,6 +624,17 @@ tcp open   client-user   $SERVER 8081
 tcp open   client-user   $SERVER6 8081
 flow_start client-user $SERVER 8082
 flow alive client-user "new connection to the echo service"
+# Every host-rule denial above, now reaching the backends directly.
+http_ 200  client-allowed evil.example.com "${APP}public/"
+http_ 200  client-allowed app.example.com "${APP}private/"
+http_ 200  client-allowed app.example.com "http://[$SERVER6]/private/"
+http_ 200  client-denied  app.example.com "${APP}public/"
+tls open   client-allowed evil.example.com $SERVER 443
+tls open   client-allowed -                $SERVER 443
+tls open   client-denied  secure.example.com $SERVER 443
+http_ 200  client-user    evil.example.com "http://$SERVER:8083/"
+stream_start client-user
+flow alive client-user "new HTTP stream without a session" /tmp/stream
 
 echo "== browser without refresh tokens"
 # Without offline_access Dex issues no refresh tokens: the page's refresh gets 409 and falls back
@@ -583,7 +690,8 @@ tcp closed client-user $SERVER 8081
 stop_gateway
 
 echo "== permissive mode"
-dc exec -d gateway env DRAWBRIDGE_PERMISSIVE=true drawbridge server run
+# Logging to the container's output, where log_has sees it.
+dc exec -d gateway sh -c 'DRAWBRIDGE_PERMISSIVE=true exec drawbridge server run >/proc/1/fd/1 2>&1'
 for _ in $(seq 40); do
     dc exec -T gateway nft list table inet drawbridge >/dev/null 2>&1 && break
     sleep 0.25
@@ -595,6 +703,17 @@ tcp open   client-denied $SERVER 8081
 udp open   client-denied $SERVER 5353
 tcp open   client-denied $SERVER6 8081
 tcp open   client-allowed $SERVER 8080   # allowed traffic is unaffected
+tp=$(now_ts)
+http_ 200  client-allowed evil.example.com "${APP}public/"   # a denied host passes
+tls open   client-allowed evil.example.com $SERVER 443
+http_ 200  client-allowed app.example.com "${APP}private/"   # and a denied path
+sleep 1
+log_has present gateway "$tp" "$(now_ts)" \
+    'drawbridge would-drop: SRC=172.30.0.10 DST=10.10.0.20 PROTO=http DPT=80 HOST=evil.example.com$' \
+    "the denied http host is logged as would-drop"
+log_has present gateway "$tp" "$(now_ts)" \
+    'drawbridge would-drop: SRC=172.30.0.10 DST=10.10.0.20 PROTO=https DPT=443 HOST=evil.example.com$' \
+    "the denied SNI is logged as would-drop"
 got=no
 (($(nft_counter drop_log_ports 'would-drop') > logged)) && got=yes
 report yes "$got" "traffic outside the policy is logged as would-drop"

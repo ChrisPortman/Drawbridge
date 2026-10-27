@@ -31,7 +31,7 @@ behaviour and are background; where an open issue conflicts with one, the issue 
 | Path | Purpose |
 |---|---|
 | `src/main.rs` | Thin binary: tracing setup, `Cli::parse()`, dispatch to `cli::{run, check, teardown}` (`server`) and `cli::{init, login, logout, service}` (`client`). **No logic here.** |
-| `src/lib.rs` | Library crate root. Declares the top-level modules: `cli`, `firewall`, `policy` (`pub`) and `portal`, `session` (`pub(crate)`). |
+| `src/lib.rs` | Library crate root. Declares the top-level modules: `cli`, `firewall`, `policy` (`pub`) and `portal`, `proxy`, `session` (`pub(crate)`). |
 | `src/cli.rs` | Clap definitions: `server run|check|teardown`, `client init|login|logout` and the hidden `client service`; every flag has a `DRAWBRIDGE_*` env var. Re-exports the subcommands from `gateway` and `client`, and `Secret` (a flag's type) from `portal`. |
 | `src/cli/gateway.rs` | `server` implementations: instance lock, interface check, portal flags → `PortalConfig`, signal-driven `run` lifecycle. |
 | `src/cli/client.rs` | `client` implementations: `init` writes `client.yaml` and the user unit; `login`/`logout` only start/stop it through `systemctl --user`; `service` (what the unit runs) logs in through the loopback handoff, refreshes, and ends the session on SIGTERM. |
@@ -42,15 +42,19 @@ behaviour and are background; where an open issue conflicts with one, the issue 
 | `src/firewall/json.rs` | Pure `Ruleset` / `SessionRules` → `nft -j` documents (`nftables` crate serde types): the apply, session update and teardown batches. |
 | `src/firewall/nft.rs` | Runs `nft` (`-j -f -`, `-c` dry runs, `--version`) with a 30s timeout; version parsing (floor 0.9.3) and stderr → `NftError` classification. |
 | `src/session.rs` | `SessionTable` state machine (login, extend, refresh leases, logout, expire, rebuild on failure) behind an `Enforcer` trait; `spawn` runs it as the single task that changes sessions. |
+| `src/proxy.rs` | Host-rule transparent proxy (ADR 0004): dual-stack `bind`, `ProxyConfig::run`, original destination (`SO_ORIGINAL_DST`), `authorise` (client rules ∪ the source's live session from the `SessionView`), the HTTPS SNI check and splice, and RSTs (`SO_LINGER 0`). |
+| `src/proxy/sni.rs` | Pure TLS ClientHello parser: SNI, no SNI, ECH, not TLS, malformed or need more. |
+| `src/proxy/http.rs` | Cleartext HTTP through hyper: every request checked by host and path (404 for a denied path, RST otherwise), h2c, `CONNECT`, ambiguous hosts, head size and timeout, Upgrade splicing, and closing a connection when the session that allowed it ends. |
+| `src/proxy/droplog.rs` | The proxy's deduplicated `drawbridge drop:` / `would-drop:` lines (10s window, bounded key map, client-supplied fields escaped). |
 | `src/portal.rs` | `Prepared` (TLS, OIDC discovery, listener binds) and `Servers` (serve, graceful shutdown); Axum router: `/`, `/login`, `/callback`, `/api/session` (GET, DELETE), `/api/session/refresh`, `/api/cli/token`; cookies, the bounded pending-login and CLI-grant stores, security headers. Re-exports `OidcConfig` and `Secret` from `oidc`, and the wire types from `api`. |
 | `src/portal/api.rs` | JSON API types and constants shared by the portal and the client service. |
 | `src/portal/oidc.rs` | OIDC relying party (`openidconnect`): discovery, auth URL with PKCE/nonce, code exchange, refresh, ID-token verification, username claim. `Authenticator` trait for tests. |
 | `src/portal/*.html` | Confirmation page (inline JS refreshes, falling back to silent re-auth) and message template, embedded with `include_str!`. |
-| `examples/policy.yaml` | Example policy, used by unit tests. |
-| `tests/data/example.nft` | Golden `check` output for the example policy. |
-| `tests/data/example.json` | Golden `json::apply` document for the example policy. |
+| `examples/policy.yaml` | Example policy, used by unit tests. It has client and user host rules. |
+| `tests/data/example.nft` | Golden `check` output for the example policy, with `--proxy-port 3128` (so it has the nat chains). |
+| `tests/data/example.json` | Golden `json::apply` document for the example policy, with the nat chains. |
 | `tests/data/example.kernel.nft` | Golden `nft list` output (counters stripped) after applying the example policy. |
-| `tests/data/sessions.kernel.nft` | Golden `nft list` output after adding and replacing sessions incrementally. |
+| `tests/data/sessions.kernel.nft` | Golden `nft list` output after adding and replacing sessions incrementally, including session redirects in `proxy_redirect`. |
 | `tests/data/portal-test.{crt,key}` | Self-signed (not CA) certificate for 127.0.0.1; the client's certificate-check tests serve it. Test-only. |
 | `tests/kernel.rs` | `#[ignore]`d tests against a real kernel (needs CAP_NET_ADMIN and `nft`): example golden, `example.json` loaded with `nft`, permissive mode, 5,000-rule policy, session add/replace/remove golden, 200-session churn. |
 | `e2e/` | Docker Compose end-to-end stack (`run.sh`, `compose.yaml`, `Dockerfile`, `policy.yaml`, `dex.yaml`, `systemctl-stub`). |
@@ -89,8 +93,20 @@ Keep these unless the user changes them:
     then the **one default action**: `iifname <ext> counter drop` (`counter accept` in permissive
     mode). Nothing else drops. Anything not accepted must fall back to the base chain.
   - `client_filter` runs `ct mark != 0 goto session_flows`, then
-    `ct state established,related accept`, then one portal accept rule per `--portal-listen`
-    address, then the per-client rules, then `jump sessions`, and ends without a verdict.
+    `ct state established,related accept`, then (with `--proxy-port`) the proxy accept
+    `meta l4proto tcp th dport <proxy port> ct status dnat counter accept`, then one portal accept
+    rule per `--portal-listen` address, then the per-client rules, then `jump sessions`, and ends
+    without a verdict. `ct status dnat` limits the proxy port to redirected connections; a direct
+    connection to it meets the default action.
+  - **nat chains**, only with `--proxy-port` (none without it): a `prerouting` base chain
+    (`type nat hook prerouting priority dstnat`, `policy accept`) holding
+    `iifname <ext> jump proxy_redirect`, and `proxy_redirect` with one
+    `ip[6] saddr S ip[6] daddr D tcp dport X counter redirect to :<proxy port>` per host rule: the
+    client rules first, then each live session's with its session IP as `saddr` and
+    `ct mark set <id>` before the redirect, so ending the session cuts the client side through
+    `session_flows` like any session flow. Redirection happens before the filter hooks, so an
+    address rule for the same dest and port can't accept the backend: host rules take
+    precedence.
   - `sessions` holds one `ip[6] saddr <ip> jump session_<id>` per live session; each `session_<id>`
     chain holds that user's rules (with the session IP as `saddr`), and each of them does
     `ct mark set <id>` before accepting.
@@ -148,6 +164,16 @@ Keep these unless the user changes them:
   exactly what enforcing would drop. `run` warns at startup when it is on. Connections it lets
   through aren't marked, so they survive a restart into enforcing mode as `established`; the
   README tells operators to flush conntrack after switching.
+- **Host rules** (`proto: http|https` with `hosts`) need `--proxy-port`
+  (`DRAWBRIDGE_PROXY_PORT`, nonzero); loading a policy with them fails without it, naming the flag.
+  The proxy listens on `[::]:<port>` (`IPV6_V6ONLY=0`) and resets any connection without an
+  original destination, or whose original destination is the proxy itself, so only redirected
+  connections are served. It connects upstream only to that original destination, and only when a
+  rule allows it (or, in permissive mode, after logging `would-drop`). It closes connections a
+  session allowed when that session leaves the `SessionView` (logout, expiry, replacement), and
+  `run` aborts it (dropping every connection) before teardown. Denials are RSTs, except a denied
+  path on an allowed host, which gets 404 and keeps the connection; an oversized head is reset
+  rather than answered 431. The proxy's drop lines are its own (`tracing`), not the kernel's.
 - **Policy is allow-only and inline per client or user** (`clients[].cidr`,
   `users[].username`, `allow[].dest/proto/ports`).
   - Validate before touching the kernel.
@@ -211,6 +237,12 @@ records why.
   File capabilities on `drawbridge` alone don't reach `nft`; that's unsupported.
 - Keep the JSON within what 0.9.3 parses. Log sets carry `flags: timeout` only: nft adds
   `dynamic` itself from the rule's `add @set`, and 0.9.3 rejects it in JSON.
+- The nat forms also follow 0.9.3's `parser_json.c`: `redirect` is an object with only `port`
+  (`{"redirect": {"port": P}}`); `ct status dnat` is a `match` with op `in` on `{"ct": {"key":
+  "status"}}` and the string `dnat`; the nat chain's `prio` is the integer -100 (`dstnat`),
+  because 0.9.3's JSON takes no priority names. A kernel without `nft_nat`/`nft_redir`
+  rejects the apply; the dry run without the nat chains then turns that into
+  `FirewallError::Proxy`.
 - nft 0.9.3 lists those sets without a `flags dynamic,timeout` line, so the `*.kernel.nft`
   goldens assume a newer nft (the e2e image's).
 - Licensing: Drawbridge is `MIT OR Apache-2.0` (`LICENSE-MIT`, `LICENSE-APACHE`), and so is the
@@ -253,6 +285,11 @@ records why.
     is tested in `cli/client/api.rs` against `tests/data/portal-test.crt`.
   - A gateway restarted with `dc exec -d` logs to the exec, not the container; send its output to
     `/proc/1/fd/1` when `log_has` must see it.
+  - Host rules: the server runs `busybox httpd` on 80 (`/public/`, `/private/`), an endless
+    HTTP stream on 8083 and `openssl s_server` on 443. Use the `http_` (status, `reset` or
+    `timeout`), `tls` (`open`, `reset` or `timeout`) and `stream_start` helpers; proxy drop
+    lines are checked with `log_has`. busybox httpd closes after every response, so keep-alive is
+    checked against the proxy's own 404s.
   - The external Docker network stands in for WireGuard. It has pinned IPv6 neighbour entries,
     because Drawbridge (correctly) drops neighbour discovery on the external interface.
 
