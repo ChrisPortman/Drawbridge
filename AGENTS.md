@@ -37,7 +37,7 @@ behaviour and are background; where an open issue conflicts with one, the issue 
 | `src/cli/client.rs` | `client` implementations: `init` writes `client.yaml` and the user unit; `login`/`logout` only start/stop it through `systemctl --user`; `service` (what the unit runs) logs in through the loopback handoff, refreshes, and ends the session on SIGTERM. |
 | `src/cli/client/*.rs` | `unit` (pure: unit file, XDG paths, `systemctl show` parsing, timing), `notify` (`sd_notify`), `api` (the service's portal client), `loopback` (the 127.0.0.1 listener). |
 | `src/policy.rs` | Serde YAML schema (`clients`, `users`), `Policy::load`/`parse`/`validate`. Shared by every other module. |
-| `src/firewall.rs` | `Firewall` handle on the `nft` binary: async `apply` / `update_sessions` / `teardown` / `check_version` / `probe`; `FirewallError` (wraps `NftError`, plus `DropLog`, `UnsupportedVersion`, `UnparseableVersion`). |
+| `src/firewall.rs` | `Firewall` handle on the `nft` binary: async `apply` / `update_sessions` / `teardown` / `check_version` / `probe`; `FirewallError` (wraps `NftError`, plus `DropLog`, `Proxy`, `UnsupportedVersion`, `UnparseableVersion`). |
 | `src/firewall/ruleset.rs` | Pure `Policy` → `Ruleset` IR, including portal rules, `SessionRules`, `Mode` and the drop log's `LogSet`s; `Display` renders nft-style text (used by `check`). |
 | `src/firewall/json.rs` | Pure `Ruleset` / `SessionRules` → `nft -j` documents (`nftables` crate serde types): the apply, session update and teardown batches. |
 | `src/firewall/nft.rs` | Runs `nft` (`-j -f -`, `-c` dry runs, `--version`) with a 30s timeout; version parsing (floor 0.9.3) and stderr → `NftError` classification. |
@@ -113,11 +113,15 @@ Keep these unless the user changes them:
     still matches. Logging can lose lines, never verdicts, because the default action is a
     separate rule. When the kernel rejects an apply, `Firewall::apply` retries it as an `nft -c`
     dry run without the drop log; if that passes, the error is `FirewallError::DropLog`, naming
-    the logging modules. Session updates skip that check.
+    the logging modules. Failing that, it dry-runs the batch without the nat `prerouting` and
+    `proxy_redirect` chains; if that passes, the error is `FirewallError::Proxy`, naming
+    `nft_redir`, `nft_nat` and `nf_conntrack`. Each retry leaves out one part, so a kernel missing
+    both gets the plain rejection. Session updates skip these checks.
   - Session ids are nonzero `u32`s that start at a random value each run, so connections marked by
     a previous run can't match a new session.
-  - A session change is one batch: add new session chains, flush `sessions` and `session_flows`
-    and re-add their rules for every live session, then delete the removed chains. It never
+  - A session change is one batch: add new session chains, flush `sessions`, `session_flows`
+    and `proxy_redirect` and re-add their rules for every live session (plus the client redirects
+    in `proxy_redirect`), then delete the removed chains. It never
     touches the drop log. If it fails,
     `SessionTable` falls back to a full `apply` from its state and retries every 5s until that
     succeeds. It never tears down. Until a retry succeeds, an expired session may stay enforced;
