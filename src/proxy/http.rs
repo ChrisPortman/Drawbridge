@@ -95,6 +95,7 @@ pub(super) async fn serve(
         upstream: tokio::sync::Mutex::new(None),
         session: Mutex::new(None),
         upgraded: Mutex::new(None),
+        upstream_conn: Mutex::new(None),
     });
     let service = {
         let conn = conn.clone();
@@ -143,14 +144,11 @@ pub(super) async fn serve(
     drop(served);
 
     let upgraded = conn.upgraded.lock().unwrap().take();
-    if let Some(mut task) = upgraded {
+    if let Some(task) = upgraded {
         let ended = session_ended(&conn, proxy.sessions.clone());
         tokio::select! {
-            _ = &mut task => {}
-            () = ended => {
-                conn.reset.store(true, Ordering::SeqCst);
-                task.abort();
-            }
+            () = task => {}
+            () = ended => conn.reset.store(true, Ordering::SeqCst),
         }
     }
 }
@@ -221,7 +219,27 @@ struct Conn {
     /// The latest session that allowed a request here; its end closes the connection.
     session: Mutex<Option<(IpAddr, u32)>>,
     /// Splices the two sides once an Upgrade succeeded.
-    upgraded: Mutex<Option<JoinHandle<()>>>,
+    upgraded: Mutex<Option<AbortOnDrop>>,
+    /// Drives the upstream connection, opened with `upstream`.
+    upstream_conn: Mutex<Option<AbortOnDrop>>,
+}
+
+/// A spawned task that is aborted when this is dropped, so it can't outlive the connection
+/// (whose task the proxy aborts on shutdown) that spawned it.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl Future for AbortOnDrop {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        Pin::new(&mut self.0).poll(cx).map(|_| ())
+    }
 }
 
 impl Conn {
@@ -330,7 +348,7 @@ impl Conn {
                     .await;
                 }
             });
-            *self.upgraded.lock().unwrap() = Some(task);
+            *self.upgraded.lock().unwrap() = Some(AbortOnDrop(task));
         }
         Ok(self.answer(resp.map(BodyExt::boxed)))
     }
@@ -352,7 +370,10 @@ impl Conn {
         let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .ok()?;
-        tokio::spawn(conn.with_upgrades());
+        let task = tokio::spawn(async move {
+            let _ = conn.with_upgrades().await;
+        });
+        *self.upstream_conn.lock().unwrap() = Some(AbortOnDrop(task));
         Some(sender)
     }
 }
@@ -718,6 +739,56 @@ mod tests {
         up.write_all(b"pong").await.unwrap();
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"pong");
+    }
+
+    /// Reads from `stream` until it closes, failing if it is still open after 5s.
+    async fn assert_closes(stream: &mut TcpStream) {
+        let mut buf = [0; 64];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .expect("still open")
+            {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_the_connection_closes_an_upgraded_splice() {
+        // Aborting the proxy aborts its connections; their splices must not outlive them.
+        let h = http(Mode::Enforcing).await;
+        let (mut client, task) = h.connect_task().await;
+        client
+            .write_all(b"GET /pub/ws HTTP/1.1\r\nhost: ok.test\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n")
+            .await
+            .unwrap();
+        let mut up = accept(&h).await;
+        read_head(&mut up).await;
+        up.write_all(b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_head(&mut client).await.starts_with("HTTP/1.1 101"));
+        task.abort();
+        assert_closes(&mut up).await;
+        assert_closes(&mut client).await;
+    }
+
+    #[tokio::test]
+    async fn aborting_the_connection_closes_the_upstream() {
+        let h = http(Mode::Enforcing).await;
+        let (mut client, task) = h.connect_task().await;
+        client
+            .write_all(b"GET /pub HTTP/1.1\r\nhost: ok.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut up = accept(&h).await;
+        read_head(&mut up).await;
+        up.write_all(OK).await.unwrap();
+        read_response(&mut client).await;
+        task.abort();
+        assert_closes(&mut up).await;
     }
 
     #[tokio::test]

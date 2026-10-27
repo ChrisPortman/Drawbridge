@@ -690,6 +690,11 @@ clients:
     impl Harness {
         /// Connects a client through the proxy to the upstream listener.
         pub(super) async fn connect(&self) -> TcpStream {
+            self.connect_task().await.0
+        }
+
+        /// [`Harness::connect`], also returning the task serving the connection.
+        pub(super) async fn connect_task(&self) -> (TcpStream, tokio::task::JoinHandle<()>) {
             let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = TcpStream::connect(front.local_addr().unwrap())
                 .await
@@ -697,8 +702,8 @@ clients:
             let (stream, peer) = front.accept().await.unwrap();
             let orig = self.upstream.local_addr().ok();
             let local = stream.local_addr().ok();
-            tokio::spawn(self.proxy.clone().admit(stream, peer, orig, local));
-            client
+            let task = tokio::spawn(self.proxy.clone().admit(stream, peer, orig, local));
+            (client, task)
         }
     }
 
