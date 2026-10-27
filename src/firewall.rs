@@ -150,7 +150,13 @@ mod tests {
 
     fn ruleset() -> Ruleset {
         let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
-        Ruleset::from_policy(&policy, "wg0", &["192.168.50.1:8443".parse().unwrap()]).unwrap()
+        Ruleset::from_policy(
+            &policy,
+            "wg0",
+            &["192.168.50.1:8443".parse().unwrap()],
+            Some(3128),
+        )
+        .unwrap()
     }
 
     /// A fake nft whose `-j -f -` (apply) and `-c -j -f -` (check) runs exit with the given
