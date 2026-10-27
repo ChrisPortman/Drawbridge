@@ -750,7 +750,8 @@ mod tests {
     // The redirect, `ct status` and nat chain forms follow nftables 0.9.3's src/parser_json.c:
     // json_parse_nat_stmt reads `redirect` as an object with optional `family`, `addr`, `port`
     // and `flags`; json_parse_match_expr maps op "in" to OP_IMPLICIT, the flag test of
-    // `ct status dnat`; json_parse_cmd_add_chain needs an integer `prio` (dstnat is -100).
+    // `ct status dnat`; json_parse_cmd_add_chain needs an integer `prio` (dstnat is -100);
+    // json_parse_fib_expr reads `result` as a name ("type") and `flags` as an array of names.
     #[test]
     fn redirect_rule_v4_without_mark() {
         let spec = redirect("192.168.50.0/24", "10.0.2.0/24", 443, 443, None);
