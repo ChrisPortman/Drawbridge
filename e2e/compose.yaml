@@ -35,6 +35,7 @@ services:
       DRAWBRIDGE_EXTERNAL_IFACE: wg0
       DRAWBRIDGE_PORTAL_LISTEN: 172.30.0.2:8443
       DRAWBRIDGE_PORTAL_URL: https://172.30.0.2:8443
+      DRAWBRIDGE_PROXY_PORT: "3128"
       DRAWBRIDGE_TLS_CERT: /etc/drawbridge/portal.crt
       DRAWBRIDGE_TLS_KEY: /etc/drawbridge/portal.key
       DRAWBRIDGE_OIDC_ISSUER: http://10.10.0.30:5556/dex
