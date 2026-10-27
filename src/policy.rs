@@ -76,9 +76,142 @@ pub struct User {
 pub struct Allow {
     pub dest: Vec<IpNetwork>,
     pub proto: Proto,
-    /// Empty means any port.
+    /// Empty means any port, or the protocol's default port for `http` and `https`.
     #[serde(default)]
     pub ports: Vec<PortSpec>,
+    /// What a host rule (`http` or `https`) allows clients to request at `dest`.
+    #[serde(default)]
+    pub hosts: Vec<HostPattern>,
+}
+
+impl Allow {
+    /// The destination ports this entry allows: `ports`, or 80 for `http` and 443 for `https`
+    /// when it is empty. Empty means any port.
+    pub fn effective_ports(&self) -> Vec<PortSpec> {
+        let default = match self.proto {
+            Proto::Http => 80,
+            Proto::Https => 443,
+            _ => return self.ports.clone(),
+        };
+        if self.ports.is_empty() {
+            vec![PortSpec {
+                lo: default,
+                hi: default,
+            }]
+        } else {
+            self.ports.clone()
+        }
+    }
+}
+
+/// A `hosts` entry of a host rule: a hostname, exact or with a leading `*.` wildcard, and for
+/// `http` an optional path prefix (`example.com/some/path`). Stored lowercased, without a
+/// trailing dot.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct HostPattern {
+    /// The hostname without the `*.` of a wildcard.
+    host: String,
+    wildcard: bool,
+    /// Starts with `/` when present.
+    path: Option<String>,
+}
+
+impl HostPattern {
+    pub fn has_path(&self) -> bool {
+        self.path.is_some()
+    }
+
+    /// Whether `host` (a TLS SNI or HTTP `Host` header) is allowed. Case-insensitive; a trailing
+    /// dot and a `:port` are ignored. A wildcard matches one or more labels, never the apex.
+    pub fn matches_host(&self, host: &str) -> bool {
+        let host = match host.rsplit_once(':') {
+            Some((h, port)) if port.bytes().all(|b| b.is_ascii_digit()) => h,
+            _ => host,
+        };
+        let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+        if !self.wildcard {
+            return host == self.host;
+        }
+        host.strip_suffix(&self.host)
+            .and_then(|prefix| prefix.strip_suffix('.'))
+            .is_some_and(|prefix| !prefix.is_empty() && !prefix.starts_with('.'))
+    }
+
+    /// Whether a request target `path` is allowed: the query is dropped, then the pattern's path
+    /// must be a whole-segment prefix (`/a/b` matches `/a/b/c`, not `/a/bc`). No path allows all.
+    pub fn matches_path(&self, path: &str) -> bool {
+        let Some(prefix) = &self.path else {
+            return true;
+        };
+        let path = path.split_once('?').map_or(path, |(p, _)| p);
+        let prefix = format!("{}/", prefix.trim_end_matches('/'));
+        format!("{path}/").starts_with(&prefix)
+    }
+}
+
+impl TryFrom<String> for HostPattern {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl std::str::FromStr for HostPattern {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (host, path) = match s.find('/') {
+            Some(i) => (&s[..i], Some(s[i..].to_string())),
+            None => (s, None),
+        };
+        if host.is_empty() {
+            return Err(format!("host {s:?} is empty"));
+        }
+        if host.contains(':') {
+            return Err(format!("host {s:?} may not have a port"));
+        }
+        let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+        let (wildcard, name) = match host.strip_prefix("*.") {
+            Some(rest) => (true, rest),
+            None => (false, host.as_str()),
+        };
+        for label in name.split('.') {
+            if label.is_empty() {
+                return Err(format!("host {s:?} has an empty label"));
+            }
+            if label.contains('*') {
+                return Err(format!(
+                    "host {s:?}: a wildcard is only allowed as a leading \"*.\""
+                ));
+            }
+            if let Some(c) = label
+                .chars()
+                .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+            {
+                return Err(format!("host {s:?} has an invalid character {c:?}"));
+            }
+        }
+        Ok(HostPattern {
+            host: name.to_string(),
+            wildcard,
+            path,
+        })
+    }
+}
+
+impl fmt::Display for HostPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.wildcard {
+            f.write_str("*.")?;
+        }
+        f.write_str(&self.host)?;
+        if let Some(path) = &self.path {
+            f.write_str(path)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -88,6 +221,10 @@ pub enum Proto {
     Udp,
     Icmp,
     Any,
+    /// A host rule matched on the HTTP `Host` header (and optionally the path).
+    Http,
+    /// A host rule matched on the TLS SNI.
+    Https,
 }
 
 impl fmt::Display for Proto {
@@ -97,6 +234,8 @@ impl fmt::Display for Proto {
             Proto::Udp => "udp",
             Proto::Icmp => "icmp",
             Proto::Any => "any",
+            Proto::Http => "http",
+            Proto::Https => "https",
         })
     }
 }
@@ -241,11 +380,26 @@ fn validate_allow(allow: &Allow) -> Result<(), String> {
     if allow.dest.is_empty() {
         return Err("dest must not be empty".into());
     }
-    if !allow.ports.is_empty() && !matches!(allow.proto, Proto::Tcp | Proto::Udp) {
+    let host_rule = matches!(allow.proto, Proto::Http | Proto::Https);
+    if !allow.ports.is_empty() && !matches!(allow.proto, Proto::Tcp | Proto::Udp) && !host_rule {
         return Err(format!(
-            "ports are only valid with tcp or udp, not {}",
+            "ports are only valid with tcp, udp, http or https, not {}",
             allow.proto
         ));
+    }
+    if host_rule && allow.hosts.is_empty() {
+        return Err(format!("hosts are required for {}", allow.proto));
+    }
+    if !host_rule && !allow.hosts.is_empty() {
+        return Err(format!(
+            "hosts are only valid with http or https, not {}",
+            allow.proto
+        ));
+    }
+    for host in &allow.hosts {
+        if allow.proto == Proto::Https && host.has_path() {
+            return Err(format!("https host {host} may not have a path"));
+        }
     }
     Ok(())
 }
@@ -358,7 +512,7 @@ mod tests {
                 &format!("dest: [10.1.0.0/16]\n        proto: {proto}\n        ports: [1]"),
             ));
             assert!(
-                e.contains("clients[0].allow[0]") && e.contains("only valid with tcp or udp"),
+                e.contains("clients[0].allow[0]") && e.contains("only valid with tcp, udp"),
                 "{proto}: {e}"
             );
         }
@@ -442,5 +596,169 @@ mod tests {
             e.to_string(),
             "failed to read policy file /nonexistent/policy.yaml"
         );
+    }
+
+    fn host_rule(proto: &str, extra: &str) -> String {
+        policy(
+            "10.0.0.1/32",
+            &format!("dest: [10.1.0.1/32]\n        proto: {proto}{extra}"),
+        )
+    }
+
+    #[test]
+    fn parses_host_rules() {
+        let p = Policy::parse(&host_rule(
+            "http",
+            "\n        hosts: [Example.COM., \"*.example.org/a/b\"]",
+        ))
+        .unwrap();
+        let allow = &p.clients[0].allow[0];
+        assert_eq!(allow.proto, Proto::Http);
+        assert_eq!(allow.hosts[0].to_string(), "example.com");
+        assert_eq!(allow.hosts[1].to_string(), "*.example.org/a/b");
+        let p = Policy::parse(&host_rule("https", "\n        hosts: [example.com]")).unwrap();
+        assert_eq!(p.clients[0].allow[0].proto, Proto::Https);
+    }
+
+    #[test]
+    fn effective_ports_default_by_proto() {
+        let ports = |proto: &str, extra: &str| {
+            Policy::parse(&host_rule(
+                proto,
+                &format!("\n        hosts: [a.com]{extra}"),
+            ))
+            .unwrap()
+            .clients[0]
+                .allow[0]
+                .effective_ports()
+        };
+        assert_eq!(ports("http", ""), [PortSpec { lo: 80, hi: 80 }]);
+        assert_eq!(ports("https", ""), [PortSpec { lo: 443, hi: 443 }]);
+        assert_eq!(
+            ports("https", "\n        ports: [8443]"),
+            [PortSpec { lo: 8443, hi: 8443 }]
+        );
+        let tcp = Policy::parse(&tcp_ports("22")).unwrap();
+        assert_eq!(
+            tcp.clients[0].allow[0].effective_ports(),
+            [PortSpec { lo: 22, hi: 22 }]
+        );
+        let any = Policy::parse(&policy(
+            "10.0.0.1/32",
+            "dest: [10.1.0.0/16]\n        proto: any",
+        ))
+        .unwrap();
+        assert!(any.clients[0].allow[0].effective_ports().is_empty());
+    }
+
+    #[test]
+    fn host_rule_validation_names_the_entry() {
+        for (proto, extra, expected) in [
+            (
+                "http",
+                "",
+                "clients[0].allow[0]: hosts are required for http",
+            ),
+            (
+                "https",
+                "\n        hosts: []",
+                "clients[0].allow[0]: hosts are required for https",
+            ),
+            (
+                "tcp",
+                "\n        hosts: [a.com]",
+                "clients[0].allow[0]: hosts are only valid with http or https, not tcp",
+            ),
+            (
+                "https",
+                "\n        hosts: [a.com/x]",
+                "clients[0].allow[0]: https host a.com/x may not have a path",
+            ),
+        ] {
+            let e = err(&host_rule(proto, extra));
+            assert!(e.contains(expected), "{proto}{extra}: {e}");
+        }
+        let e = err(
+            "users:\n  - username: a\n    allow:\n      - dest: [10.0.0.0/8]\n        proto: http\n",
+        );
+        assert!(
+            e.contains("users[0].allow[0]: hosts are required for http"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_host_patterns() {
+        for (host, expected) in [
+            ("a.com:80", "may not have a port"),
+            ("a..com", "empty label"),
+            ("\".a.com\"", "empty label"),
+            ("\"\"", "empty"),
+            ("\"*\"", "wildcard"),
+            ("\"a.*.com\"", "wildcard"),
+            ("\"*a.com\"", "wildcard"),
+            ("\"*.*.com\"", "wildcard"),
+            ("\"a.com?x\"", "invalid character"),
+        ] {
+            let e = err(&host_rule("http", &format!("\n        hosts: [{host}]")));
+            assert!(e.contains(expected), "{host}: {e}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_allow() {
+        let e = err(&host_rule(
+            "http",
+            "\n        hosts: [a.com]\n        paths: [/x]",
+        ));
+        assert!(e.contains("unknown field"), "{e}");
+    }
+
+    fn pattern(s: &str) -> HostPattern {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn matches_host() {
+        let exact = pattern("Example.com.");
+        for host in [
+            "example.com",
+            "EXAMPLE.COM",
+            "example.com.",
+            "example.com:8080",
+            "Example.Com.:443",
+        ] {
+            assert!(exact.matches_host(host), "{host}");
+        }
+        for host in ["www.example.com", "example.org", "xexample.com", ""] {
+            assert!(!exact.matches_host(host), "{host}");
+        }
+        let wild = pattern("*.example.com");
+        for host in ["a.example.com", "a.b.example.com", "A.Example.COM.:80"] {
+            assert!(wild.matches_host(host), "{host}");
+        }
+        for host in [
+            "example.com",
+            "aexample.com",
+            ".example.com",
+            "example.com.evil",
+        ] {
+            assert!(!wild.matches_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn matches_path() {
+        let p = pattern("a.com/a/b");
+        for path in ["/a/b", "/a/b/", "/a/b/c", "/a/b?x=1", "/a/b/c?y"] {
+            assert!(p.matches_path(path), "{path}");
+        }
+        for path in ["/a/bc", "/a", "/", "/a/bc?/a/b/", "/x/a/b"] {
+            assert!(!p.matches_path(path), "{path}");
+        }
+        let any = pattern("a.com");
+        for path in ["/", "/anything", "/x?y"] {
+            assert!(any.matches_path(path), "{path}");
+        }
     }
 }

@@ -337,6 +337,7 @@ fn allow_rule(spec: &RuleSpec) -> Vec<Statement<'static>> {
             rule.push(match_eq(meta(MetaKey::L4proto), proto));
         }
         (Proto::Any, _) => {}
+        (Proto::Http | Proto::Https, _) => unreachable!("host rules are not expanded"),
     }
     if let Some(mark) = spec.mark {
         rule.push(Statement::Mangle(stmt::Mangle {
@@ -356,6 +357,7 @@ fn l4proto(proto: Proto) -> u32 {
         Proto::Udp => IPPROTO_UDP,
         Proto::Icmp => IPPROTO_ICMP,
         Proto::Any => unreachable!("`any` matches every protocol"),
+        Proto::Http | Proto::Https => unreachable!("host rules are not expanded"),
     }
 }
 
