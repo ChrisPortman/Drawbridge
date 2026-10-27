@@ -74,7 +74,7 @@ pub(super) async fn serve(
     }
 
     let reset = Arc::new(AtomicBool::new(false));
-    let answering = Arc::new(AtomicBool::new(false));
+    let answering = Arc::new(Answering::default());
     let idle = Arc::new(AtomicBool::new(false));
     let io = Io {
         head,
@@ -83,6 +83,8 @@ pub(super) async fn serve(
         reset: reset.clone(),
         answering: answering.clone(),
         idle: idle.clone(),
+        in_response: false,
+        response_flushed: false,
         upgraded: false,
     };
     let conn = Arc::new(Conn {
@@ -210,8 +212,8 @@ struct Conn {
     peer: SocketAddr,
     dst: SocketAddr,
     reset: Arc<AtomicBool>,
-    /// Set while a response from [`Conn::request`] is on its way out (see [`Io::poll_write`]).
-    answering: Arc<AtomicBool>,
+    /// Tells the [`Io`] about the responses [`Conn::request`] produces.
+    answering: Arc<Answering>,
     /// Notified when a request is denied with a RST.
     denied: Notify,
     /// The upstream connection, opened by the first forwarded request.
@@ -298,9 +300,15 @@ impl Conn {
         self.forward(req).await
     }
 
+    /// Marks `resp` as the service's, so the [`Io`] lets it out.
     fn answer(&self, resp: Response<Body>) -> Response<Body> {
-        self.answering.store(true, Ordering::SeqCst);
-        resp
+        let a = &self.answering;
+        a.body_done.store(false, Ordering::SeqCst);
+        a.upgrade
+            .store(resp.status() == StatusCode::SWITCHING_PROTOCOLS, Ordering::SeqCst);
+        a.head_next.store(true, Ordering::SeqCst);
+        let done = a.clone();
+        resp.map(|body| TrackedBody { body, done }.boxed())
     }
 
     fn log(&self, host: Option<String>, path: Option<String>, reason: Option<DenyReason>) {
@@ -414,13 +422,69 @@ fn not_found(req: &Request<Incoming>) -> Response<Body> {
     resp
 }
 
+/// What [`Conn::answer`] tells the [`Io`] about the service's responses.
+#[derive(Default)]
+struct Answering {
+    /// The next write starts a response head the service produced.
+    head_next: AtomicBool,
+    /// That response is a `101 Switching Protocols`.
+    upgrade: AtomicBool,
+    /// hyper has finished with (or dropped) that response's body.
+    body_done: AtomicBool,
+}
+
+/// A response body that tells [`Answering::body_done`] when hyper is done with it.
+struct TrackedBody {
+    body: Body,
+    done: Arc<Answering>,
+}
+
+impl hyper::body::Body for TrackedBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+        let polled = Pin::new(&mut self.body).poll_frame(cx);
+        if let Poll::Ready(None) = polled {
+            self.done.body_done.store(true, Ordering::SeqCst);
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+impl Drop for TrackedBody {
+    fn drop(&mut self) {
+        self.done.body_done.store(true, Ordering::SeqCst);
+    }
+}
+
 /// The client stream with the bytes the proxy read before hyper took over replayed first.
+///
+/// hyper answers a request it can't parse (an oversized head gets 431) on its own. The `Io`
+/// refuses any write that isn't part of a response the service produced, so the connection
+/// fails and is reset instead. A response lasts from its head until its body is done, flushed,
+/// and the client has sent more (hyper only parses, and so only fails on, a next request then).
 struct Io {
     head: Vec<u8>,
     pos: usize,
     stream: TcpStream,
     reset: Arc<AtomicBool>,
-    answering: Arc<AtomicBool>,
+    answering: Arc<Answering>,
+    /// Whether the writes belong to a response the service produced.
+    in_response: bool,
+    /// Whether that response's body is done and everything written is flushed.
+    response_flushed: bool,
     /// Set when a response head goes out, cleared when the client sends more: whether the
     /// connection is waiting for a next request that hasn't started.
     idle: Arc<AtomicBool>,
@@ -454,6 +518,9 @@ impl AsyncRead for Io {
         let polled = Pin::new(&mut self.stream).poll_read(cx, buf);
         if buf.filled().len() > filled {
             self.idle.store(false, Ordering::SeqCst);
+            if self.response_flushed {
+                self.in_response = false;
+            }
         }
         polled
     }
@@ -465,23 +532,29 @@ impl AsyncWrite for Io {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // hyper answers a request it can't parse (an oversized head gets 431) on its own. A
-        // response head the service didn't produce is one of those: refuse it, so the
-        // connection fails and is reset instead.
         // After a 101, the bytes are the upgraded protocol's.
-        if !self.upgraded && buf.starts_with(b"HTTP/1.") {
-            if !self.answering.swap(false, Ordering::SeqCst) {
+        if !self.upgraded {
+            if self.answering.head_next.swap(false, Ordering::SeqCst) {
+                self.in_response = true;
+                self.response_flushed = false;
+                self.upgraded = self.answering.upgrade.load(Ordering::SeqCst);
+                self.idle.store(true, Ordering::SeqCst);
+            } else if !self.in_response {
                 self.reset.store(true, Ordering::SeqCst);
                 return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
             }
-            self.upgraded = buf[8..].starts_with(b" 101 ");
-            self.idle.store(true, Ordering::SeqCst);
         }
         Pin::new(&mut self.stream).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
+        let flushed = Pin::new(&mut self.stream).poll_flush(cx);
+        if let Poll::Ready(Ok(())) = flushed
+            && self.answering.body_done.load(Ordering::SeqCst)
+        {
+            self.response_flushed = true;
+        }
+        flushed
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -713,6 +786,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_head_after_a_response_is_reset() {
+        // The 431 hyper writes on its own comes after a response the service produced.
+        let h = http(Mode::Enforcing).await;
+        let mut client = h.connect().await;
+        client
+            .write_all(b"GET /private HTTP/1.1\r\nhost: ok.test\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_response(&mut client).await.starts_with("HTTP/1.1 404"));
+        let big = format!(
+            "GET /pub HTTP/1.1\r\nhost: ok.test\r\nx: {}\r\n\r\n",
+            "a".repeat(20_000)
+        );
+        let _ = client.write_all(big.as_bytes()).await;
+        assert_reset(&mut client).await;
+    }
+
+    #[tokio::test]
     async fn incomplete_head_is_reset_after_the_timeout() {
         assert_request_reset(b"GET /pub HTTP/1.1\r\nhost: ok").await;
     }
@@ -789,6 +880,40 @@ mod tests {
         read_response(&mut client).await;
         task.abort();
         assert_closes(&mut up).await;
+    }
+
+    #[tokio::test]
+    async fn a_body_that_looks_like_a_response_head_is_forwarded() {
+        // Only a response the service produced may go out, but a body chunk that happens to
+        // start like a head is part of one.
+        let h = http(Mode::Enforcing).await;
+        let mut client = h.connect().await;
+        client
+            .write_all(b"GET /pub HTTP/1.1\r\nhost: ok.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut up = accept(&h).await;
+        read_head(&mut up).await;
+        up.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\n\r\n")
+            .await
+            .unwrap();
+        // Let the head go out on its own before the body.
+        assert!(read_head(&mut client).await.starts_with("HTTP/1.1 200"));
+        up.write_all(b"HTTP/1.").await.unwrap();
+        let mut body = [0; 7];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut body))
+            .await
+            .expect("no body in time")
+            .expect("body forwarded");
+        assert_eq!(&body, b"HTTP/1.");
+        // And the connection is still usable.
+        client
+            .write_all(b"GET /pub HTTP/1.1\r\nhost: ok.test\r\n\r\n")
+            .await
+            .unwrap();
+        read_head(&mut up).await;
+        up.write_all(OK).await.unwrap();
+        assert!(read_response(&mut client).await.starts_with("HTTP/1.1 200"));
     }
 
     #[tokio::test]
