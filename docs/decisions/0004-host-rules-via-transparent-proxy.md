@@ -1,4 +1,4 @@
-# 0003: Host rules through a transparent proxy
+# 0004: Host rules through a transparent proxy
 
 - Issue: https://github.com/ChrisPortman/Drawbridge/issues/7 (#7)
 - Status: Accepted
@@ -43,13 +43,13 @@ This touches several invariants in `AGENTS.md`:
 - Policy schema and validation for host rules, with unit tests.
 - `ruleset.rs` IR and rendering for the nat `prerouting` chain, the `proxy_redirect` chain and the
   proxy accept rule, with unit tests.
-- nfraw encodes `redirect` and `ct status dnat`, matched against a new byte golden
-  (`tests/data/proxy.netlink.hex`).
+- `firewall/json.rs` encodes `redirect` and `ct status dnat` as nft JSON that nftables 0.9.3
+  accepts, with unit tests and the `example.json` golden regenerated.
 - The proxy handles SNI and HTTP, RST and 404, Upgrade, timeouts and size limits, with unit tests.
 - The proxy reads a session view, and ending a session closes its proxied connections.
 - Deduplicated `drawbridge drop:` / `drawbridge would-drop:` log lines.
 - `--proxy-port` / `DRAWBRIDGE_PROXY_PORT` is required when the policy has host rules.
-- Regenerated `example.nft`, `example.kernel.nft` and `sessions.kernel.nft`; `tests/kernel.rs`
+- Regenerated `example.nft`, `example.json`, `example.kernel.nft` and `sessions.kernel.nft`; `tests/kernel.rs`
   extended.
 - e2e checks:
   - client http: allowed path, denied path (404), denied host (RST);
@@ -135,8 +135,10 @@ This touches several invariants in `AGENTS.md`:
   and tls-parser is a heavy dependency.
 
 **Kernel encoding.**
-- rustables 0.9 has no `redir` expression and no `ct status` key, so both are hand-encoded in
-  `nfraw`, as was done for the drop log.
+- Drawbridge drives nftables through the `nft` binary with JSON (ADR 0003), so `redirect` and
+  `ct status dnat` are ordinary statements in `firewall/json.rs`. They must stay within what
+  nft 0.9.3 parses. A kernel without `nft_redir`/`nft_nat` is reported like the drop log: the
+  apply is retried as an `nft -c` dry run without the nat parts.
 
 **Listener.**
 - The proxy listens dual-stack on `[::]:<--proxy-port>`, with no separate listen-address flag. A
@@ -148,7 +150,7 @@ This touches several invariants in `AGENTS.md`:
 
 Delivered as sub-issues of #7. They touch these modules:
 - `policy.rs`;
-- `firewall/ruleset.rs`, `firewall/nfraw.rs` and `firewall.rs`;
+- `firewall/ruleset.rs`, `firewall/json.rs` and `firewall.rs`;
 - `session.rs`;
 - the new `proxy.rs`, with `sni`, `http` and `droplog`;
 - `cli.rs` and `cli/gateway.rs`;
