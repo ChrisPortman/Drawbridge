@@ -63,7 +63,7 @@ cargo test                                   # unit tests, no privileges needed
 cargo clippy --all-targets                   # keep warning-free
 cargo fmt
 cargo run -- server check --policy examples/policy.yaml --external-iface wg0 \
-    --portal-listen 192.168.50.1:8443          # print planned ruleset (matches tests/data/example.nft)
+    --portal-listen 192.168.50.1:8443 --proxy-port 3128   # print planned ruleset (matches tests/data/example.nft)
 ./e2e/run.sh                                 # full end-to-end test (Docker + Compose v2, no root)
 ```
 

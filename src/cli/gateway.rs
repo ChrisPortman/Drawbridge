@@ -22,7 +22,12 @@ const PORTAL_DRAIN: Duration = Duration::from_secs(2);
 
 fn load(args: &PolicyArgs) -> anyhow::Result<(Policy, Ruleset)> {
     let policy = Policy::load(&args.policy)?;
-    let mut ruleset = Ruleset::from_policy(&policy, &args.external_iface, &args.portal_listen)?;
+    let mut ruleset = Ruleset::from_policy(
+        &policy,
+        &args.external_iface,
+        &args.portal_listen,
+        args.proxy_port,
+    )?;
     if args.permissive {
         ruleset.mode = Mode::Permissive;
     }

@@ -486,8 +486,13 @@ mod tests {
 
     fn example() -> (Policy, Ruleset) {
         let policy = Policy::parse(include_str!("../../examples/policy.yaml")).unwrap();
-        let ruleset =
-            Ruleset::from_policy(&policy, "wg0", &["192.168.50.1:8443".parse().unwrap()]).unwrap();
+        let ruleset = Ruleset::from_policy(
+            &policy,
+            "wg0",
+            &["192.168.50.1:8443".parse().unwrap()],
+            Some(3128),
+        )
+        .unwrap();
         (policy, ruleset)
     }
 

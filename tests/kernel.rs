@@ -23,6 +23,7 @@ use drawbridge::firewall::{
 use drawbridge::policy::{Allow, Client, Policy, PortSpec, Proto};
 
 const PORTAL: &str = "192.168.50.1:8443";
+const PROXY_PORT: u16 = 3128;
 
 /// Chains without sessions: 2 base, client_filter, session_flows, sessions and the 2 log chains.
 const CHAINS: usize = 7;
@@ -90,7 +91,8 @@ async fn apply_and_teardown() {
     let _guard = KERNEL.lock().await;
     let fw = firewall();
     let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
-    let ruleset = Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()]).unwrap();
+    let ruleset =
+        Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()], Some(PROXY_PORT)).unwrap();
 
     // Applying twice must replace, not duplicate, the table.
     fw.apply(&ruleset).await.unwrap();
@@ -150,7 +152,7 @@ fn large_policy() -> Policy {
 async fn apply_large_policy() {
     let _guard = KERNEL.lock().await;
     let fw = firewall();
-    let ruleset = Ruleset::from_policy(&large_policy(), "wg0", &[]).unwrap();
+    let ruleset = Ruleset::from_policy(&large_policy(), "wg0", &[], None).unwrap();
     assert_eq!(ruleset.rules.len(), 5000);
 
     fw.apply(&ruleset).await.unwrap();
@@ -173,7 +175,8 @@ async fn add_and_remove_sessions() {
     let _guard = KERNEL.lock().await;
     let fw = firewall();
     let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
-    let mut ruleset = Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()]).unwrap();
+    let mut ruleset =
+        Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()], Some(PROXY_PORT)).unwrap();
     fw.apply(&ruleset).await.unwrap();
 
     let s1 = session(&policy, 1, "192.168.60.7");
@@ -220,7 +223,7 @@ async fn session_churn() {
     let _guard = KERNEL.lock().await;
     let fw = firewall();
     let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
-    fw.apply(&Ruleset::from_policy(&policy, "wg0", &[]).unwrap())
+    fw.apply(&Ruleset::from_policy(&policy, "wg0", &[], Some(PROXY_PORT)).unwrap())
         .await
         .unwrap();
 
@@ -267,7 +270,8 @@ async fn permissive_accepts_and_logs_would_drop() {
     let _guard = KERNEL.lock().await;
     let fw = firewall();
     let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
-    let mut ruleset = Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()]).unwrap();
+    let mut ruleset =
+        Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()], Some(PROXY_PORT)).unwrap();
     ruleset.mode = Mode::Permissive;
     fw.apply(&ruleset).await.unwrap();
 

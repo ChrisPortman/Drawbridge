@@ -27,6 +27,12 @@ pub const SESSION_FLOWS_CHAIN: &str = "session_flows";
 pub(crate) const SESSION_CHAIN_PREFIX: &str = "session_";
 /// Priority of the base chains (`filter`).
 pub(crate) const BASE_CHAIN_PRIORITY: i32 = 0;
+/// Nat base chain that sends external-interface traffic to [`PROXY_REDIRECT_CHAIN`], named after
+/// its hook. It runs before the filter chains, so host rules take precedence over IP rules.
+pub(crate) const NAT_CHAIN: &str = "prerouting";
+/// Regular chain redirecting host-rule traffic to the proxy: client redirects, then session
+/// redirects.
+pub const PROXY_REDIRECT_CHAIN: &str = "proxy_redirect";
 /// Regular chain, jumped to by each base chain just before its default action, that logs the
 /// packet once per [`LOG_WINDOW`] for each key (see [`LogSet`]). TCP and UDP continue by `goto`
 /// in [`DROP_LOG_PORTS_CHAIN`], whose keys include the destination port.
@@ -241,6 +247,8 @@ pub enum RulesetError {
     InterfaceName(String),
     #[error("portal listen address {0} must be a specific address, not unspecified")]
     PortalAddr(SocketAddr),
+    #[error("the policy has host rules (http, https), which need --proxy-port")]
+    ProxyPortRequired,
     #[error("invalid policy")]
     Policy(#[from] PolicyError),
 }
@@ -252,6 +260,11 @@ pub struct Ruleset {
     pub portal: Vec<SocketAddr>,
     /// Static per-client rules from the policy's `clients`.
     pub rules: Vec<RuleSpec>,
+    /// Port of the transparent proxy that host rules redirect to. Required when the policy has
+    /// host rules.
+    pub proxy_port: Option<u16>,
+    /// Redirects to the proxy from the policy's `clients` host rules.
+    pub redirects: Vec<RedirectSpec>,
     /// Authenticated sessions, each in its own chain. Empty when built from a policy.
     pub sessions: Vec<SessionRules>,
     /// [`Mode::Enforcing`] when built from a policy.
@@ -266,6 +279,8 @@ pub struct SessionRules {
     pub id: u32,
     pub ip: IpAddr,
     pub rules: Vec<RuleSpec>,
+    /// Redirects to the proxy from the user's host rules, each setting the session's ct mark.
+    pub redirects: Vec<RedirectSpec>,
 }
 
 impl SessionRules {
@@ -275,15 +290,23 @@ impl SessionRules {
         assert_ne!(id, 0, "session id 0 is the unmarked ct mark");
         let user = policy.user(username)?;
         let src = IpNetwork::from(ip);
-        let mut rules = Vec::new();
+        let (mut rules, mut redirects) = (Vec::new(), Vec::new());
         for allow in &user.allow {
             let same_family = allow.dest.iter().filter(|d| d.is_ipv4() == ip.is_ipv4());
-            expand(&mut rules, src, allow, same_family.copied());
+            expand(&mut rules, &mut redirects, src, allow, same_family.copied());
         }
         for rule in &mut rules {
             rule.mark = Some(id);
         }
-        Some(SessionRules { id, ip, rules })
+        for redirect in &mut redirects {
+            redirect.mark = Some(id);
+        }
+        Some(SessionRules {
+            id,
+            ip,
+            rules,
+            redirects,
+        })
     }
 
     pub(crate) fn chain(&self) -> String {
@@ -313,13 +336,25 @@ impl RuleSpec {
     }
 }
 
+/// One redirect to the proxy: TCP from `src` to `dst` on destination ports `ports`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedirectSpec {
+    pub src: IpNetwork,
+    pub dst: IpNetwork,
+    pub ports: PortSpec,
+    /// `ct mark` to tag redirected connections with (session redirects only).
+    pub mark: Option<u32>,
+}
+
 impl Ruleset {
     /// Validates the policy, then expands it into one rule per client × allow entry × dest × port
     /// spec, in policy order. `portal` addresses get an accept rule ahead of the client rules.
+    /// Host rules become redirects to `proxy_port` instead, which is then required.
     pub fn from_policy(
         policy: &Policy,
         external_iface: &str,
         portal: &[SocketAddr],
+        proxy_port: Option<u16>,
     ) -> Result<Self, RulesetError> {
         if !is_valid_iface_name(external_iface) {
             return Err(RulesetError::InterfaceName(external_iface.to_string()));
@@ -329,32 +364,61 @@ impl Ruleset {
             return Err(RulesetError::PortalAddr(addr));
         }
         policy.validate()?;
-        let mut rules = Vec::new();
+        let has_host_rules = (policy.clients.iter().flat_map(|c| &c.allow))
+            .chain(policy.users.iter().flat_map(|u| &u.allow))
+            .any(is_host_rule);
+        if has_host_rules && proxy_port.is_none() {
+            return Err(RulesetError::ProxyPortRequired);
+        }
+        let (mut rules, mut redirects) = (Vec::new(), Vec::new());
         for client in &policy.clients {
             let src = normalize(client.cidr);
             for allow in &client.allow {
-                expand(&mut rules, src, allow, allow.dest.iter().copied());
+                expand(
+                    &mut rules,
+                    &mut redirects,
+                    src,
+                    allow,
+                    allow.dest.iter().copied(),
+                );
             }
         }
         Ok(Ruleset {
             external_iface: external_iface.to_string(),
             portal: portal.to_vec(),
             rules,
+            proxy_port,
+            redirects,
             sessions: Vec::new(),
             mode: Mode::Enforcing,
         })
     }
 }
 
-/// Appends one rule per dest × port spec of `allow`, from `src`. Host rules (`http`, `https`)
-/// generate nothing yet, so they allow nothing.
+fn is_host_rule(allow: &Allow) -> bool {
+    matches!(allow.proto, Proto::Http | Proto::Https)
+}
+
+/// Appends one entry per dest × port spec of `allow`, from `src`: a redirect to the proxy for a
+/// host rule (`http`, `https`, with their default ports), otherwise an accept rule.
 fn expand(
     rules: &mut Vec<RuleSpec>,
+    redirects: &mut Vec<RedirectSpec>,
     src: IpNetwork,
     allow: &Allow,
     dests: impl Iterator<Item = IpNetwork>,
 ) {
-    if matches!(allow.proto, Proto::Http | Proto::Https) {
+    if is_host_rule(allow) {
+        let ports = allow.effective_ports();
+        for dest in dests {
+            let dst = normalize(dest);
+            redirects.extend(ports.iter().map(|&ports| RedirectSpec {
+                src,
+                dst,
+                ports,
+                mark: None,
+            }));
+        }
         return;
     }
     for dest in dests {
@@ -417,6 +481,39 @@ fn family(ip: IpAddr) -> &'static str {
     if ip.is_ipv4() { "ip" } else { "ip6" }
 }
 
+/// A redirect rule in `proxy_redirect`, sending matching TCP to the proxy port.
+pub(crate) struct RedirectRule<'a>(pub(crate) &'a RedirectSpec, pub(crate) u16);
+
+impl fmt::Display for RedirectRule<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let RedirectRule(r, proxy_port) = *self;
+        let family = family(r.src.ip());
+        write!(
+            f,
+            "{family} saddr {} {family} daddr {} tcp dport {}",
+            r.src, r.dst, r.ports
+        )?;
+        if let Some(mark) = r.mark {
+            write!(f, " ct mark set {mark:#010x}")?;
+        }
+        write!(f, " counter redirect to :{proxy_port}")
+    }
+}
+
+/// The `client_filter` rule accepting connections redirected to the proxy port. Requiring
+/// `ct status dnat` keeps clients from reaching the proxy directly.
+pub(crate) struct ProxyAcceptRule(pub(crate) u16);
+
+impl fmt::Display for ProxyAcceptRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "meta l4proto tcp th dport {} ct status dnat counter accept",
+            self.0
+        )
+    }
+}
+
 /// The portal accept rule for one listen address.
 pub(crate) struct PortalRule(pub(crate) SocketAddr);
 
@@ -477,9 +574,27 @@ impl fmt::Display for Ruleset {
             writeln!(f, "\t\tiifname \"{iface}\" counter {}", self.mode.verdict())?;
             writeln!(f, "\t}}")?;
         }
+        writeln!(f, "\tchain {NAT_CHAIN} {{")?;
+        writeln!(
+            f,
+            "\t\ttype nat hook {NAT_CHAIN} priority dstnat; policy accept;"
+        )?;
+        writeln!(f, "\t\tiifname \"{iface}\" jump {PROXY_REDIRECT_CHAIN}")?;
+        writeln!(f, "\t}}")?;
+        writeln!(f, "\tchain {PROXY_REDIRECT_CHAIN} {{")?;
+        if let Some(port) = self.proxy_port {
+            let session_redirects = self.sessions.iter().flat_map(|s| &s.redirects);
+            for redirect in self.redirects.iter().chain(session_redirects) {
+                writeln!(f, "\t\t{}", RedirectRule(redirect, port))?;
+            }
+        }
+        writeln!(f, "\t}}")?;
         writeln!(f, "\tchain {FILTER_CHAIN} {{")?;
         writeln!(f, "\t\tct mark != 0x00000000 goto {SESSION_FLOWS_CHAIN}")?;
         writeln!(f, "\t\tct state established,related accept")?;
+        if let Some(port) = self.proxy_port {
+            writeln!(f, "\t\t{}", ProxyAcceptRule(port))?;
+        }
         for &addr in &self.portal {
             writeln!(f, "\t\t{}", PortalRule(addr))?;
         }
@@ -531,9 +646,16 @@ mod tests {
     }
 
     const PORTAL: &str = "192.168.50.1:8443";
+    const PROXY_PORT: u16 = 3128;
 
     fn example() -> Ruleset {
-        Ruleset::from_policy(&example_policy(), "wg0", &[PORTAL.parse().unwrap()]).unwrap()
+        Ruleset::from_policy(
+            &example_policy(),
+            "wg0",
+            &[PORTAL.parse().unwrap()],
+            Some(PROXY_PORT),
+        )
+        .unwrap()
     }
 
     fn rule_strings(rules: &[RuleSpec]) -> Vec<String> {
@@ -560,7 +682,7 @@ mod tests {
             "clients:\n  - cidr: 10.0.0.7/24\n    allow:\n      - dest: [10.1.2.3/16]\n        proto: any\n",
         )
         .unwrap();
-        let rs = Ruleset::from_policy(&policy, "wg0", &[]).unwrap();
+        let rs = Ruleset::from_policy(&policy, "wg0", &[], None).unwrap();
         assert_eq!(
             rs.rules[0].to_string(),
             "ip saddr 10.0.0.0/24 ip daddr 10.1.0.0/16 counter accept"
@@ -571,7 +693,10 @@ mod tests {
     fn accepts_interface_names_up_to_15_bytes() {
         let policy = Policy::default();
         for name in ["wg0", "eth0.100", "br-lan_1", "a23456789012345"] {
-            assert!(Ruleset::from_policy(&policy, name, &[]).is_ok(), "{name}");
+            assert!(
+                Ruleset::from_policy(&policy, name, &[], None).is_ok(),
+                "{name}"
+            );
         }
     }
 
@@ -591,7 +716,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    Ruleset::from_policy(&policy, name, &[]),
+                    Ruleset::from_policy(&policy, name, &[], None),
                     Err(RulesetError::InterfaceName(_))
                 ),
                 "{name:?}"
@@ -614,7 +739,7 @@ mod tests {
             }],
         };
         assert!(matches!(
-            Ruleset::from_policy(&policy, "wg0", &[]),
+            Ruleset::from_policy(&policy, "wg0", &[], None),
             Err(RulesetError::Policy(_))
         ));
     }
@@ -664,7 +789,7 @@ mod tests {
 ",
         )
         .unwrap();
-        let rules: Vec<String> = Ruleset::from_policy(&policy, "wg0", &[])
+        let rules: Vec<String> = Ruleset::from_policy(&policy, "wg0", &[], None)
             .unwrap()
             .rules
             .iter()
@@ -685,7 +810,7 @@ mod tests {
         for addr in ["0.0.0.0:443", "[::]:443"] {
             assert!(
                 matches!(
-                    Ruleset::from_policy(&Policy::default(), "wg0", &[addr.parse().unwrap()]),
+                    Ruleset::from_policy(&Policy::default(), "wg0", &[addr.parse().unwrap()], None),
                     Err(RulesetError::PortalAddr(_))
                 ),
                 "{addr}"
@@ -734,7 +859,7 @@ mod tests {
     #[test]
     fn renders_sessions() {
         let policy = example_policy();
-        let mut rs = Ruleset::from_policy(&Policy::default(), "wg0", &[]).unwrap();
+        let mut rs = Ruleset::from_policy(&Policy::default(), "wg0", &[], None).unwrap();
         rs.sessions = vec![
             SessionRules::for_user(&policy, 3, "alice", "192.168.60.7".parse().unwrap()).unwrap(),
             SessionRules::for_user(&policy, 4, "alice", "fd00:60::7".parse().unwrap()).unwrap(),
@@ -795,6 +920,159 @@ mod tests {
                 .iter()
                 .all(|s| (s.chain() == DROP_LOG_PORTS_CHAIN) == s.ports)
         );
+    }
+
+    fn host_policy() -> Policy {
+        Policy::parse(
+            "clients:
+  - cidr: 10.0.0.0/24
+    allow:
+      - dest: [10.1.0.0/16]
+        proto: https
+        hosts: [example.com]
+      - dest: [10.2.0.5/32]
+        proto: http
+        ports: [8080, 9000-9001]
+        hosts: [\"*.example.com/api\"]
+      - dest: [10.3.0.0/16]
+        proto: tcp
+        ports: [22]
+  - cidr: fd00::/64
+    allow:
+      - dest: [\"fd01::/64\"]
+        proto: http
+        hosts: [example.com]
+users:
+  - username: bob
+    allow:
+      - dest: [10.4.0.0/16, \"fd04::/64\"]
+        proto: https
+        hosts: [example.org]
+      - dest: [10.5.0.0/16]
+        proto: tcp
+        ports: [22]
+",
+        )
+        .unwrap()
+    }
+
+    fn host_ruleset() -> Ruleset {
+        Ruleset::from_policy(&host_policy(), "wg0", &[], Some(3128)).unwrap()
+    }
+
+    #[test]
+    fn host_rules_need_a_proxy_port() {
+        assert!(matches!(
+            Ruleset::from_policy(&host_policy(), "wg0", &[], None),
+            Err(RulesetError::ProxyPortRequired)
+        ));
+        // User host rules need one too.
+        let mut users_only = host_policy();
+        users_only.clients.clear();
+        assert!(matches!(
+            Ruleset::from_policy(&users_only, "wg0", &[], None),
+            Err(RulesetError::ProxyPortRequired)
+        ));
+        // A policy without host rules needs none.
+        let mut no_hosts = host_policy();
+        no_hosts.clients.truncate(0);
+        no_hosts.users.clear();
+        assert!(Ruleset::from_policy(&no_hosts, "wg0", &[], None).is_ok());
+    }
+
+    #[test]
+    fn host_rules_leave_the_filter_rules() {
+        assert_eq!(
+            rule_strings(&host_ruleset().rules),
+            ["ip saddr 10.0.0.0/24 ip daddr 10.3.0.0/16 tcp dport 22 counter accept"]
+        );
+        let session =
+            SessionRules::for_user(&host_policy(), 7, "bob", "10.9.0.1".parse().unwrap()).unwrap();
+        assert_eq!(
+            rule_strings(&session.rules),
+            [
+                "ip saddr 10.9.0.1/32 ip daddr 10.5.0.0/16 tcp dport 22 ct mark set 0x00000007 counter accept"
+            ]
+        );
+    }
+
+    fn redirect_strings(redirects: &[RedirectSpec]) -> Vec<String> {
+        redirects
+            .iter()
+            .map(|r| RedirectRule(r, 3128).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn renders_client_redirects_with_default_ports() {
+        assert_eq!(
+            redirect_strings(&host_ruleset().redirects),
+            [
+                "ip saddr 10.0.0.0/24 ip daddr 10.1.0.0/16 tcp dport 443 counter redirect to :3128",
+                "ip saddr 10.0.0.0/24 ip daddr 10.2.0.5/32 tcp dport 8080 counter redirect to :3128",
+                "ip saddr 10.0.0.0/24 ip daddr 10.2.0.5/32 tcp dport 9000-9001 counter redirect to :3128",
+                "ip6 saddr fd00::/64 ip6 daddr fd01::/64 tcp dport 80 counter redirect to :3128",
+            ]
+        );
+    }
+
+    #[test]
+    fn session_redirects_follow_the_login_family_and_mark() {
+        let policy = host_policy();
+        let v4 = SessionRules::for_user(&policy, 7, "bob", "10.9.0.1".parse().unwrap()).unwrap();
+        assert_eq!(
+            redirect_strings(&v4.redirects),
+            [
+                "ip saddr 10.9.0.1/32 ip daddr 10.4.0.0/16 tcp dport 443 ct mark set 0x00000007 counter redirect to :3128"
+            ]
+        );
+        let v6 = SessionRules::for_user(&policy, 8, "bob", "fd09::1".parse().unwrap()).unwrap();
+        assert_eq!(
+            redirect_strings(&v6.redirects),
+            [
+                "ip6 saddr fd09::1/128 ip6 daddr fd04::/64 tcp dport 443 ct mark set 0x00000008 counter redirect to :3128"
+            ]
+        );
+    }
+
+    #[test]
+    fn renders_nat_chain_redirects_and_proxy_accept() {
+        let mut rs = host_ruleset();
+        rs.sessions = vec![
+            SessionRules::for_user(&host_policy(), 7, "bob", "10.9.0.1".parse().unwrap()).unwrap(),
+        ];
+        let text = rs.to_string();
+        assert!(text.contains(
+            "\tchain prerouting {
+\t\ttype nat hook prerouting priority dstnat; policy accept;
+\t\tiifname \"wg0\" jump proxy_redirect
+\t}
+\tchain proxy_redirect {
+\t\tip saddr 10.0.0.0/24 ip daddr 10.1.0.0/16 tcp dport 443 counter redirect to :3128
+\t\tip saddr 10.0.0.0/24 ip daddr 10.2.0.5/32 tcp dport 8080 counter redirect to :3128
+\t\tip saddr 10.0.0.0/24 ip daddr 10.2.0.5/32 tcp dport 9000-9001 counter redirect to :3128
+\t\tip6 saddr fd00::/64 ip6 daddr fd01::/64 tcp dport 80 counter redirect to :3128
+\t\tip saddr 10.9.0.1/32 ip daddr 10.4.0.0/16 tcp dport 443 ct mark set 0x00000007 counter redirect to :3128
+\t}
+"
+        ), "{text}");
+        assert!(
+            text.contains(
+                "\t\tct state established,related accept
+\t\tmeta l4proto tcp th dport 3128 ct status dnat counter accept
+\t\tip saddr 10.0.0.0/24"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn no_proxy_port_renders_no_proxy_accept() {
+        let text = Ruleset::from_policy(&Policy::default(), "wg0", &[], None)
+            .unwrap()
+            .to_string();
+        assert!(!text.contains("ct status dnat"), "{text}");
+        assert!(text.contains("\tchain proxy_redirect {\n\t}\n"), "{text}");
     }
 
     #[test]
