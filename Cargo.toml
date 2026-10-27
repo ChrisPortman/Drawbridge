@@ -20,6 +20,7 @@ openidconnect = { version = "4.0.1", default-features = false, features = ["reqw
 rand = "0.10.3"
 # The client service trusts the OS store; the gateway turns these roots off (portal/oidc.rs).
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-native-roots", "json"] }
+nftables = "0.6.3"
 rustables = "0.9"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }

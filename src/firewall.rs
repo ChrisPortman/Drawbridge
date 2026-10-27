@@ -1,6 +1,7 @@
 //! Translates a [`Ruleset`] into nf_tables netlink batches via `rustables`, sent with
 //! `netlink::send_batch`.
 
+mod json;
 mod netlink;
 mod nfraw;
 pub mod ruleset;
