@@ -184,7 +184,7 @@ pub struct PolicyArgs {
     pub portal_listen: Vec<SocketAddr>,
     /// TCP port of the transparent proxy that host rules (`http`, `https`) redirect to. Required
     /// when the policy has host rules.
-    #[arg(long, env = "DRAWBRIDGE_PROXY_PORT")]
+    #[arg(long, env = "DRAWBRIDGE_PROXY_PORT", value_parser = clap::value_parser!(u16).range(1..))]
     pub proxy_port: Option<u16>,
     /// Accept traffic the policy doesn't allow instead of dropping it, logging it as
     /// "drawbridge would-drop". For rolling out onto a gateway already carrying traffic: tune the
@@ -276,6 +276,15 @@ mod tests {
 
     fn parse(args: &str) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("drawbridge").chain(args.split_whitespace()))
+    }
+
+    #[test]
+    fn proxy_port_must_be_a_nonzero_port() {
+        let base = "server check --policy p.yaml --external-iface wg0 --proxy-port";
+        assert!(parse(&format!("{base} 3128")).is_ok());
+        // Port 0 would bind a random port that the redirects don't point at.
+        assert!(parse(&format!("{base} 0")).is_err());
+        assert!(parse(&format!("{base} 65536")).is_err());
     }
 
     #[test]

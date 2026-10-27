@@ -83,7 +83,9 @@ pub(crate) fn update_sessions(
     }
     // Without a proxy port, apply installed no nat chains.
     if base.proxy_port.is_some() {
-        cmds.push(NfCmd::Flush(FlushObject::Chain(chain(PROXY_REDIRECT_CHAIN))));
+        cmds.push(NfCmd::Flush(FlushObject::Chain(chain(
+            PROXY_REDIRECT_CHAIN,
+        ))));
     }
     live_session_cmds(&mut cmds, live);
     redirect_cmds(&mut cmds, base, live);

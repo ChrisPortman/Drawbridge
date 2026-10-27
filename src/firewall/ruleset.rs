@@ -247,7 +247,9 @@ pub enum RulesetError {
     InterfaceName(String),
     #[error("portal listen address {0} must be a specific address, not unspecified")]
     PortalAddr(SocketAddr),
-    #[error("the policy has host rules (http, https), which need --proxy-port")]
+    #[error(
+        "the policy has host rules (http, https), which need --proxy-port (DRAWBRIDGE_PROXY_PORT)"
+    )]
     ProxyPortRequired,
     #[error("invalid policy")]
     Policy(#[from] PolicyError),
