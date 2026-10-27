@@ -151,8 +151,10 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
 
     let mut servers = Servers::default();
     let mut sessions_task = None;
+    // Live sessions for the host-rule proxy; constant and empty without a portal.
+    let mut _session_view = session::idle_view();
     if let Some(portal) = prepared {
-        let (sessions, task) = session::spawn(SessionTable::new(
+        let (sessions, view, task) = session::spawn(SessionTable::new(
             Arc::new(policy),
             Kernel {
                 firewall: firewall.clone(),
@@ -161,6 +163,7 @@ pub async fn run(args: &RunArgs) -> anyhow::Result<()> {
             args.portal.session_max_ttl,
         ));
         sessions_task = Some(task);
+        _session_view = view;
         servers = portal.serve(sessions);
     }
 
