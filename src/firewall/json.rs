@@ -10,7 +10,8 @@ use std::net::{IpAddr, SocketAddr};
 
 use ipnetwork::IpNetwork;
 use nftables::expr::{
-    CT, Expression, Fib, FibFlag, FibResult, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix, Range,
+    CT, Expression, Fib, FibFlag, FibResult, Meta, MetaKey, NamedExpression, Payload, PayloadField,
+    Prefix, Range,
 };
 use nftables::schema::{
     Chain, FlushObject, NfCmd, NfListObject, NfObject, Nftables, Rule, Set, SetFlag, SetType,

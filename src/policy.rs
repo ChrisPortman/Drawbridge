@@ -1,5 +1,6 @@
 //! Allow-list policy file: YAML schema, loading and validation.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -85,21 +86,28 @@ pub struct Allow {
 }
 
 impl Allow {
+    /// Whether this is a host rule (`http` or `https`), which the proxy enforces.
+    pub(crate) fn is_host_rule(&self) -> bool {
+        self.proto.is_host()
+    }
+
     /// The destination ports this entry allows: `ports`, or 80 for `http` and 443 for `https`
     /// when it is empty. Empty means any port.
-    pub fn effective_ports(&self) -> Vec<PortSpec> {
+    pub(crate) fn effective_ports(&self) -> Cow<'_, [PortSpec]> {
         let default = match self.proto {
             Proto::Http => 80,
             Proto::Https => 443,
-            _ => return self.ports.clone(),
+            Proto::Tcp | Proto::Udp | Proto::Icmp | Proto::Any => {
+                return Cow::Borrowed(&self.ports);
+            }
         };
         if self.ports.is_empty() {
-            vec![PortSpec {
+            Cow::Owned(vec![PortSpec {
                 lo: default,
                 hi: default,
-            }]
+            }])
         } else {
-            self.ports.clone()
+            Cow::Borrowed(&self.ports)
         }
     }
 }
@@ -118,13 +126,13 @@ pub struct HostPattern {
 }
 
 impl HostPattern {
-    pub fn has_path(&self) -> bool {
+    pub(crate) fn has_path(&self) -> bool {
         self.path.is_some()
     }
 
     /// Whether `host` (a TLS SNI or HTTP `Host` header) is allowed. Case-insensitive; a trailing
     /// dot and a `:port` are ignored. A wildcard matches one or more labels, never the apex.
-    pub fn matches_host(&self, host: &str) -> bool {
+    pub(crate) fn matches_host(&self, host: &str) -> bool {
         let host = match host.rsplit_once(':') {
             Some((h, port)) if port.bytes().all(|b| b.is_ascii_digit()) => h,
             _ => host,
@@ -272,6 +280,16 @@ pub enum Proto {
     Http,
     /// A host rule matched on the TLS SNI.
     Https,
+}
+
+impl Proto {
+    /// Whether this is a host-rule protocol (`http` or `https`).
+    pub(crate) fn is_host(self) -> bool {
+        match self {
+            Proto::Http | Proto::Https => true,
+            Proto::Tcp | Proto::Udp | Proto::Icmp | Proto::Any => false,
+        }
+    }
 }
 
 impl fmt::Display for Proto {
@@ -427,7 +445,7 @@ fn validate_allow(allow: &Allow) -> Result<(), String> {
     if allow.dest.is_empty() {
         return Err("dest must not be empty".into());
     }
-    let host_rule = matches!(allow.proto, Proto::Http | Proto::Https);
+    let host_rule = allow.is_host_rule();
     if !allow.ports.is_empty() && !matches!(allow.proto, Proto::Tcp | Proto::Udp) && !host_rule {
         return Err(format!(
             "ports are only valid with tcp, udp, http or https, not {}",
@@ -678,6 +696,7 @@ mod tests {
             .clients[0]
                 .allow[0]
                 .effective_ports()
+                .into_owned()
         };
         assert_eq!(ports("http", ""), [PortSpec { lo: 80, hi: 80 }]);
         assert_eq!(ports("https", ""), [PortSpec { lo: 443, hi: 443 }]);
@@ -687,7 +706,7 @@ mod tests {
         );
         let tcp = Policy::parse(&tcp_ports("22")).unwrap();
         assert_eq!(
-            tcp.clients[0].allow[0].effective_ports(),
+            tcp.clients[0].allow[0].effective_ports().into_owned(),
             [PortSpec { lo: 22, hi: 22 }]
         );
         let any = Policy::parse(&policy(

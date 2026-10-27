@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 
 use crate::firewall::ruleset::{RuleSpec, Ruleset, SessionRules};
 use crate::firewall::{Firewall, FirewallError};
-use crate::policy::{Allow, Policy, Proto};
+use crate::policy::{Allow, Policy};
 use crate::portal::Secret;
 
 /// How long to wait before retrying a failed firewall rebuild.
@@ -500,7 +500,7 @@ fn host_rules(policy: &Policy, username: &str, ip: IpAddr) -> Arc<[Allow]> {
     };
     user.allow
         .iter()
-        .filter(|a| matches!(a.proto, Proto::Http | Proto::Https))
+        .filter(|a| a.is_host_rule())
         .filter_map(|a| {
             let dest: Vec<_> = a
                 .dest

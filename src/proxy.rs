@@ -224,7 +224,7 @@ impl Proxy {
             .clients
             .iter()
             .map(|c| {
-                let hosts = c.allow.iter().filter(|a| is_host_rule(a)).cloned();
+                let hosts = c.allow.iter().filter(|a| a.is_host_rule()).cloned();
                 (c.cidr, hosts.collect::<Vec<_>>())
             })
             .filter(|(_, allow)| !allow.is_empty())
@@ -337,7 +337,9 @@ impl Proxy {
                 ClientHello::NoSni => (None, Some(DenyReason::NoSni)),
                 ClientHello::Ech => (None, Some(DenyReason::Ech)),
                 ClientHello::NotTls => (None, Some(DenyReason::NotTls)),
-                ClientHello::Malformed | ClientHello::NeedMore => (None, Some(DenyReason::Malformed)),
+                ClientHello::Malformed | ClientHello::NeedMore => {
+                    (None, Some(DenyReason::Malformed))
+                }
             },
         };
 
@@ -396,12 +398,7 @@ fn is_proxy_itself(dst: SocketAddr, local: Option<SocketAddr>) -> bool {
         return true;
     };
     // Only a local address can be bound (without IP_FREEBIND).
-    dst == local
-        || (dst.port() == local.port() && std::net::UdpSocket::bind((dst.ip(), 0)).is_ok())
-}
-
-fn is_host_rule(allow: &Allow) -> bool {
-    matches!(allow.proto, Proto::Http | Proto::Https)
+    dst == local || (dst.port() == local.port() && std::net::UdpSocket::bind((dst.ip(), 0)).is_ok())
 }
 
 /// `None` if no rule in `rules` allows `host` at `dst`; otherwise whether one also allows `path`
@@ -869,7 +866,10 @@ clients:
         let _a2 = Limits::acquire(&limits, a).expect("second from a");
         assert!(Limits::acquire(&limits, a).is_none(), "over a's limit");
         let _b1 = Limits::acquire(&limits, b).expect("first from b");
-        assert!(Limits::acquire(&limits, b).is_none(), "over the global limit");
+        assert!(
+            Limits::acquire(&limits, b).is_none(),
+            "over the global limit"
+        );
         drop(a1);
         assert!(Limits::acquire(&limits, b).is_some(), "a's slot freed");
     }

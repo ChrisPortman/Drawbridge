@@ -289,8 +289,10 @@ impl Conn {
     fn answer(&self, resp: Response<Body>) -> Response<Body> {
         let a = &self.answering;
         a.body_done.store(false, Ordering::SeqCst);
-        a.upgrade
-            .store(resp.status() == StatusCode::SWITCHING_PROTOCOLS, Ordering::SeqCst);
+        a.upgrade.store(
+            resp.status() == StatusCode::SWITCHING_PROTOCOLS,
+            Ordering::SeqCst,
+        );
         a.head_next.store(true, Ordering::SeqCst);
         let done = a.clone();
         resp.map(|body| TrackedBody { body, done }.boxed())

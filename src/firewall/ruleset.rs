@@ -368,7 +368,7 @@ impl Ruleset {
         policy.validate()?;
         let has_host_rules = (policy.clients.iter().flat_map(|c| &c.allow))
             .chain(policy.users.iter().flat_map(|u| &u.allow))
-            .any(is_host_rule);
+            .any(Allow::is_host_rule);
         if has_host_rules && proxy_port.is_none() {
             return Err(RulesetError::ProxyPortRequired);
         }
@@ -397,10 +397,6 @@ impl Ruleset {
     }
 }
 
-fn is_host_rule(allow: &Allow) -> bool {
-    matches!(allow.proto, Proto::Http | Proto::Https)
-}
-
 /// Appends one entry per dest × port spec of `allow`, from `src`: a redirect to the proxy for a
 /// host rule (`http`, `https`, with their default ports), otherwise an accept rule.
 fn expand(
@@ -410,7 +406,7 @@ fn expand(
     allow: &Allow,
     dests: impl Iterator<Item = IpNetwork>,
 ) {
-    if is_host_rule(allow) {
+    if allow.is_host_rule() {
         let ports = allow.effective_ports();
         for dest in dests {
             let dst = normalize(dest);
