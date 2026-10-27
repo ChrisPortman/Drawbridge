@@ -934,7 +934,7 @@ mod tests {
 
     fn app() -> (Router, Arc<Portal<Stub>>) {
         let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
-        let (handle, _task) = crate::session::spawn(SessionTable::new(
+        let (handle, _view, _task) = crate::session::spawn(SessionTable::new(
             Arc::new(policy),
             NoopEnforcer,
             Duration::ZERO,
