@@ -55,11 +55,15 @@ pub(crate) fn apply_without_drop_log(ruleset: &Ruleset) -> Nftables<'static> {
     document(cmds)
 }
 
-/// [`apply`] without the nat `prerouting` and `proxy_redirect` chains (the proxy accept in
-/// `client_filter`, which needs only conntrack, stays). If the kernel rejects [`apply`] but
-/// `nft -c` accepts this, the nat modules are missing.
+/// [`apply`] without the transparent proxy's rules: the nat `prerouting` and `proxy_redirect`
+/// chains and the proxy accept in `client_filter`. If the kernel rejects [`apply`] but `nft -c`
+/// accepts this, the nat or fib modules are missing.
 pub(crate) fn apply_without_nat(ruleset: &Ruleset) -> Nftables<'static> {
-    let mut cmds = apply_cmds(ruleset);
+    let without_proxy = Ruleset {
+        proxy_port: None,
+        ..ruleset.clone()
+    };
+    let mut cmds = apply_cmds(&without_proxy);
     cmds.extend(drop_log(ruleset.mode));
     document(cmds)
 }
@@ -879,8 +883,15 @@ mod tests {
             name == "prerouting" || name == "proxy_redirect"
         };
         assert!(full.iter().any(is_nat));
-        let kept: Vec<_> = full.into_iter().filter(|c| !is_nat(c)).collect();
+        let mut kept: Vec<_> = full.into_iter().filter(|c| !is_nat(c)).collect();
+        // The proxy accept needs nft_fib, so one client_filter rule goes too.
+        let rule = ("add".into(), "rule".into(), "client_filter".into());
+        let at = kept.iter().position(|c| *c == rule).unwrap();
+        kept.remove(at);
         assert_eq!(kept, reduced);
+        let accept = rule_value(proxy_accept_rule(3128));
+        assert!(rules_in(&apply(&ruleset), "client_filter").contains(&accept));
+        assert!(!rules_in(&apply_without_nat(&ruleset), "client_filter").contains(&accept));
     }
 
     #[test]
