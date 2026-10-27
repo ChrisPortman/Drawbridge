@@ -4,8 +4,11 @@
 # destinations it may reach. Anything not listed is dropped.
 #
 #   dest:  destination CIDRs (same address family as the client)
-#   proto: tcp | udp | icmp | any
-#   ports: optional, tcp/udp only; single ports or "lo-hi" ranges
+#   proto: tcp | udp | icmp | any | http | https
+#   ports: optional, tcp/udp/http/https only; single ports or "lo-hi" ranges
+#          (http and https default to 80 and 443)
+#   hosts: http/https only; the hostnames (exact or "*.") allowed at dest,
+#          and for http an optional path prefix (example.com/docs)
 clients:
   - cidr: 192.168.50.0/24
     allow:
@@ -15,6 +18,9 @@ clients:
       - dest: [10.0.0.53/32]
         proto: udp
         ports: [53]
+      - dest: [10.0.2.0/24]
+        proto: https
+        hosts: [git.example.com, "*.docs.example.com"]
 
   - cidr: fd00:50::/64
     allow:
@@ -30,3 +36,6 @@ users:
       - dest: [10.0.1.0/24, "fd00:1::/64"]
         proto: tcp
         ports: [22, 443]
+      - dest: [10.0.3.10/32]
+        proto: http
+        hosts: [wiki.example.com/team]

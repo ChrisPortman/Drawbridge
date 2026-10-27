@@ -31,28 +31,32 @@ behaviour and are background; where an open issue conflicts with one, the issue 
 | Path | Purpose |
 |---|---|
 | `src/main.rs` | Thin binary: tracing setup, `Cli::parse()`, dispatch to `cli::{run, check, teardown}` (`server`) and `cli::{init, login, logout, service}` (`client`). **No logic here.** |
-| `src/lib.rs` | Library crate root. Declares the top-level modules: `cli`, `firewall`, `policy` (`pub`) and `portal`, `session` (`pub(crate)`). |
+| `src/lib.rs` | Library crate root. Declares the top-level modules: `cli`, `firewall`, `policy` (`pub`) and `portal`, `proxy`, `session` (`pub(crate)`). |
 | `src/cli.rs` | Clap definitions: `server run|check|teardown`, `client init|login|logout` and the hidden `client service`; every flag has a `DRAWBRIDGE_*` env var. Re-exports the subcommands from `gateway` and `client`, and `Secret` (a flag's type) from `portal`. |
 | `src/cli/gateway.rs` | `server` implementations: instance lock, interface check, portal flags → `PortalConfig`, signal-driven `run` lifecycle. |
 | `src/cli/client.rs` | `client` implementations: `init` writes `client.yaml` and the user unit; `login`/`logout` only start/stop it through `systemctl --user`; `service` (what the unit runs) logs in through the loopback handoff, refreshes, and ends the session on SIGTERM. |
 | `src/cli/client/*.rs` | `unit` (pure: unit file, XDG paths, `systemctl show` parsing, timing), `notify` (`sd_notify`), `api` (the service's portal client), `loopback` (the 127.0.0.1 listener). |
 | `src/policy.rs` | Serde YAML schema (`clients`, `users`), `Policy::load`/`parse`/`validate`. Shared by every other module. |
-| `src/firewall.rs` | `Firewall` handle on the `nft` binary: async `apply` / `update_sessions` / `teardown` / `check_version` / `probe`; `FirewallError` (wraps `NftError`, plus `DropLog`, `UnsupportedVersion`, `UnparseableVersion`). |
+| `src/firewall.rs` | `Firewall` handle on the `nft` binary: async `apply` / `update_sessions` / `teardown` / `check_version` / `probe`; `FirewallError` (wraps `NftError`, plus `DropLog`, `Proxy`, `UnsupportedVersion`, `UnparseableVersion`). |
 | `src/firewall/ruleset.rs` | Pure `Policy` → `Ruleset` IR, including portal rules, `SessionRules`, `Mode` and the drop log's `LogSet`s; `Display` renders nft-style text (used by `check`). |
 | `src/firewall/json.rs` | Pure `Ruleset` / `SessionRules` → `nft -j` documents (`nftables` crate serde types): the apply, session update and teardown batches. |
 | `src/firewall/nft.rs` | Runs `nft` (`-j -f -`, `-c` dry runs, `--version`) with a 30s timeout; version parsing (floor 0.9.3) and stderr → `NftError` classification. |
 | `src/session.rs` | `SessionTable` state machine (login, extend, refresh leases, logout, expire, rebuild on failure) behind an `Enforcer` trait; `spawn` runs it as the single task that changes sessions. |
+| `src/proxy.rs` | Host-rule transparent proxy (ADR 0004): dual-stack `bind`, `ProxyConfig::run`, original destination (`SO_ORIGINAL_DST`), `authorise` (client rules ∪ the source's live session from the `SessionView`), the HTTPS SNI check and splice, and RSTs (`SO_LINGER 0`). |
+| `src/proxy/sni.rs` | Pure TLS ClientHello parser: SNI, no SNI, ECH, not TLS, malformed or need more. |
+| `src/proxy/http.rs` | Cleartext HTTP through hyper: every request checked by host and path (404 for a denied path, RST otherwise), h2c, `CONNECT`, ambiguous hosts, head size and timeout, Upgrade splicing, and closing a connection when the session that allowed it ends. |
+| `src/proxy/droplog.rs` | The proxy's deduplicated `drawbridge drop:` / `would-drop:` lines (10s window, bounded key map, client-supplied fields escaped). |
 | `src/portal.rs` | `Prepared` (TLS, OIDC discovery, listener binds) and `Servers` (serve, graceful shutdown); Axum router: `/`, `/login`, `/callback`, `/api/session` (GET, DELETE), `/api/session/refresh`, `/api/cli/token`; cookies, the bounded pending-login and CLI-grant stores, security headers. Re-exports `OidcConfig` and `Secret` from `oidc`, and the wire types from `api`. |
 | `src/portal/api.rs` | JSON API types and constants shared by the portal and the client service. |
 | `src/portal/oidc.rs` | OIDC relying party (`openidconnect`): discovery, auth URL with PKCE/nonce, code exchange, refresh, ID-token verification, username claim. `Authenticator` trait for tests. |
 | `src/portal/*.html` | Confirmation page (inline JS refreshes, falling back to silent re-auth) and message template, embedded with `include_str!`. |
-| `examples/policy.yaml` | Example policy, used by unit tests. |
-| `tests/data/example.nft` | Golden `check` output for the example policy. |
-| `tests/data/example.json` | Golden `json::apply` document for the example policy. |
+| `examples/policy.yaml` | Example policy, used by unit tests. It has client and user host rules. |
+| `tests/data/example.nft` | Golden `check` output for the example policy, with `--proxy-port 3128` (so it has the nat chains). |
+| `tests/data/example.json` | Golden `json::apply` document for the example policy, with the nat chains. |
 | `tests/data/example.kernel.nft` | Golden `nft list` output (counters stripped) after applying the example policy. |
-| `tests/data/sessions.kernel.nft` | Golden `nft list` output after adding and replacing sessions incrementally. |
+| `tests/data/sessions.kernel.nft` | Golden `nft list` output after adding and replacing sessions incrementally, including session redirects in `proxy_redirect`. |
 | `tests/data/portal-test.{crt,key}` | Self-signed (not CA) certificate for 127.0.0.1; the client's certificate-check tests serve it. Test-only. |
-| `tests/kernel.rs` | `#[ignore]`d tests against a real kernel (needs CAP_NET_ADMIN and `nft`): example golden, `example.json` loaded with `nft`, permissive mode, 5,000-rule policy, session add/replace/remove golden, 200-session churn. |
+| `tests/kernel.rs` | `#[ignore]`d tests against a real kernel (needs CAP_NET_ADMIN and `nft`): example golden (with the nat `prerouting` and `proxy_redirect` chains and the proxy accept), `example.json` loaded with `nft`, permissive mode, 5,000-rule policy without a proxy port (no nat chains), session add/replace/remove golden (session redirects in `proxy_redirect`), 200-session churn. |
 | `e2e/` | Docker Compose end-to-end stack (`run.sh`, `compose.yaml`, `Dockerfile`, `policy.yaml`, `dex.yaml`, `systemctl-stub`). |
 
 ## Commands
@@ -63,7 +67,7 @@ cargo test                                   # unit tests, no privileges needed
 cargo clippy --all-targets                   # keep warning-free
 cargo fmt
 cargo run -- server check --policy examples/policy.yaml --external-iface wg0 \
-    --portal-listen 192.168.50.1:8443          # print planned ruleset (matches tests/data/example.nft)
+    --portal-listen 192.168.50.1:8443 --proxy-port 3128   # print planned ruleset (matches tests/data/example.nft)
 ./e2e/run.sh                                 # full end-to-end test (Docker + Compose v2, no root)
 ```
 
@@ -89,8 +93,22 @@ Keep these unless the user changes them:
     then the **one default action**: `iifname <ext> counter drop` (`counter accept` in permissive
     mode). Nothing else drops. Anything not accepted must fall back to the base chain.
   - `client_filter` runs `ct mark != 0 goto session_flows`, then
-    `ct state established,related accept`, then one portal accept rule per `--portal-listen`
-    address, then the per-client rules, then `jump sessions`, and ends without a verdict.
+    `ct state established,related accept`, then (with `--proxy-port`) the proxy accept
+    `meta l4proto tcp th dport <proxy port> ct status dnat fib daddr type local counter accept`,
+    then one portal accept rule per `--portal-listen` address, then the per-client rules, then
+    `jump sessions`, and ends without a verdict. `ct status dnat` limits the proxy port to
+    redirected connections; a direct connection to it meets the default action.
+    `fib daddr type local` keeps it from accepting someone else's DNAT to the same port (a
+    container's published port, say) in the forward hook.
+  - **nat chains**, only with `--proxy-port` (none without it): a `prerouting` base chain
+    (`type nat hook prerouting priority dstnat`, `policy accept`) holding
+    `iifname <ext> jump proxy_redirect`, and `proxy_redirect` with one
+    `ip[6] saddr S ip[6] daddr D tcp dport X counter redirect to :<proxy port>` per host rule: the
+    client rules first, then each live session's with its session IP as `saddr` and
+    `ct mark set <id>` before the redirect, so ending the session cuts the client side through
+    `session_flows` like any session flow. Redirection happens before the filter hooks, so an
+    address rule for the same dest and port can't accept the backend: host rules take
+    precedence.
   - `sessions` holds one `ip[6] saddr <ip> jump session_<id>` per live session; each `session_<id>`
     chain holds that user's rules (with the session IP as `saddr`), and each of them does
     `ct mark set <id>` before accepting.
@@ -113,11 +131,15 @@ Keep these unless the user changes them:
     still matches. Logging can lose lines, never verdicts, because the default action is a
     separate rule. When the kernel rejects an apply, `Firewall::apply` retries it as an `nft -c`
     dry run without the drop log; if that passes, the error is `FirewallError::DropLog`, naming
-    the logging modules. Session updates skip that check.
+    the logging modules. Failing that, it dry-runs the batch without the proxy's rules (the nat
+    `prerouting` and `proxy_redirect` chains and the proxy accept); if that passes, the error is
+    `FirewallError::Proxy`, naming `nft_redir`, `nft_nat`, `nft_fib_inet` and `nf_conntrack`. Each retry leaves out one part, so a kernel missing
+    both gets the plain rejection. Session updates skip these checks.
   - Session ids are nonzero `u32`s that start at a random value each run, so connections marked by
     a previous run can't match a new session.
-  - A session change is one batch: add new session chains, flush `sessions` and `session_flows`
-    and re-add their rules for every live session, then delete the removed chains. It never
+  - A session change is one batch: add new session chains, flush `sessions`, `session_flows`
+    and `proxy_redirect` and re-add their rules for every live session (plus the client redirects
+    in `proxy_redirect`), then delete the removed chains. It never
     touches the drop log. If it fails,
     `SessionTable` falls back to a full `apply` from its state and retries every 5s until that
     succeeds. It never tears down. Until a retry succeeds, an expired session may stay enforced;
@@ -125,10 +147,13 @@ Keep these unless the user changes them:
 - **Only traffic arriving on the external interface is filtered.** That interface is assumed to be
   dedicated to clients and statically addressed. Don't add DHCP, ARP or ND exceptions.
 - **Access to the gateway host comes only through policy.** A client reaches the host by listing
-  the gateway's IP as a `dest`. Nothing is hard-coded. The **one exception** is the portal: each
-  `--portal-listen` address (which must be specific, not unspecified) gets an accept rule so that
-  unauthenticated users can log in. The OIDC provider is *not* exempt: allow it with a normal
-  `clients` rule.
+  the gateway's IP as a `dest`. Nothing is hard-coded. There are **two exceptions**:
+  - the portal: each `--portal-listen` address (which must be specific, not unspecified) gets an
+    accept rule so that unauthenticated users can log in;
+  - the proxy port, with `--proxy-port`: the proxy accept lets in only connections that a host
+    rule's redirect sent there (`ct status dnat`, to a local address), never a direct one.
+
+  The OIDC provider is *not* exempt: allow it with a normal `clients` rule.
 - **Apply is atomic.** One batch does add table, delete table, then rebuilds everything. A restart
   therefore replaces leftover state. A batch the kernel rejects changes nothing. After `nft` times
   out and is killed (`NftError::Timeout`), the batch may already be live. Either way `run`
@@ -144,6 +169,18 @@ Keep these unless the user changes them:
   exactly what enforcing would drop. `run` warns at startup when it is on. Connections it lets
   through aren't marked, so they survive a restart into enforcing mode as `established`; the
   README tells operators to flush conntrack after switching.
+- **Host rules** (`proto: http|https` with `hosts`) need `--proxy-port`
+  (`DRAWBRIDGE_PROXY_PORT`, nonzero); loading a policy with them fails without it, naming the flag.
+  The proxy listens on `[::]:<port>` (`IPV6_V6ONLY=0`) and resets any connection without an
+  original destination, or whose original destination is the proxy itself (any of the host's
+  addresses on the proxy port), so only redirected connections are served. It serves at most
+  4,096 connections at once, 256 per source address; over either limit it resets and logs
+  `REASON=limit`, in permissive mode too. It connects upstream only to that original destination, and only when a
+  rule allows it (or, in permissive mode, after logging `would-drop`). It closes connections a
+  session allowed when that session leaves the `SessionView` (logout, expiry, replacement), and
+  `run` aborts it (dropping every connection) before teardown. Denials are RSTs, except a denied
+  path on an allowed host, which gets 404 and keeps the connection; an oversized head is reset
+  rather than answered 431. The proxy's drop lines are its own (`tracing`), not the kernel's.
 - **Policy is allow-only and inline per client or user** (`clients[].cidr`,
   `users[].username`, `allow[].dest/proto/ports`).
   - Validate before touching the kernel.
@@ -207,6 +244,13 @@ records why.
   File capabilities on `drawbridge` alone don't reach `nft`; that's unsupported.
 - Keep the JSON within what 0.9.3 parses. Log sets carry `flags: timeout` only: nft adds
   `dynamic` itself from the rule's `add @set`, and 0.9.3 rejects it in JSON.
+- The nat forms also follow 0.9.3's `parser_json.c`: `redirect` is an object with only `port`
+  (`{"redirect": {"port": P}}`); `ct status dnat` is a `match` with op `in` on `{"ct": {"key":
+  "status"}}` and the string `dnat`; `fib daddr type local` is a `match` with op `==` on
+  `{"fib": {"result": "type", "flags": ["daddr"]}}` and the string `local`; the nat chain's
+  `prio` is the integer -100 (`dstnat`), because 0.9.3's JSON takes no priority names. A kernel
+  without `nft_nat`/`nft_redir`/`nft_fib_inet` rejects the apply; the dry run without the
+  proxy's rules then turns that into `FirewallError::Proxy`.
 - nft 0.9.3 lists those sets without a `flags dynamic,timeout` line, so the `*.kernel.nft`
   goldens assume a newer nft (the e2e image's).
 - Licensing: Drawbridge is `MIT OR Apache-2.0` (`LICENSE-MIT`, `LICENSE-APACHE`), and so is the
@@ -249,6 +293,11 @@ records why.
     is tested in `cli/client/api.rs` against `tests/data/portal-test.crt`.
   - A gateway restarted with `dc exec -d` logs to the exec, not the container; send its output to
     `/proc/1/fd/1` when `log_has` must see it.
+  - Host rules: the server runs `busybox httpd` on 80 (`/public/`, `/private/`), an endless
+    HTTP stream on 8083 and `openssl s_server` on 443. Use the `http_` (status, `reset` or
+    `timeout`), `tls` (`open`, `reset` or `timeout`) and `stream_start` helpers; proxy drop
+    lines are checked with `log_has`. busybox httpd closes after every response, so keep-alive is
+    checked against the proxy's own 404s.
   - The external Docker network stands in for WireGuard. It has pinned IPv6 neighbour entries,
     because Drawbridge (correctly) drops neighbour discovery on the external interface.
 

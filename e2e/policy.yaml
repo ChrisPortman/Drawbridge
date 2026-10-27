@@ -13,6 +13,17 @@ clients:
       - dest: [172.30.0.2/32]
         proto: tcp
         ports: [2222]
+      # Host rules: http by host and path, https by SNI (the proxy on :3128 checks them).
+      - dest: [10.10.0.20/32]
+        proto: http
+        hosts: [app.example.com/public]
+      - dest: [10.10.0.20/32]
+        proto: https
+        hosts: [secure.example.com]
+      # An IP rule for the same backend and port: the https host rule still takes precedence.
+      - dest: [10.10.0.20/32]
+        proto: tcp
+        ports: [443]
 
   # The same client over IPv6, with a narrower allow list.
   - cidr: fd00:30::10/128
@@ -22,6 +33,9 @@ clients:
         ports: [8080]
       - dest: ["fd00:10::20/128"]
         proto: icmp
+      - dest: ["fd00:10::20/128"]
+        proto: http
+        hosts: [app.example.com/public]
 
   # Every external client may reach the OIDC provider, so it can log in to the portal.
   - cidr: 172.30.0.0/24
@@ -38,3 +52,8 @@ users:
       - dest: [10.10.0.20/32, "fd00:10::20/128"]
         proto: tcp
         ports: [8081, 8082]   # 8082 is a TCP echo service for long-lived flows
+      # An endless HTTP stream, through the proxy while alice's session lasts.
+      - dest: [10.10.0.20/32]
+        proto: http
+        ports: [8083]
+        hosts: [stream.example.com]

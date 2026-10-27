@@ -330,6 +330,74 @@
             {
               "match": {
                 "left": {
+                  "meta": {
+                    "key": "l4proto"
+                  }
+                },
+                "right": 6,
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "th",
+                    "field": "dport"
+                  }
+                },
+                "right": 3128,
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "ct": {
+                    "key": "status"
+                  }
+                },
+                "right": "dnat",
+                "op": "in"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "fib": {
+                    "result": "type",
+                    "flags": [
+                      "daddr"
+                    ]
+                  }
+                },
+                "right": "local",
+                "op": "=="
+              }
+            },
+            {
+              "counter": {
+                "packets": 0,
+                "bytes": 0
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "inet",
+          "table": "drawbridge",
+          "chain": "client_filter",
+          "expr": [
+            {
+              "match": {
+                "left": {
                   "payload": {
                     "protocol": "ip",
                     "field": "daddr"
@@ -637,6 +705,123 @@
             {
               "jump": {
                 "target": "sessions"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "inet",
+          "table": "drawbridge",
+          "name": "proxy_redirect"
+        }
+      }
+    },
+    {
+      "add": {
+        "chain": {
+          "family": "inet",
+          "table": "drawbridge",
+          "name": "prerouting",
+          "type": "nat",
+          "hook": "prerouting",
+          "prio": -100,
+          "policy": "accept"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "inet",
+          "table": "drawbridge",
+          "chain": "prerouting",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "wg0",
+                "op": "=="
+              }
+            },
+            {
+              "jump": {
+                "target": "proxy_redirect"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "inet",
+          "table": "drawbridge",
+          "chain": "proxy_redirect",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "saddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "192.168.50.0",
+                    "len": 24
+                  }
+                },
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "prefix": {
+                    "addr": "10.0.2.0",
+                    "len": 24
+                  }
+                },
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "payload": {
+                    "protocol": "tcp",
+                    "field": "dport"
+                  }
+                },
+                "right": 443,
+                "op": "=="
+              }
+            },
+            {
+              "counter": {
+                "packets": 0,
+                "bytes": 0
+              }
+            },
+            {
+              "redirect": {
+                "port": 3128
               }
             }
           ]

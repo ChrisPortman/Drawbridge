@@ -158,14 +158,43 @@ Delivered as sub-issues of #7. They touch these modules:
 
 ## Deviations
 
-None yet.
+- **Kernel encoding.** A kernel without the nat modules gets its own error,
+  `FirewallError::Proxy` (naming `nft_redir`, `nft_nat`, `nft_fib_inet` and `nf_conntrack`), from
+  a second dry run without the proxy's rules, rather than sharing the drop log's. Each dry run leaves out one part, so
+  a kernel missing both gets the plain rejection.
+- **One proxy port for both protocols.** The proxy tells TLS from HTTP by the first byte, so http
+  and https host rules share `--proxy-port`.
+- **More denials than listed above** (found in review of #7, #19): a request naming two hosts
+  (two `Host` headers, or an absolute-form authority that differs from `Host`) is reset as
+  `ambiguous-host`, because upstreams disagree on which wins; and an http path with a `.` or `..`
+  segment (also percent-encoded) or a backslash never matches a path rule, because the upstream
+  may resolve it outside the prefix. So `/a/./b` gets 404 under a rule for `/a`, though the
+  upstream would serve it inside the prefix. The review of #7 extended this to anything an
+  upstream might decode or split differently: a fragment, `;` parameters hiding a dot segment
+  (`/..;/`), and a percent-encoded `/`, `\`, `%`, `?` or `#`. A rule's own path is limited to
+  plain path characters without empty or dot segments. Drop-log fields from the client (`HOST`,
+  `PATH`) are escaped (`\xNN`, also spaces and backslashes), so they can't forge fields or lines,
+  and the log's key map is capped at 65,536 like the kernel's sets.
+- **Proxy accept.** It is `tcp dport <proxy port> ct status dnat fib daddr type local accept`:
+  without `fib daddr type local`, it would also accept another tool's DNAT to the same port (a
+  container's published port) in the forward hook.
+- **Connection limits** (review of #7): at most 4,096 proxied connections at once, 256 per source
+  address; over either, a reset logged as `REASON=limit` (in permissive mode too), so one client
+  can't exhaust the gateway's file descriptors and starve the portal.
+- **Idle keep-alive.** hyper's header timeout also runs between requests, so the proxy closes a
+  keep-alive connection that sends no new request within 10 seconds. It closes it with a FIN, not
+  a RST, and doesn't log it; clients open a new connection.
+- **e2e backends:** `busybox httpd` (paths), a socat HTTP stream (the long-lived proxied
+  connection) and `openssl s_server`, all on the server node.
 
 ## Consequences
 
 - Drawbridge now carries user traffic in userspace for host rules. Backends see the gateway as the
   source.
-- `ct status dnat accept` would also accept any other DNAT to the proxy port. No other NAT is
-  expected on the external interface.
+- The proxy accept trusts any DNAT to a local address on the proxy port, not only
+  Drawbridge's. No other NAT to the gateway itself is expected on the external interface.
+- Only the first ClientHello is checked; after a HelloRetryRequest the second is spliced unread.
+  This adds nothing to domain fronting, which the splice allows anyway.
 - The cost of a session batch grows with the number of client host rules, because
   `proxy_redirect` is refilled each time.
 - Follow-up: #8 (client and session overlap).
