@@ -10,7 +10,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use ipnetwork::IpNetwork;
 use nftables::expr::{
-    CT, Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix, Range,
+    CT, Expression, Fib, FibFlag, FibResult, Meta, MetaKey, NamedExpression, Payload, PayloadField, Prefix, Range,
 };
 use nftables::schema::{
     Chain, FlushObject, NfCmd, NfListObject, NfObject, Nftables, Rule, Set, SetFlag, SetType,
@@ -248,8 +248,9 @@ fn redirect_rule(spec: &RedirectSpec, proxy_port: u16) -> Vec<Statement<'static>
     rule
 }
 
-/// `meta l4proto tcp th dport P ct status dnat counter accept`: only connections redirected to
-/// the proxy reach it.
+/// `meta l4proto tcp th dport P ct status dnat fib daddr type local counter accept`: only
+/// connections redirected to the proxy reach it. `fib daddr type local` keeps it from accepting
+/// someone else's DNAT to port P (a container's published port, say) in the forward hook.
 fn proxy_accept_rule(proxy_port: u16) -> Vec<Statement<'static>> {
     vec![
         match_eq(meta(MetaKey::L4proto), Expression::Number(IPPROTO_TCP)),
@@ -258,6 +259,13 @@ fn proxy_accept_rule(proxy_port: u16) -> Vec<Statement<'static>> {
             Expression::Number(proxy_port.into()),
         ),
         matches(Operator::IN, ct("status"), string("dnat")),
+        match_eq(
+            Expression::Named(NamedExpression::Fib(Fib {
+                result: FibResult::Type,
+                flags: HashSet::from([FibFlag::Daddr]),
+            })),
+            string("local"),
+        ),
         counter(),
         Statement::Accept(None),
     ]
@@ -793,6 +801,8 @@ mod tests {
                 {"match": {"op": "==", "left": {"payload": {"protocol": "th", "field": "dport"}},
                     "right": 3128}},
                 {"match": {"op": "in", "left": {"ct": {"key": "status"}}, "right": "dnat"}},
+                {"match": {"op": "==", "left": {"fib": {"result": "type", "flags": ["daddr"]}},
+                    "right": "local"}},
                 counter,
                 {"accept": null},
             ])

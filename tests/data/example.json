@@ -362,6 +362,20 @@
               }
             },
             {
+              "match": {
+                "left": {
+                  "fib": {
+                    "result": "type",
+                    "flags": [
+                      "daddr"
+                    ]
+                  }
+                },
+                "right": "local",
+                "op": "=="
+              }
+            },
+            {
               "counter": {
                 "packets": 0,
                 "bytes": 0

@@ -384,6 +384,17 @@ udp closed client-denied  $SERVER 5353
 ping_ closed client-denied $SERVER
 tcp closed client-denied  $GATEWAY 2222
 tcp open   server         172.30.0.10 7000   # internally originated traffic is not filtered
+# Someone else's DNAT to the proxy port (a container's published port, say) is forwarded, not
+# redirected to the proxy, so the proxy's accept rule must not let it through.
+dc exec -T gateway nft -f - <<'EOF'
+table ip foreign {
+    chain pre {
+        type nat hook prerouting priority dstnat; policy accept;
+        iifname "wg0" ip daddr 172.30.0.2 tcp dport 3128 dnat to 10.10.0.20:3128
+    }
+}
+EOF
+tcp closed client-denied  $GATEWAY 3128   # DNATed to the server's 3128 by the foreign table
 
 echo "== drop log"
 # Three datagrams to one destination port, each from a new source port: one key, so one log line.
@@ -617,6 +628,8 @@ tcp open   client-denied $SERVER 8999
 tcp open   client-denied $SERVER 9002
 udp open   client-denied $SERVER 8080
 tcp open   client-denied $GATEWAY 2223
+tcp open   client-denied $GATEWAY 3128   # the foreign DNAT, now unfiltered
+dc exec -T gateway nft delete table ip foreign
 tcp open   client-denied $SERVER6 8081
 tcp open   client-denied $SERVER6 9000
 tcp open   client-user   $SERVER 8080

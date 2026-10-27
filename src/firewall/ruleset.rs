@@ -503,14 +503,15 @@ impl fmt::Display for RedirectRule<'_> {
 }
 
 /// The `client_filter` rule accepting connections redirected to the proxy port. Requiring
-/// `ct status dnat` keeps clients from reaching the proxy directly.
+/// `ct status dnat` keeps clients from reaching the proxy directly, and `fib daddr type local`
+/// keeps it from accepting a foreign DNAT to the same port in the forward hook.
 pub(crate) struct ProxyAcceptRule(pub(crate) u16);
 
 impl fmt::Display for ProxyAcceptRule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "meta l4proto tcp th dport {} ct status dnat counter accept",
+            "meta l4proto tcp th dport {} ct status dnat fib daddr type local counter accept",
             self.0
         )
     }
@@ -1062,7 +1063,7 @@ users:
         assert!(
             text.contains(
                 "\t\tct state established,related accept
-\t\tmeta l4proto tcp th dport 3128 ct status dnat counter accept
+\t\tmeta l4proto tcp th dport 3128 ct status dnat fib daddr type local counter accept
 \t\tip saddr 10.0.0.0/24"
             ),
             "{text}"
