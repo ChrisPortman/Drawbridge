@@ -4,6 +4,8 @@
 mod json;
 mod netlink;
 mod nfraw;
+#[allow(dead_code)] // Wired into `Firewall` by the next slice of #21.
+mod nft;
 pub mod ruleset;
 
 pub use netlink::NetlinkError;
