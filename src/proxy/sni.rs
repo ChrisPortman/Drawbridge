@@ -166,11 +166,11 @@ impl<'a> Reader<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Arc;
 
-    fn client_hello(sni: Option<&str>) -> Vec<u8> {
+    pub(crate) fn client_hello(sni: Option<&str>) -> Vec<u8> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
