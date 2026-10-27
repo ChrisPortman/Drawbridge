@@ -102,7 +102,9 @@ impl Enforcer for Kernel {
         removed: &[u32],
         live: &[SessionRules],
     ) -> Result<(), FirewallError> {
-        self.firewall.update_sessions(added, removed, live).await
+        self.firewall
+            .update_sessions(&self.base, added, removed, live)
+            .await
     }
 
     async fn rebuild(&mut self, live: &[SessionRules]) -> Result<(), FirewallError> {

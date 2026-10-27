@@ -24,6 +24,11 @@ pub enum FirewallError {
          modules are available (built in, or loadable): {stderr}"
     )]
     DropLog { stderr: String },
+    #[error(
+        "the kernel rejected the transparent proxy's nat rules; check that the nft_redir, nft_nat \
+         and nf_conntrack modules are available (built in, or loadable): {stderr}"
+    )]
+    Proxy { stderr: String },
     #[error("nft at {} is v{found}; Drawbridge needs nftables >= {MIN_VERSION}", path.display())]
     UnsupportedVersion { path: PathBuf, found: String },
     #[error(
@@ -73,7 +78,9 @@ impl Firewall {
 
     /// Atomically replaces the gateway table with one implementing `ruleset`. If the kernel
     /// rejects it but accepts the same batch without the drop log, reports
-    /// [`FirewallError::DropLog`].
+    /// [`FirewallError::DropLog`]; failing that, if it accepts the batch without the nat chains,
+    /// [`FirewallError::Proxy`]. Each dry run leaves out one part only, so a kernel missing both
+    /// sets of modules gets the plain rejection.
     pub async fn apply(&self, ruleset: &Ruleset) -> Result<(), FirewallError> {
         let err = match self.send(&json::apply(ruleset)).await {
             Ok(()) => return Ok(()),
@@ -82,24 +89,30 @@ impl Firewall {
         };
         // Kernel errors carry no command index; dry-run without the drop log to attribute it.
         match self.dry_run(&json::apply_without_drop_log(ruleset)).await {
-            Ok(()) => Err(FirewallError::DropLog { stderr: err }),
+            Ok(()) => return Err(FirewallError::DropLog { stderr: err }),
+            Err(retry) => debug!(error = %retry, "the batch without the drop log was rejected too"),
+        }
+        match self.dry_run(&json::apply_without_nat(ruleset)).await {
+            Ok(()) => Err(FirewallError::Proxy { stderr: err }),
             Err(retry) => {
-                debug!(error = %retry, "the batch without the drop log was rejected too");
+                debug!(error = %retry, "the batch without the nat chains was rejected too");
                 Err(NftError::Rejected { stderr: err }.into())
             }
         }
     }
 
     /// Atomically installs `added` sessions, removes the chains of the `removed` session ids, and
-    /// rewrites the dispatch chains for the `live` sessions, which must include `added`. The table
-    /// must already exist (see [`Firewall::apply`]).
+    /// rewrites the dispatch chains and `proxy_redirect` for the `live` sessions, which must
+    /// include `added`, on top of `base`'s client redirects. The table must already exist (see
+    /// [`Firewall::apply`]).
     pub async fn update_sessions(
         &self,
+        base: &Ruleset,
         added: &[SessionRules],
         removed: &[u32],
         live: &[SessionRules],
     ) -> Result<(), FirewallError> {
-        self.send(&json::update_sessions(added, removed, live))
+        self.send(&json::update_sessions(base, added, removed, live))
             .await
     }
 
@@ -199,6 +212,25 @@ esac"#
     }
 
     #[tokio::test]
+    async fn proxy_is_blamed_when_only_the_batch_without_nat_passes() {
+        let fw = Firewall::new(fake_nft(
+            "fw-proxy",
+            &format!(
+                r#"doc=$(cat)
+case "$*" in
+  "-c -j -f -") case "$doc" in *'"prerouting"'*) {REJECT} ;; *) exit 0 ;; esac ;;
+  *) {REJECT} ;;
+esac"#
+            ),
+        ));
+        let e = fw.apply(&ruleset()).await.unwrap_err();
+        assert!(
+            matches!(e, FirewallError::Proxy { ref stderr } if stderr.contains("No such file")),
+            "{e:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn permission_denied_is_not_retried() {
         let fw = nft(
             "fw-eperm",
@@ -215,7 +247,10 @@ esac"#
     #[tokio::test]
     async fn session_updates_skip_the_drop_log_check() {
         let fw = nft("fw-sessions", REJECT, "exit 0");
-        let e = fw.update_sessions(&[], &[1], &[]).await.unwrap_err();
+        let e = fw
+            .update_sessions(&ruleset(), &[], &[1], &[])
+            .await
+            .unwrap_err();
         assert!(
             matches!(e, FirewallError::Nft(NftError::Rejected { .. })),
             "{e:?}"
