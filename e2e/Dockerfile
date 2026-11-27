@@ -10,7 +10,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:trixie-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends nftables iproute2 netcat-openbsd iputils-ping procps socat \
-      curl openssl \
+      curl openssl busybox \
  && rm -rf /var/lib/apt/lists/*
 # Self-signed portal certificate for the gateway's external address.
 RUN mkdir -p /etc/drawbridge \

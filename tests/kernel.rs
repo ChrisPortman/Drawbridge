@@ -16,19 +16,22 @@ use tokio::sync::Mutex;
 use drawbridge::firewall::{
     Firewall,
     ruleset::{
-        FILTER_CHAIN, LOG_SETS, Mode, Ruleset, SESSION_FLOWS_CHAIN, SESSIONS_CHAIN, SessionRules,
-        TABLE,
+        FILTER_CHAIN, LOG_SETS, Mode, PROXY_REDIRECT_CHAIN, Ruleset, SESSION_FLOWS_CHAIN,
+        SESSIONS_CHAIN, SessionRules, TABLE,
     },
 };
 use drawbridge::policy::{Allow, Client, Policy, PortSpec, Proto};
 
 const PORTAL: &str = "192.168.50.1:8443";
+const PROXY_PORT: u16 = 3128;
 
-/// Chains without sessions: 2 base, client_filter, session_flows, sessions and the 2 log chains.
-const CHAINS: usize = 7;
-/// Rules outside client_filter: 3 per base chain (filter jump, log jump, default action), and in
-/// the log chains 2 gotos and a log and a miss rule per set.
-const FIXED_RULES: usize = 2 * 3 + 2 + 2 * LOG_SETS.len();
+/// Chains without sessions: 2 filter base chains, client_filter, session_flows, sessions, the 2
+/// log chains, the nat prerouting chain and proxy_redirect.
+const CHAINS: usize = 9;
+/// Rules outside client_filter and proxy_redirect: 3 per filter base chain (filter jump, log
+/// jump, default action), the nat chain's jump, and in the log chains 2 gotos and a log and a miss
+/// rule per set.
+const FIXED_RULES: usize = 2 * 3 + 1 + 2 + 2 * LOG_SETS.len();
 
 /// The `nft` the tests drive, as the gateway would.
 fn firewall() -> Firewall {
@@ -90,7 +93,8 @@ async fn apply_and_teardown() {
     let _guard = KERNEL.lock().await;
     let fw = firewall();
     let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
-    let ruleset = Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()]).unwrap();
+    let ruleset =
+        Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()], Some(PROXY_PORT)).unwrap();
 
     // Applying twice must replace, not duplicate, the table.
     fw.apply(&ruleset).await.unwrap();
@@ -99,11 +103,13 @@ async fn apply_and_teardown() {
     let listing = nft_json(&["list", "table", "inet", TABLE]).expect("table exists");
     assert_eq!(count(&listing, "chain"), CHAINS);
     assert_eq!(count(&listing, "set"), LOG_SETS.len());
-    // In client_filter: the session-flows goto, ct, portal, per-client rules and sessions jump.
+    // In client_filter: the session-flows goto, ct, proxy accept, portal, per-client rules and
+    // sessions jump; then the client redirects.
     assert_eq!(
         count(&listing, "rule"),
-        FIXED_RULES + 3 + ruleset.rules.len() + 1
+        FIXED_RULES + 4 + ruleset.rules.len() + 1 + ruleset.redirects.len()
     );
+    assert!(!ruleset.redirects.is_empty());
     assert!(nft_json(&["list", "chain", "inet", TABLE, FILTER_CHAIN]).is_some());
     // What the kernel holds must match the reviewed golden listing, so the JSON encoding
     // can't drift from what `check` renders.
@@ -135,6 +141,7 @@ fn large_policy() -> Policy {
                         hi: 1000 + p,
                     })
                     .collect(),
+                hosts: vec![],
             }],
         })
         .collect();
@@ -149,14 +156,15 @@ fn large_policy() -> Policy {
 async fn apply_large_policy() {
     let _guard = KERNEL.lock().await;
     let fw = firewall();
-    let ruleset = Ruleset::from_policy(&large_policy(), "wg0", &[]).unwrap();
+    let ruleset = Ruleset::from_policy(&large_policy(), "wg0", &[], None).unwrap();
     assert_eq!(ruleset.rules.len(), 5000);
 
     fw.apply(&ruleset).await.unwrap();
     let listing = nft_json(&["list", "table", "inet", TABLE]).expect("table exists");
+    // No proxy port, so no nat chain and no jump to proxy_redirect.
     assert_eq!(
         count(&listing, "rule"),
-        FIXED_RULES + 2 + ruleset.rules.len() + 1
+        FIXED_RULES - 1 + 2 + ruleset.rules.len() + 1
     );
 
     fw.teardown().await.unwrap();
@@ -172,18 +180,24 @@ async fn add_and_remove_sessions() {
     let _guard = KERNEL.lock().await;
     let fw = firewall();
     let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
-    let mut ruleset = Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()]).unwrap();
+    let mut ruleset =
+        Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()], Some(PROXY_PORT)).unwrap();
     fw.apply(&ruleset).await.unwrap();
 
     let s1 = session(&policy, 1, "192.168.60.7");
     let s2 = session(&policy, 2, "fd00:60::7");
     let s3 = session(&policy, 3, "192.168.60.8");
-    fw.update_sessions(&[s1.clone(), s2.clone()], &[], &[s1.clone(), s2.clone()])
-        .await
-        .unwrap();
+    fw.update_sessions(
+        &ruleset,
+        &[s1.clone(), s2.clone()],
+        &[],
+        &[s1.clone(), s2.clone()],
+    )
+    .await
+    .unwrap();
     // Replacing a session (2 -> 3) and keeping another happens in one batch.
     let live = [s1.clone(), s3.clone()];
-    fw.update_sessions(std::slice::from_ref(&s3), &[2], &live)
+    fw.update_sessions(&ruleset, std::slice::from_ref(&s3), &[2], &live)
         .await
         .unwrap();
     let incremental = nft_list_normalized();
@@ -197,11 +211,16 @@ async fn add_and_remove_sessions() {
 
     // Removing every session leaves empty dispatch and session_flows chains, so every marked
     // connection falls through to the default action, and no session chains.
-    fw.update_sessions(&[], &[1, 3], &[]).await.unwrap();
+    fw.update_sessions(&ruleset, &[], &[1, 3], &[])
+        .await
+        .unwrap();
     let listing = nft_json(&["list", "chain", "inet", TABLE, SESSIONS_CHAIN]).unwrap();
     assert_eq!(count(&listing, "rule"), 0);
     let listing = nft_json(&["list", "chain", "inet", TABLE, SESSION_FLOWS_CHAIN]).unwrap();
     assert_eq!(count(&listing, "rule"), 0);
+    // Only the client redirects stay.
+    let listing = nft_json(&["list", "chain", "inet", TABLE, PROXY_REDIRECT_CHAIN]).unwrap();
+    assert_eq!(count(&listing, "rule"), ruleset.redirects.len());
     assert_eq!(
         count(
             &nft_json(&["list", "table", "inet", TABLE]).unwrap(),
@@ -219,9 +238,8 @@ async fn session_churn() {
     let _guard = KERNEL.lock().await;
     let fw = firewall();
     let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
-    fw.apply(&Ruleset::from_policy(&policy, "wg0", &[]).unwrap())
-        .await
-        .unwrap();
+    let ruleset = Ruleset::from_policy(&policy, "wg0", &[], Some(PROXY_PORT)).unwrap();
+    fw.apply(&ruleset).await.unwrap();
 
     let mut live = Vec::new();
     for id in 1..=200u32 {
@@ -231,25 +249,33 @@ async fn session_churn() {
             &format!("192.168.{}.{}", 60 + id / 250, id % 250 + 1),
         );
         live.push(s.clone());
-        fw.update_sessions(&[s], &[], &live).await.unwrap();
+        fw.update_sessions(&ruleset, &[s], &[], &live)
+            .await
+            .unwrap();
     }
     let listing = nft_json(&["list", "chain", "inet", TABLE, SESSIONS_CHAIN]).unwrap();
     assert_eq!(count(&listing, "rule"), 200);
     let listing = nft_json(&["list", "chain", "inet", TABLE, SESSION_FLOWS_CHAIN]).unwrap();
     assert_eq!(count(&listing, "rule"), 200);
+    // Every session has a host rule, so a redirect, after the client redirects.
+    assert!(live.iter().all(|s| s.redirects.len() == 1));
+    let listing = nft_json(&["list", "chain", "inet", TABLE, PROXY_REDIRECT_CHAIN]).unwrap();
+    assert_eq!(count(&listing, "rule"), ruleset.redirects.len() + 200);
 
     while let Some(s) = live.pop() {
         if live.len() % 2 == 0 {
-            fw.update_sessions(&[], &[s.id], &live).await.unwrap();
+            fw.update_sessions(&ruleset, &[], &[s.id], &live)
+                .await
+                .unwrap();
         } else {
             // Removing via a replacement exercises add and delete together.
             let replacement = session(&policy, s.id + 1000, "192.168.99.1");
             let mut next = live.clone();
             next.push(replacement.clone());
-            fw.update_sessions(std::slice::from_ref(&replacement), &[s.id], &next)
+            fw.update_sessions(&ruleset, std::slice::from_ref(&replacement), &[s.id], &next)
                 .await
                 .unwrap();
-            fw.update_sessions(&[], &[replacement.id], &live)
+            fw.update_sessions(&ruleset, &[], &[replacement.id], &live)
                 .await
                 .unwrap();
         }
@@ -266,7 +292,8 @@ async fn permissive_accepts_and_logs_would_drop() {
     let _guard = KERNEL.lock().await;
     let fw = firewall();
     let policy = Policy::parse(include_str!("../examples/policy.yaml")).unwrap();
-    let mut ruleset = Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()]).unwrap();
+    let mut ruleset =
+        Ruleset::from_policy(&policy, "wg0", &[PORTAL.parse().unwrap()], Some(PROXY_PORT)).unwrap();
     ruleset.mode = Mode::Permissive;
     fw.apply(&ruleset).await.unwrap();
 

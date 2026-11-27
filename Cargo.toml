@@ -11,8 +11,12 @@ anyhow = "1.0.104"
 axum = "0.8.9"
 axum-extra = { version = "0.12.6", features = ["cookie"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 cookie = "0.18"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
 ipnetwork = { version = "0.21.1", features = ["serde"] }
 nix = { version = "0.31.3", features = ["socket", "net", "uio"] }
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
@@ -31,5 +35,4 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 
 [dev-dependencies]
-http-body-util = "0.1.5"
 tower = { version = "0.5.3", features = ["util"] }

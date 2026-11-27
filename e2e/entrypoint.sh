@@ -53,9 +53,27 @@ server)
     ip route add 172.30.0.0/24 via 10.10.0.2
     ip -6 route add fd00:30::/64 via fd00:10::2
     # 8999 and 9002 sit just outside the allowed 9000-9001 range.
-    listen 8080 8081 8999 9000 9001 9002
+    # 3128 is the target of run.sh's foreign DNAT to the gateway's proxy port.
+    listen 3128 8080 8081 8999 9000 9001 9002
     echo_udp 5353 8080
     echo_tcp 8082
+    # Host-rule backends: an HTTP server with distinct paths on 80, an endless HTTP stream on 8083
+    # (a long-lived proxied connection) and a TLS server on 443. None of them checks the host.
+    mkdir -p /srv/www/public /srv/www/private
+    echo public >/srv/www/public/index.html
+    echo private >/srv/www/private/index.html
+    busybox httpd -p 80 -h /srv/www
+    cat >/usr/local/bin/stream <<'EOF'
+#!/bin/sh
+printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n'
+while echo tick; do sleep 1; done
+EOF
+    chmod +x /usr/local/bin/stream
+    socat TCP6-LISTEN:8083,ipv6only=0,reuseaddr,fork EXEC:/usr/local/bin/stream &
+    (while :; do
+        openssl s_server -quiet -www -accept 443 \
+            -cert /etc/drawbridge/portal.crt -key /etc/drawbridge/portal.key >/dev/null 2>&1
+    done) &
     touch /tmp/ready
     exec sleep infinity
     ;;

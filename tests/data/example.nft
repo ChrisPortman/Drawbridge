@@ -15,9 +15,17 @@ table inet drawbridge {
 		iifname "wg0" jump drop_log
 		iifname "wg0" counter drop
 	}
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "wg0" jump proxy_redirect
+	}
+	chain proxy_redirect {
+		ip saddr 192.168.50.0/24 ip daddr 10.0.2.0/24 tcp dport 443 counter redirect to :3128
+	}
 	chain client_filter {
 		ct mark != 0x00000000 goto session_flows
 		ct state established,related accept
+		meta l4proto tcp th dport 3128 ct status dnat fib daddr type local counter accept
 		ip daddr 192.168.50.1 tcp dport 8443 counter accept
 		ip saddr 192.168.50.0/24 ip daddr 10.0.1.0/24 tcp dport 443 counter accept
 		ip saddr 192.168.50.0/24 ip daddr 10.0.1.0/24 tcp dport 8000-8100 counter accept

@@ -10,12 +10,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use rand::RngExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
 use crate::firewall::ruleset::{RuleSpec, Ruleset, SessionRules};
 use crate::firewall::{Firewall, FirewallError};
-use crate::policy::Policy;
+use crate::policy::{Allow, Policy};
 use crate::portal::Secret;
 
 /// How long to wait before retrying a failed firewall rebuild.
@@ -102,7 +102,9 @@ impl Enforcer for Kernel {
         removed: &[u32],
         live: &[SessionRules],
     ) -> Result<(), FirewallError> {
-        self.firewall.update_sessions(added, removed, live).await
+        self.firewall
+            .update_sessions(&self.base, added, removed, live)
+            .await
     }
 
     async fn rebuild(&mut self, live: &[SessionRules]) -> Result<(), FirewallError> {
@@ -140,6 +142,8 @@ struct Session {
     token: String,
     expires_at: SystemTime,
     rules: SessionRules,
+    /// The user's host rules for this IP's address family, as published in the view.
+    host_rules: Arc<[Allow]>,
     /// The provider's refresh token; it never leaves the gateway.
     refresh: Option<Secret>,
     /// The refresh in flight, if any.
@@ -162,6 +166,24 @@ pub(crate) struct SessionInfo {
     pub(crate) access: Vec<String>,
 }
 
+/// What the host-rule proxy needs to know about live sessions: per source IP, the session id
+/// and the user's host rules (`http` and `https` allows), with `dest` narrowed to the IP's
+/// address family. Rules left with no dest are omitted.
+pub(crate) type SessionView = HashMap<IpAddr, SessionGrant>;
+
+/// One live session in the [`SessionView`].
+#[derive(Debug, Clone)]
+pub(crate) struct SessionGrant {
+    /// The session id, which a replacing session on the same IP changes.
+    pub(crate) id: u32,
+    pub(crate) host_rules: Arc<[Allow]>,
+}
+
+/// A view that never changes, for when no portal (and so no session) runs.
+pub(crate) fn idle_view() -> watch::Receiver<Arc<SessionView>> {
+    watch::channel(Arc::default()).1
+}
+
 pub(crate) struct SessionTable<E> {
     policy: Arc<Policy>,
     enforcer: E,
@@ -175,6 +197,8 @@ pub(crate) struct SessionTable<E> {
     /// Upper bound on how long one login keeps access; zero means the token's expiry alone.
     max_ttl: Duration,
     next_lease: u64,
+    /// Republished after every change to `by_ip`.
+    view: watch::Sender<Arc<SessionView>>,
 }
 
 impl<E: Enforcer> SessionTable<E> {
@@ -187,7 +211,28 @@ impl<E: Enforcer> SessionTable<E> {
             dirty: false,
             max_ttl,
             next_lease: 0,
+            view: watch::Sender::new(Arc::default()),
         }
+    }
+
+    /// Follows the [`SessionView`], which every change to the table republishes.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<SessionView>> {
+        self.view.subscribe()
+    }
+
+    fn publish(&self) {
+        let view = self
+            .by_ip
+            .iter()
+            .map(|(&ip, s)| {
+                let grant = SessionGrant {
+                    id: s.rules.id,
+                    host_rules: s.host_rules.clone(),
+                };
+                (ip, grant)
+            })
+            .collect();
+        self.view.send_replace(Arc::new(view));
     }
 
     /// Provisions `username` from `ip` until `expires_at` (capped at `max_ttl` from `now`) and
@@ -224,8 +269,10 @@ impl<E: Enforcer> SessionTable<E> {
         }
         let id = self.allocate_id();
         let rules = SessionRules::for_user(&self.policy, id, username, ip).expect("checked above");
+        let host_rules = host_rules(&self.policy, username, ip);
         let session = Session {
             username: username.to_string(),
+            host_rules,
             token: new_token(),
             expires_at,
             rules,
@@ -249,6 +296,7 @@ impl<E: Enforcer> SessionTable<E> {
         if let Some(old) = &replaced {
             info!(%ip, username = old.username, "session replaced");
         }
+        self.publish();
         info!(%ip, username, id = added[0].id, "session provisioned");
         Ok(token)
     }
@@ -348,6 +396,7 @@ impl<E: Enforcer> SessionTable<E> {
         }
         let s = self.by_ip.remove(&ip).expect("checked above");
         info!(%ip, username = s.username, "session ended");
+        self.publish();
         // Like an expiry, the session is gone from the state either way; a failed update leaves
         // the table dirty and the retry timer removes it from the kernel.
         if let Err(e) = self.sync(&[], &[s.rules.id]).await {
@@ -373,6 +422,7 @@ impl<E: Enforcer> SessionTable<E> {
             info!(%ip, username = s.username, "session expired");
             removed.push(s.rules.id);
         }
+        self.publish();
         if let Err(e) = self.sync(&[], &removed).await {
             error!(error = %format!("{e:#}"), "failed to deprovision expired sessions; will retry");
         }
@@ -455,6 +505,26 @@ impl Session {
             access: self.rules.rules.iter().map(RuleSpec::describe).collect(),
         }
     }
+}
+
+/// `username`'s host rules, with `dest` narrowed to `ip`'s address family.
+fn host_rules(policy: &Policy, username: &str, ip: IpAddr) -> Arc<[Allow]> {
+    let Some(user) = policy.user(username) else {
+        return Arc::new([]);
+    };
+    user.allow
+        .iter()
+        .filter(|a| a.is_host_rule())
+        .filter_map(|a| {
+            let dest: Vec<_> = a
+                .dest
+                .iter()
+                .filter(|d| d.is_ipv4() == ip.is_ipv4())
+                .copied()
+                .collect();
+            (!dest.is_empty()).then(|| Allow { dest, ..a.clone() })
+        })
+        .collect()
 }
 
 /// `expires_at`, capped at `max_ttl` from `now` (zero means no cap).
@@ -597,12 +667,18 @@ impl SessionHandle {
     }
 }
 
-/// Runs `table` in a task until every [`SessionHandle`] is dropped.
+/// Runs `table` in a task until every [`SessionHandle`] is dropped. The receiver follows its
+/// [`SessionView`].
 pub(crate) fn spawn<E: Enforcer>(
     table: SessionTable<E>,
-) -> (SessionHandle, tokio::task::JoinHandle<()>) {
+) -> (
+    SessionHandle,
+    watch::Receiver<Arc<SessionView>>,
+    tokio::task::JoinHandle<()>,
+) {
     let (tx, rx) = mpsc::channel(64);
-    (SessionHandle { tx }, tokio::spawn(run(table, rx)))
+    let view = table.subscribe();
+    (SessionHandle { tx }, view, tokio::spawn(run(table, rx)))
 }
 
 async fn run<E: Enforcer>(mut table: SessionTable<E>, mut rx: mpsc::Receiver<Command>) {
@@ -1204,5 +1280,147 @@ mod tests {
             Err(RefreshError::NoSession)
         );
         assert!(!t.logout(&token, ip(IP), at(201)).await);
+    }
+
+    const HOST_POLICY: &str = r#"
+users:
+  - username: alice
+    allow:
+      - dest: [10.0.1.0/24]
+        proto: tcp
+        ports: [22]
+      - dest: [10.0.2.0/24, "fd00:2::/64"]
+        proto: https
+        hosts: [example.com]
+      - dest: ["fd00:3::/64"]
+        proto: http
+        hosts: [example.org]
+  - username: bob
+    allow:
+      - dest: [10.0.4.0/24]
+        proto: http
+        hosts: [bob.example]
+"#;
+
+    fn host_table() -> SessionTable<Fake> {
+        let policy = Policy::parse(HOST_POLICY).unwrap();
+        let mut t = SessionTable::new(Arc::new(policy), Fake::default(), Duration::ZERO);
+        t.next_id = 1;
+        t
+    }
+
+    /// The view's entry for `ip`: session id and each host rule as `dests proto hosts`.
+    fn entry(view: &SessionView, ip: IpAddr) -> Option<(u32, Vec<String>)> {
+        let SessionGrant { id, host_rules } = view.get(&ip)?;
+        let rules = host_rules
+            .iter()
+            .map(|a| {
+                let dests: Vec<_> = a.dest.iter().map(ToString::to_string).collect();
+                let hosts: Vec<_> = a.hosts.iter().map(ToString::to_string).collect();
+                format!("{} {} {}", dests.join(","), a.proto, hosts.join(","))
+            })
+            .collect();
+        Some((*id, rules))
+    }
+
+    #[tokio::test]
+    async fn view_holds_the_login_families_host_rules() {
+        let mut t = host_table();
+        let view = t.subscribe();
+        assert!(view.borrow().is_empty());
+        t.login(ip(IP), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
+        t.login(ip("fd00:60::7"), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
+        let v = view.borrow().clone();
+        assert_eq!(v.len(), 2);
+        assert_eq!(
+            entry(&v, ip(IP)),
+            Some((1, vec!["10.0.2.0/24 https example.com".into()]))
+        );
+        assert_eq!(
+            entry(&v, ip("fd00:60::7")),
+            Some((
+                2,
+                vec![
+                    "fd00:2::/64 https example.com".into(),
+                    "fd00:3::/64 http example.org".into()
+                ]
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn view_keeps_the_id_on_extend_and_changes_it_on_replace() {
+        let mut t = host_table();
+        let view = t.subscribe();
+        t.login(ip(IP), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
+        t.login(ip(IP), "alice", at(300), None, at(150))
+            .await
+            .unwrap();
+        assert_eq!(entry(&view.borrow(), ip(IP)).unwrap().0, 1);
+        t.login(ip(IP), "bob", at(300), None, at(160))
+            .await
+            .unwrap();
+        assert_eq!(
+            entry(&view.borrow(), ip(IP)),
+            Some((2, vec!["10.0.4.0/24 http bob.example".into()]))
+        );
+        t.login(ip(IP), "alice", at(300), None, at(170))
+            .await
+            .unwrap();
+        assert_eq!(entry(&view.borrow(), ip(IP)).unwrap().0, 3);
+    }
+
+    #[tokio::test]
+    async fn view_drops_sessions_on_logout_and_expiry() {
+        let mut t = host_table();
+        let view = t.subscribe();
+        let token = t
+            .login(ip(IP), "alice", at(200), None, at(100))
+            .await
+            .unwrap();
+        t.login(ip("fd00:60::7"), "alice", at(300), None, at(100))
+            .await
+            .unwrap();
+        assert!(t.logout(&token, ip(IP), at(150)).await);
+        assert!(entry(&view.borrow(), ip(IP)).is_none());
+        assert!(entry(&view.borrow(), ip("fd00:60::7")).is_some());
+        t.expire(at(300)).await;
+        assert!(view.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn view_is_unchanged_by_a_refused_login() {
+        let mut t = host_table();
+        t.enforcer.fail_update = true;
+        t.enforcer.fail_rebuild = true;
+        let view = t.subscribe();
+        assert!(
+            t.login(ip(IP), "alice", at(200), None, at(100))
+                .await
+                .is_err()
+        );
+        assert!(view.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_publishes_and_an_idle_view_stays_empty() {
+        let (handle, mut view, _task) = spawn(host_table());
+        handle
+            .login(
+                ip(IP),
+                "alice".into(),
+                SystemTime::now() + Duration::from_secs(3600),
+                None,
+            )
+            .await
+            .unwrap();
+        view.wait_for(|v| v.contains_key(&ip(IP))).await.unwrap();
+        assert!(idle_view().borrow().is_empty());
     }
 }
